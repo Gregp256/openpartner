@@ -2,7 +2,7 @@
  * The /creator-api reverse proxy only forwards allowlisted Network paths.
  * Covers the account-verification POSTs under /creators/me/platforms/
  * (verify/start, verify), the creator data export, the location prompt,
- * the avatar and cover image uploads,
+ * the avatar and cover image uploads, the password routes,
  * that paths off the allowlist stay 404 without reaching the Network, and
  * the signed header that tells the Network the creator's own address. A
  * local HTTP server plays the Network.
@@ -33,8 +33,27 @@ beforeAll(async () => {
     network = createServer((req, res) => {
       calls.push({ method: req.method ?? '', path: req.url ?? '', cookie: req.headers.cookie });
       clientIpHeaders.push(req.headers['x-openpartner-client-ip'] as string | undefined);
-      req.resume();
+      let bytes = 0;
+      req.on('data', (c: Buffer) => {
+        bytes += c.length;
+      });
       req.on('end', () => {
+        if (req.url === '/creators/me/conversations/cnv_1/attachments' && req.method === 'POST') {
+          res.writeHead(201, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ attachment: { id: 'cna_1', size: bytes, contentType: req.headers['content-type'] } }));
+        }
+        if (req.url === '/creators/me/conversations/cnv_1/attachments/cna_png') {
+          res.writeHead(200, { 'content-type': 'image/png' });
+          return res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+        }
+        if (req.url === '/creators/me/conversations/cnv_1/attachments/cna_html') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          return res.end('<script>alert(1)</script>');
+        }
+        if (req.url === '/creators/me/conversations/cnv_1/attachments/cna_gone') {
+          res.writeHead(410, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'attachment_removed' }));
+        }
         if (req.url === '/creators/me/export') {
           if (!req.headers.cookie) {
             res.writeHead(401, { 'content-type': 'application/json' });
@@ -45,6 +64,10 @@ beforeAll(async () => {
             'content-disposition': 'attachment; filename="openpartner-creator-export-ada_example_com-2026-10-19.json"',
           });
           return res.end(JSON.stringify({ exportedAt: '2026-10-19T00:00:00.000Z', creator: { id: 'cr_1' } }));
+        }
+        if (req.url?.endsWith('/realtime')) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ ticket: 'tkt_1', expiresAt: '2026-10-25T21:00:00.000Z' }));
         }
         if (req.url?.endsWith('/verify')) {
           res.writeHead(409, { 'content-type': 'application/json' });
@@ -100,6 +123,58 @@ describe('creator-api proxy: platform verification', () => {
     const res = await request(app).post('/creator-api/vendors/me/discover/creators').send({});
     expect(res.status).toBe(404);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('creator-api proxy: live conversations', () => {
+  it('forwards a socket ticket request and adds where to open the socket', async () => {
+    const res = await request(app)
+      .post('/creator-api/creators/me/conversations/cnv_1/realtime')
+      .set('Cookie', 'op_network_creator_session=abc')
+      .send({});
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ticket: 'tkt_1',
+      expiresAt: '2026-10-25T21:00:00.000Z',
+      url: `${process.env.NETWORK_URL!.replace(/^http/, 'ws')}/realtime`,
+    });
+    expect(calls).toEqual([{ method: 'POST', path: '/creators/me/conversations/cnv_1/realtime', cookie: 'op_network_creator_session=abc' }]);
+  });
+});
+
+describe('creator-api proxy: conversation images', () => {
+  it('forwards an image up to 5 MB, GIFs included, and answers a bigger one itself', async () => {
+    const image = Buffer.concat([Buffer.from('GIF89a'), Buffer.alloc(3 * 1024 * 1024, 1)]);
+    const up = await request(app)
+      .post('/creator-api/creators/me/conversations/cnv_1/attachments')
+      .set('Cookie', 'op_network_creator_session=abc')
+      .set('Content-Type', 'image/gif')
+      .send(image);
+    expect(up.status).toBe(201);
+    expect(up.body.attachment).toEqual({ id: 'cna_1', size: image.length, contentType: 'image/gif' });
+
+    const big = await request(app)
+      .post('/creator-api/creators/me/conversations/cnv_1/attachments')
+      .set('Cookie', 'op_network_creator_session=abc')
+      .set('Content-Type', 'image/png')
+      .send(Buffer.alloc(5 * 1024 * 1024 + 1, 1));
+    expect(big).toMatchObject({ status: 413, body: { error: 'payload_too_large' } });
+    expect(calls.filter((c) => c.path.endsWith('/attachments'))).toHaveLength(1);
+  });
+
+  it('relays an image file as an image, and nothing else as a page', async () => {
+    const file = await request(app).get('/creator-api/creators/me/conversations/cnv_1/attachments/cna_png').set('Cookie', 'op_network_creator_session=abc');
+    expect(file.status).toBe(200);
+    expect(file.headers['content-type']).toBe('image/png');
+    expect(file.headers['content-security-policy']).toContain('sandbox');
+    expect(file.headers['cache-control']).toBe('no-store');
+    expect(calls.at(-1)).toEqual({ method: 'GET', path: '/creators/me/conversations/cnv_1/attachments/cna_png', cookie: 'op_network_creator_session=abc' });
+
+    const html = await request(app).get('/creator-api/creators/me/conversations/cnv_1/attachments/cna_html').set('Cookie', 'op_network_creator_session=abc');
+    expect(html.status).toBe(502);
+    expect(html.headers['content-type']).toContain('application/json');
+    const gone = await request(app).get('/creator-api/creators/me/conversations/cnv_1/attachments/cna_gone').set('Cookie', 'op_network_creator_session=abc');
+    expect(gone).toMatchObject({ status: 410, body: { error: 'attachment_removed' } });
   });
 });
 
@@ -197,6 +272,59 @@ describe('creator-api proxy: the creator address header', () => {
   });
 });
 
+describe('creator-api proxy: the creator address behind Cloudflare', () => {
+  // Hosted runs TRUST_PROXY=cloudflare: visitor → Cloudflare → App
+  // Platform's ingress → api, so X-Forwarded-For arrives as "visitor, edge".
+  // The signed address is req.ip.
+  const key = 'network-admin-key-for-tests';
+  const EDGE = '172.71.30.204';
+  const appWithTrustProxy = (value: string) => {
+    const previous = process.env.TRUST_PROXY;
+    process.env.TRUST_PROXY = value;
+    try {
+      return createApp({ enableLogger: false });
+    } finally {
+      if (previous === undefined) delete process.env.TRUST_PROXY;
+      else process.env.TRUST_PROXY = previous;
+    }
+  };
+  const cloudflareApp = appWithTrustProxy('cloudflare');
+  const signedIps = () => clientIpHeaders.map((h) => h?.split(';')[0]);
+
+  it('vouches for the visitor, not the Cloudflare edge', async () => {
+    process.env.NETWORK_ADMIN_API_KEY = key;
+    await request(cloudflareApp).post('/creator-api/creators/signin').set('X-Forwarded-For', `203.0.113.7, ${EDGE}`).send({});
+    await request(cloudflareApp).get('/creator-api/offerings').set('X-Forwarded-For', '203.0.113.7, 2a06:98c0:3600::1');
+    expect(signedIps()).toEqual(['203.0.113.7', '203.0.113.7']);
+
+    // Unset, it's one hop as before: the same chain gives the edge.
+    await request(app).get('/creator-api/offerings').set('X-Forwarded-For', `203.0.113.7, ${EDGE}`);
+    expect(signedIps()[2]).toBe(EDGE);
+  });
+
+  it("can't be talked into another address by a request straight to the origin", async () => {
+    process.env.NETWORK_ADMIN_API_KEY = key;
+    // Forged headers through Cloudflare: it appends the caller's own
+    // address, the ingress appends the edge.
+    await request(cloudflareApp)
+      .get('/creator-api/offerings')
+      .set('X-Forwarded-For', `192.0.2.1, 198.51.100.9, ${EDGE}`)
+      .set('CF-Connecting-IP', '192.0.2.1')
+      .set('True-Client-IP', '192.0.2.1');
+    // A forged Cloudflare hop in front of the caller.
+    await request(cloudflareApp).get('/creator-api/offerings').set('X-Forwarded-For', `192.0.2.1, ${EDGE}, 198.51.100.9, ${EDGE}`);
+    // The ingress reached without Cloudflare: it appends the caller.
+    await request(cloudflareApp).get('/creator-api/offerings').set('X-Forwarded-For', `192.0.2.1, ${EDGE}, 198.51.100.9`);
+    // A Cloudflare Worker connects from Cloudflare's ranges; it is the caller.
+    await request(cloudflareApp).get('/creator-api/offerings').set('X-Forwarded-For', `192.0.2.1, 2a06:98c0:3600::103, ${EDGE}`);
+    expect(signedIps()).toEqual(['198.51.100.9', '198.51.100.9', '198.51.100.9', '2a06:98c0:3600::103']);
+  });
+
+  it('refuses to start with a TRUST_PROXY it does not know', () => {
+    expect(() => appWithTrustProxy('cloudfare')).toThrow(/TRUST_PROXY/);
+  });
+});
+
 describe('creator-api proxy: image uploads', () => {
   it('forwards the avatar and cover uploads as raw images', async () => {
     const cookie = 'op_network_creator_session=abc';
@@ -215,6 +343,17 @@ describe('creator-api proxy: image uploads', () => {
   });
 });
 
+describe('creator-api proxy: cover from YouTube', () => {
+  it('forwards the YouTube banner request', async () => {
+    const res = await request(app)
+      .post('/creator-api/creators/me/cover/youtube')
+      .set('Cookie', 'op_network_creator_session=abc')
+      .send({});
+    expect(res.status).toBe(200);
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['POST /creators/me/cover/youtube']);
+  });
+});
+
 describe('creator-api proxy: storefront', () => {
   it('forwards the creator storefront, package and bookings calls', async () => {
     const cookie = 'op_network_creator_session=abc';
@@ -228,7 +367,17 @@ describe('creator-api proxy: storefront', () => {
       ['GET', '/creators/me/bookings?status=pending'],
       ['POST', '/creators/me/bookings/bkr_1/accept'],
       ['POST', '/creators/me/bookings/bkr_1/decline'],
+      ['POST', '/creators/me/bookings/bkr_1/withdraw'],
+      ['POST', '/creators/me/bookings/bkr_1/deliver'],
+      ['POST', '/creators/me/bookings/bkr_1/refund'],
       ['DELETE', '/creators/me/bookings/bkr_1'],
+      ['GET', '/creators/me/conversations'],
+      ['GET', '/creators/me/conversations/cnv_1?before=cnm_9'],
+      ['POST', '/creators/me/conversations/cnv_1/messages'],
+      ['POST', '/creators/me/conversations/cnv_1/offers'],
+      ['POST', '/creators/me/conversations/cnv_1/block'],
+      ['GET', '/creators/me/payments?refresh=1'],
+      ['POST', '/creators/me/payments/onboarding'],
       ['POST', '/creators/me/storefront/import/preview'],
       ['POST', '/creators/me/storefront/import/apply'],
     ];
@@ -241,23 +390,107 @@ describe('creator-api proxy: storefront', () => {
     expect(calls.every((c) => c.cookie === cookie)).toBe(true);
   });
 
-  it('forwards the public request form and the confirm link without a session', async () => {
+  it('forwards the public request form without a session; the old confirm link is not proxied', async () => {
     const send = await request(app)
       .post('/creator-api/creators/by-handle/ada/bookings')
       .send({ contactName: 'Grace', contactEmail: 'g@example.com', brief: 'A sponsored post about our app.' });
     expect(send.status).toBe(200);
-    const confirm = await request(app).post('/creator-api/bookings/confirm').send({ token: 'opbk_x' });
-    expect(confirm.status).toBe(200);
-    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
-      'POST /creators/by-handle/ada/bookings',
-      'POST /bookings/confirm',
-    ]);
+    // A request is continued as a brand now (routes/booking-claims.ts), and
+    // the preview behind it is read with the admin key, never by a browser.
+    expect((await request(app).post('/creator-api/bookings/confirm').send({ token: 'opbk_x' })).status).toBe(404);
+    expect((await request(app).post('/creator-api/bookings/preview').send({ token: 'opbk_x' })).status).toBe(404);
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['POST /creators/by-handle/ada/bookings']);
+  });
+
+  it('forwards operator messages: the list and marking one read', async () => {
+    const cookie = 'op_network_creator_session=abc';
+    expect((await request(app).get('/creator-api/creators/me/messages').set('Cookie', cookie)).status).toBe(200);
+    expect((await request(app).post('/creator-api/creators/me/messages/cmsg_1/read').set('Cookie', cookie).send({})).status).toBe(200);
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /creators/me/messages', 'POST /creators/me/messages/cmsg_1/read']);
+    expect(calls.every((c) => c.cookie === cookie)).toBe(true);
+    // Deleting or editing a message isn't a creator action.
+    expect((await request(app).delete('/creator-api/creators/me/messages/cmsg_1')).status).toBe(404);
+    expect((await request(app).get('/creator-api/creators/me/messages/cmsg_1')).status).toBe(404);
+    expect(calls).toHaveLength(2);
   });
 
   it('keeps the methods it does not need off the allowlist', async () => {
     expect((await request(app).put('/creator-api/creators/me/packages/cpk_1').send({})).status).toBe(404);
     expect((await request(app).get('/creator-api/creators/me/bookings/bkr_1')).status).toBe(404);
-    expect((await request(app).get('/creator-api/bookings/confirm')).status).toBe(200); // exact paths forward any method; the Network answers
-    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /bookings/confirm']);
+    expect((await request(app).delete('/creator-api/creators/me/conversations/cnv_1')).status).toBe(404);
+    expect((await request(app).get('/creator-api/creators/me/payments')).status).toBe(200); // exact paths forward any method; the Network answers
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /creators/me/payments']);
+  });
+
+  it('forwards booking reports, their share links and reported numbers, never cached', async () => {
+    const cookie = 'op_network_creator_session=abc';
+    const steps: Array<[string, string]> = [
+      ['GET', '/creators/me/bookings/bkr_1/report'],
+      ['GET', '/creators/me/bookings/bkr_1/report/shares'],
+      ['POST', '/creators/me/bookings/bkr_1/report/shares'],
+      ['POST', '/creators/me/bookings/bkr_1/report/shares/brs_1/revoke'],
+      ['PUT', '/creators/me/bookings/bkr_1/reported-stats'],
+    ];
+    for (const [method, path] of steps) {
+      const r = request(app)[method.toLowerCase() as 'get' | 'put' | 'post'](`/creator-api${path}`).set('Cookie', cookie);
+      const res = method === 'GET' ? await r : await r.send({});
+      expect(res.status, `${method} ${path}`).toBe(200);
+      if (/\/report(\/|$)/.test(path)) expect(res.headers['cache-control'], path).toBe('no-store');
+    }
+    // The public page posts the token from its URL fragment, in the body.
+    const view = await request(app).post('/creator-api/reports/view').send({ token: 'oprp_x' });
+    expect(view.status).toBe(200);
+    expect(view.headers['cache-control']).toBe('no-store');
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([...steps.map(([m, p]) => `${m} ${p}`), 'POST /reports/view']);
+    // Nothing else under a booking opens up.
+    expect((await request(app).get('/creator-api/creators/me/bookings/bkr_1/report/shares/brs_1')).status).toBe(404);
+    expect((await request(app).put('/creator-api/creators/me/bookings/bkr_1/report')).status).toBe(404);
+    expect((await request(app).get('/creator-api/reports/oprp_x')).status).toBe(404);
+  });
+
+  it('forwards the verified work the creator shows on their storefront', async () => {
+    const cookie = 'op_network_creator_session=abc';
+    expect((await request(app).get('/creator-api/creators/me/case-studies').set('Cookie', cookie)).status).toBe(200);
+    expect((await request(app).put('/creator-api/creators/me/case-studies').set('Cookie', cookie).send({ bookingIds: ['bkr_1'] })).status).toBe(200);
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['GET /creators/me/case-studies', 'PUT /creators/me/case-studies']);
+    expect((await request(app).put('/creator-api/creators/me/case-studies/bkr_1')).status).toBe(404);
+  });
+});
+
+describe('creator-api proxy: passwords', () => {
+  it('forwards password sign-in, forgot, reset and set/change, with the creator cookie and address', async () => {
+    process.env.NETWORK_ADMIN_API_KEY = 'netadm_test_proxy_0123456789abcdef';
+    const cookie = 'op_network_creator_session=opscreator_abc';
+    const steps: Array<[string, string]> = [
+      ['POST', '/creators/signin/password'],
+      ['POST', '/creators/password/forgot'],
+      ['POST', '/creators/password/reset'],
+      ['GET', '/creators/me/password'],
+      ['PUT', '/creators/me/password'],
+    ];
+    for (const [method, path] of steps) {
+      const r = request(app)[method.toLowerCase() as 'get' | 'put' | 'post'](`/creator-api${path}`).set('Cookie', cookie);
+      const res = method === 'GET' ? await r : await r.send({ email: 'ada@example.com', password: 'correct horse battery' });
+      expect(res.status, `${method} ${path}`).toBe(200);
+    }
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(steps.map(([m, p]) => `${m} ${p}`));
+    expect(calls.every((c) => c.cookie === cookie)).toBe(true);
+    // The Network's country gate sees the creator, not this server.
+    expect(clientIpHeaders.every((h) => typeof h === 'string' && /;sig=[0-9a-f]{64}$/.test(h))).toBe(true);
+  });
+
+  it('forwards nothing next to them', async () => {
+    for (const path of [
+      '/creators/password',
+      '/creators/password/forgot/extra',
+      '/creators/signin/password/extra',
+      '/creators/me/password/history',
+      '/admin/creators/signin-token',
+      '/admin/creators/signup',
+    ]) {
+      const res = await request(app).post(`/creator-api${path}`).send({});
+      expect(res.status, path).toBe(404);
+    }
+    expect(calls).toHaveLength(0);
   });
 });

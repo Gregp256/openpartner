@@ -1,13 +1,30 @@
 import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Link } from 'react-router';
 import { HelpCircle, Plus, Tag } from 'lucide-react';
 import { api } from '../api.js';
 import { alpha, theme } from '../theme.js';
 import { TenantLink } from '../tenant-link.js';
-import { useBrand } from '../lib/useBrand.js';
-import { Button, Card, EmptyState, ErrorBanner, Input, Label, Page, Select, Table, formatDate } from '../ui.js';
+import { useTenantBase } from '../tenant-base.js';
+import { useBrand, useDefaultCurrency } from '../lib/useBrand.js';
+import {
+  Button,
+  Card,
+  EmptyState,
+  ErrorBanner,
+  Input,
+  Label,
+  Page,
+  SectionHeading,
+  Select,
+  Table,
+  formatDate,
+  moneyByCurrency,
+  statusAmounts,
+} from '../ui.js';
 import { renderCommissionSummary } from '../lib/commission-summary.js';
 import { CompoundRuleEditor, ruleEventTypeMissing, ruleSlabProblem, type CommissionSubRule } from '../lib/CompoundRuleEditor.js';
+import { EditOnly, useViewOnly } from '../lib/viewOnly.js';
 import { PROGRAM_CATEGORIES, clickDestinationProblem, clickDestinationWarning, parseVideoUrl } from '@openpartner/db';
 
 interface CustomerReward {
@@ -29,6 +46,7 @@ interface Program {
   attributionModel: string;
   /** Older API responses during a deploy gap omit it; treat as on. */
   renewalsStayWithPartner?: boolean;
+  couponsYieldToLinks?: boolean;
   destinationUrl: string;
   deepLinkAllowedDomains: string | null;
   holdbackDays: number | null;
@@ -40,6 +58,10 @@ interface Program {
   /** Event types that are sales in this program beyond invoice_paid and
    *  subscription_created. */
   revenueEventTypes?: string[];
+  /** Two-tier: the recruiter's share of a recruit's commission, a decimal
+   *  string ("10.00"). Null or absent = off. */
+  recruiterCommissionPercent?: string | null;
+  recruiterCommissionMonths?: number | null;
   marketplaceDescription: string | null;
   marketplaceCoverUrl?: string | null;
   marketplaceVideoUrl?: string | null;
@@ -66,8 +88,8 @@ function normalizeRules(raw: Program['commissionRule']): CommissionSubRule[] {
   return [{ trigger: 'every', type: raw.type, value: raw.value, recurring: raw.recurring }];
 }
 
-function summarizeRules(raw: Program['commissionRule'], reward: CustomerReward | null): string {
-  return renderCommissionSummary(normalizeRules(raw), reward);
+function summarizeRules(raw: Program['commissionRule'], reward: CustomerReward | null, defaultCurrency: string): string {
+  return renderCommissionSummary(normalizeRules(raw), reward, defaultCurrency);
 }
 
 type ProgramStatus = 'scheduled' | 'active' | 'ended';
@@ -79,8 +101,10 @@ function statusOf(c: Pick<Program, 'startsAt' | 'endsAt'>, at: Date = new Date()
 
 export function AdminPrograms() {
   const qc = useQueryClient();
+  const defaultCurrency = useDefaultCurrency();
   const [showCreate, setShowCreate] = useState(false);
   const [editing, setEditing] = useState<Program | null>(null);
+  const viewOnly = useViewOnly();
   const campaigns = useQuery({
     queryKey: ['campaigns'],
     queryFn: () => api<{ programs: Program[]; customerRewardDelivery?: CustomerRewardDelivery }>('/programs'),
@@ -105,9 +129,11 @@ export function AdminPrograms() {
       title="Programs"
       subtitle="Commission rules, attribution windows, and models applied to partner clicks."
       actions={
-        <Button icon={<Plus size={14} />} onClick={() => setShowCreate(true)}>
-          New campaign
-        </Button>
+        <EditOnly>
+          <Button icon={<Plus size={14} />} onClick={() => setShowCreate(true)}>
+            New campaign
+          </Button>
+        </EditOnly>
       }
     >
       <ErrorBanner error={campaigns.error ?? endNow.error} />
@@ -140,6 +166,7 @@ export function AdminPrograms() {
       ) : (campaigns.data?.programs ?? []).length === 0 ? (
         <EmptyState title="No programs yet" hint="A program holds the commission rule and attribution settings." icon={<Tag size={28} strokeWidth={1.25} />} />
       ) : (
+        <>
         <Table
           columns={['Name', 'Status', 'Destination', 'Commission', 'Window', 'Holdback', 'Model', 'Created', 'Actions']}
           rows={(campaigns.data?.programs ?? []).map((c) => {
@@ -153,7 +180,7 @@ export function AdminPrograms() {
                   <span style={{ color: theme.accentText, fontSize: 11, marginLeft: 8 }}>+ deep links</span>
                 )}
               </span>,
-              <span style={{ fontSize: 13 }}>{summarizeRules(c.commissionRule, c.customerReward)}</span>,
+              <span style={{ fontSize: 13 }}>{summarizeRules(c.commissionRule, c.customerReward, defaultCurrency)}</span>,
               <span style={{ color: theme.textMuted }}>{c.attributionWindowDays}d</span>,
               <span style={{ color: c.holdbackDays ? theme.text : theme.textDim }}>
                 {c.holdbackDays ? `${c.holdbackDays}d` : '—'}
@@ -161,20 +188,22 @@ export function AdminPrograms() {
               <code style={{ color: theme.accentText, fontSize: 12 }}>{c.attributionModel}</code>,
               <span style={{ color: theme.textMuted }}>{formatDate(c.createdAt, { relative: true })}</span>,
               <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                <button
-                  type="button"
-                  onClick={() => setEditing(c)}
-                  style={smallActionStyle(theme.textMuted)}
-                >
-                  Edit
-                </button>
+                {!viewOnly && (
+                  <button
+                    type="button"
+                    onClick={() => setEditing(c)}
+                    style={smallActionStyle(theme.textMuted)}
+                  >
+                    Edit
+                  </button>
+                )}
                 <TenantLink
                   to={`/admin/programs/${c.id}/bounties`}
                   style={{ ...smallActionStyle(theme.textMuted), border: `1px solid ${alpha(theme.textMuted, 0.333)}`, textDecoration: 'none' }}
                 >
                   Bounties
                 </TenantLink>
-                {status !== 'ended' && (
+                {status !== 'ended' && !viewOnly && (
                   <button
                     type="button"
                     onClick={() => {
@@ -192,8 +221,99 @@ export function AdminPrograms() {
             ];
           })}
         />
+        <ProgramPerformance />
+        </>
       )}
     </Page>
+  );
+}
+
+const PERFORMANCE_WINDOWS = [7, 30, 90] as const;
+
+interface ProgramStats {
+  programId: string;
+  name: string;
+  partners: number;
+  clicks: number;
+  attributedEvents: number;
+  attributedRevenueByCurrency: Record<string, number>;
+  commissionByCurrency: Record<string, Record<string, number>>;
+}
+
+/** Each program's results side by side, from GET /programs/stats: the
+ *  numbers the dashboard shows filtered to that program, which each name
+ *  links to. Amounts stay per currency. */
+function ProgramPerformance() {
+  const tenantBase = useTenantBase();
+  const defaultCurrency = useDefaultCurrency();
+  const [days, setDays] = useState<number>(30);
+  const stats = useQuery({
+    queryKey: ['program-stats', days],
+    queryFn: () => {
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+      return api<{ currency: string; programs: ProgramStats[] }>(`/programs/stats?${new URLSearchParams({ since })}`);
+    },
+    placeholderData: keepPreviousData,
+  });
+  const currency = stats.data?.currency ?? defaultCurrency;
+  const right = (label: string) => ({ label, align: 'right' as const });
+
+  return (
+    <>
+      <SectionHeading
+        actions={
+          <Select
+            aria-label="Performance window"
+            value={String(days)}
+            onChange={(e) => setDays(Number(e.target.value))}
+            style={{ width: 'auto', padding: '6px 10px', fontSize: 13 }}
+          >
+            {PERFORMANCE_WINDOWS.map((d) => (
+              <option key={d} value={d}>
+                Last {d} days
+              </option>
+            ))}
+          </Select>
+        }
+      >
+        Performance
+      </SectionHeading>
+      <ErrorBanner error={stats.error} />
+      {stats.isLoading ? (
+        <Card>Loading…</Card>
+      ) : (
+        <div style={{ opacity: stats.isPlaceholderData ? 0.6 : 1, transition: 'opacity 120ms ease' }}>
+          <Table
+            columns={[
+              'Program',
+              right('Partners'),
+              right('Clicks'),
+              right('Conversions'),
+              right('Revenue'),
+              right('Accrued'),
+              right('Approved'),
+              right('Paid'),
+            ]}
+            rows={(stats.data?.programs ?? []).map((p) => [
+              <Link
+                to={{ pathname: tenantBase || '/', search: `?${new URLSearchParams({ program: p.programId })}` }}
+                title="Open the dashboard for this program"
+                style={{ color: theme.text, fontWeight: 500, textDecoration: 'none' }}
+              >
+                {p.name}
+              </Link>,
+              p.partners.toLocaleString(),
+              p.clicks.toLocaleString(),
+              p.attributedEvents.toLocaleString(),
+              moneyByCurrency(p.attributedRevenueByCurrency, currency),
+              moneyByCurrency(statusAmounts(p.commissionByCurrency, 'accrued'), currency),
+              moneyByCurrency(statusAmounts(p.commissionByCurrency, 'approved'), currency),
+              moneyByCurrency(statusAmounts(p.commissionByCurrency, 'paid'), currency),
+            ])}
+          />
+        </div>
+      )}
+    </>
   );
 }
 
@@ -257,6 +377,8 @@ function EditProgramDates({
   const [renewalsStayWithPartner, setRenewalsStayWithPartner] = useState(
     campaign.renewalsStayWithPartner ?? true,
   );
+  const [recruiter, setRecruiter] = useState<RecruiterTerms>(recruiterTermsOf(campaign));
+  const [couponsYieldToLinks, setCouponsYieldToLinks] = useState(campaign.couponsYieldToLinks ?? false);
 
   const save = useMutation({
     mutationFn: () =>
@@ -279,6 +401,8 @@ function EditProgramDates({
           holdbackDays: Number(holdbackDays) || 0,
           revenueEventTypes: parseEventTypes(revenueEventTypes),
           renewalsStayWithPartner,
+          ...recruiterTermsBody(recruiter),
+          couponsYieldToLinks,
         },
       }),
     onSuccess: onSaved,
@@ -384,6 +508,8 @@ function EditProgramDates({
         windowDays={campaign.attributionWindowDays}
         onChange={setRenewalsStayWithPartner}
       />
+      <RecruiterCommissionField value={recruiter} onChange={setRecruiter} />
+      <CouponPrecedenceField enabled={couponsYieldToLinks} onChange={setCouponsYieldToLinks} />
 
       <div style={{ display: 'flex', gap: 8 }}>
         <Button
@@ -397,7 +523,8 @@ function EditProgramDates({
             rules.some((r) => ruleSlabProblem(r) !== null) ||
             (shareOnNetwork && !marketplaceDescription.trim()) ||
             (shareOnNetwork && videoLinkInvalid(videoUrl)) ||
-            revenueEventTypesProblem(revenueEventTypes) !== null
+            revenueEventTypesProblem(revenueEventTypes) !== null ||
+            recruiterTermsProblem(recruiter) !== null
           }
         >
           {save.isPending ? 'Saving…' : 'Save changes'}
@@ -505,10 +632,12 @@ function CreateProgram({
   const [windowDays, setWindowDays] = useState('60');
   const [model, setModel] = useState<'last_click' | 'first_click' | 'linear' | 'position'>('last_click');
   const [renewalsStayWithPartner, setRenewalsStayWithPartner] = useState(true);
+  const [couponsYieldToLinks, setCouponsYieldToLinks] = useState(false);
   const [holdbackDays, setHoldbackDays] = useState('0');
   const [startsAt, setStartsAt] = useState('');
   const [endsAt, setEndsAt] = useState('');
   const [grantToAllPartners, setGrantToAllPartners] = useState(false);
+  const [recruiter, setRecruiter] = useState<RecruiterTerms>(recruiterTermsOf({}));
 
   const urlProblem = destinationUrlProblem(destinationUrl);
 
@@ -524,6 +653,7 @@ function CreateProgram({
           attributionWindowDays: Number(windowDays),
           attributionModel: model,
           renewalsStayWithPartner,
+          couponsYieldToLinks,
           holdbackDays: Number(holdbackDays) || undefined,
           startsAt: startsAt ? new Date(startsAt).toISOString() : null,
           endsAt: endsAt ? new Date(endsAt).toISOString() : null,
@@ -542,6 +672,7 @@ function CreateProgram({
           categories: categories.length > 0 ? categories : undefined,
           partnersMayCustomizeCode: partnersMayCustomizeCode || undefined,
           grantToAllPartners: grantToAllPartners || undefined,
+          ...(recruiter.enabled ? recruiterTermsBody(recruiter) : {}),
         },
       }),
     onSuccess: onCreated,
@@ -612,6 +743,8 @@ function CreateProgram({
         windowDays={Number(windowDays) || 60}
         onChange={setRenewalsStayWithPartner}
       />
+      <RecruiterCommissionField value={recruiter} onChange={setRecruiter} />
+      <CouponPrecedenceField enabled={couponsYieldToLinks} onChange={setCouponsYieldToLinks} />
       <div style={{ marginBottom: 16 }}>
         <LabelWithHelp
           label="Payout holdback (days)"
@@ -677,6 +810,7 @@ function CreateProgram({
             urlProblem != null ||
             (networkEnabled && shareOnNetwork && !marketplaceDescription.trim()) ||
             (networkEnabled && shareOnNetwork && videoLinkInvalid(videoUrl)) ||
+            recruiterTermsProblem(recruiter) !== null ||
             mut.isPending
           }
         >
@@ -733,6 +867,101 @@ function PartnerCodeCustomizationField({
   );
 }
 
+/** The recruiter-commission inputs as typed. */
+interface RecruiterTerms {
+  enabled: boolean;
+  /** Percent of the recruit's commission, as typed. */
+  percent: string;
+  /** Months it lasts; blank = no limit. */
+  months: string;
+}
+
+function recruiterTermsOf(p: Pick<Program, 'recruiterCommissionPercent' | 'recruiterCommissionMonths'> | Record<string, never>): RecruiterTerms {
+  const percent = 'recruiterCommissionPercent' in p ? p.recruiterCommissionPercent : null;
+  const months = 'recruiterCommissionMonths' in p ? p.recruiterCommissionMonths : null;
+  return {
+    enabled: percent != null,
+    percent: percent != null ? String(Number(percent)) : '10',
+    months: months != null ? String(months) : '',
+  };
+}
+
+/** What the API's recruiter schemas would refuse (routes/programs.ts),
+ *  said here instead of as a bare invalid_body after Save. */
+function recruiterTermsProblem(t: RecruiterTerms): string | null {
+  if (!t.enabled) return null;
+  const percent = Number(t.percent);
+  if (!t.percent.trim() || !Number.isFinite(percent) || percent <= 0 || percent > 50) {
+    return 'Enter a share above 0 and up to 50%.';
+  }
+  if (Math.abs(percent * 100 - Math.round(percent * 100)) > 1e-9) return 'Use at most two decimal places.';
+  if (t.months.trim()) {
+    const months = Number(t.months);
+    if (!Number.isInteger(months) || months < 1 || months > 120) return 'Months must be a whole number from 1 to 120, or blank.';
+  }
+  return null;
+}
+
+function recruiterTermsBody(t: RecruiterTerms): { recruiterCommissionPercent: number | null; recruiterCommissionMonths: number | null } {
+  if (!t.enabled) return { recruiterCommissionPercent: null, recruiterCommissionMonths: null };
+  return {
+    recruiterCommissionPercent: Number(t.percent),
+    recruiterCommissionMonths: t.months.trim() ? Number(t.months) : null,
+  };
+}
+
+/**
+ * Program.recruiterCommissionPercent / recruiterCommissionMonths: two-tier
+ * commissions. A partner's recruiter earns this share of every commission
+ * the partner earns here. Spec: docs/two-tier-commissions.md.
+ */
+function RecruiterCommissionField({ value, onChange }: { value: RecruiterTerms; onChange: (v: RecruiterTerms) => void }) {
+  const problem = recruiterTermsProblem(value);
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: theme.text, marginBottom: 6 }}>
+        <input type="checkbox" checked={value.enabled} onChange={(e) => onChange({ ...value, enabled: e.target.checked })} />
+        Pay partners for the partners they recruit
+      </label>
+      {value.enabled && (
+        <div className="op-grid-collapse" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, margin: '8px 0 6px 24px' }}>
+          <div>
+            <Label>Recruiter&rsquo;s share (% of the recruit&rsquo;s commission)</Label>
+            <Input
+              type="number"
+              min={0.01}
+              max={50}
+              step={0.5}
+              value={value.percent}
+              onChange={(e) => onChange({ ...value, percent: e.target.value })}
+              style={problem ? { borderColor: alpha(theme.danger, 0.533) } : undefined}
+            />
+          </div>
+          <div>
+            <Label>For how many months (blank = no limit)</Label>
+            <Input
+              type="number"
+              min={1}
+              max={120}
+              value={value.months}
+              placeholder="No limit"
+              onChange={(e) => onChange({ ...value, months: e.target.value })}
+            />
+          </div>
+        </div>
+      )}
+      {problem && <div style={{ fontSize: 12, color: theme.danger, margin: '0 0 4px 24px' }}>{problem}</div>}
+      <div style={{ fontSize: 12, color: theme.textDim, marginLeft: 24, lineHeight: 1.5 }}>
+        A partner who recruits another, through their recruit link or because you set it on the
+        partner, earns this share of every commission the recruit earns in this campaign. It&rsquo;s
+        paid on top of the recruit&rsquo;s commission, not out of it, and approved together with it.
+        One level only: recruiters earn nothing on partners their recruits bring in. Keep the share
+        small, and check that recruits bring in real customers.
+      </div>
+    </div>
+  );
+}
+
 /**
  * Program.renewalsStayWithPartner. On: the window picks who wins a
  * customer, and that partner keeps the customer's renewals — the
@@ -766,6 +995,37 @@ function RenewalsField({
             Off: every payment is credited to whoever has the latest click in the {windowDays}-day
             window (or as your model splits it). A customer who renews {windowDays} days after
             their last partner click earns nobody a commission.
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Program.couponsYieldToLinks. Off: a code redeemed at checkout is the
+ * latest touch, so it beats the link that brought the customer. On: a code
+ * credits only when no partner link click is in the window. Admin →
+ * Tracking health counts how often a code took a sale from a link.
+ */
+function CouponPrecedenceField({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: theme.text, marginBottom: 6 }}>
+        <input type="checkbox" checked={enabled} onChange={(e) => onChange(e.target.checked)} />
+        Partner links beat coupon codes
+      </label>
+      <div style={{ fontSize: 12, color: theme.textDim, marginLeft: 24 }}>
+        {enabled ? (
+          <>
+            On: when a customer clicked a partner&rsquo;s link inside the window, that click is credited even if
+            they check out with another partner&rsquo;s code. A code credits on its own only when no link did.
+            Renewals stay with whoever won the customer&rsquo;s first payment, so existing customers don&rsquo;t move.
+          </>
+        ) : (
+          <>
+            Off (default): a code used at checkout counts as the customer&rsquo;s latest touch, so it takes the
+            sale from a partner whose link brought them earlier.
           </>
         )}
       </div>

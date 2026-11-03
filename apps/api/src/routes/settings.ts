@@ -9,9 +9,9 @@
  * lives here so admins can update it without a redeploy.
  */
 
-import { Router } from 'express';
+import express, { Router, type RequestHandler } from 'express';
 import type { Knex } from 'knex';
-import { z } from 'zod';
+import { z } from '../zod.js';
 import {
   PAYOUT_CADENCES,
   PAYOUT_RAIL_PREFERENCES,
@@ -30,23 +30,32 @@ import {
   type MailTransportKind,
 } from '../mail-settings.js';
 import { getMailer } from '../mailer.js';
+import { db as platformDb } from '../db.js';
+import { networkReviewFor, TRACKING_NOT_VERIFIED_DETAIL } from '../tracking-verification.js';
 import {
   completeNetworkConnect,
+  getNetworkMembership,
   getPublicNetworkMembership,
   grantFederationScope,
   NETWORK_BONUS_SCOPE,
   NetworkProxyError,
   networkProxy,
+  networkTier,
   saveNetworkMembership,
   sendHeartbeat,
   signupWithNetwork,
 } from '../network-client.js';
 import { isNetworkOfferedToPartners, resyncConsentedPartners, summarizeNetworkConsent } from '../network-consent.js';
+import { CONVERSATION_IMAGE_MAX_BYTES, CONVERSATION_IMAGE_TYPES } from '../conversation-images.js';
 import { readPartnerAccessSettings, savePartnerAccessSettings } from '../partner-portal-access.js';
+import { readStatementSettings, saveStatementSettings } from '../payout-statements.js';
+import { clearNetworkListingSkip } from '../onboarding-settings.js';
 import { createApiKeyRow } from '../auth.js';
-import { getTenancyMode, tenantOf } from '../tenancy.js';
+import { afterCommit, getTenancyMode, tenantOf } from '../tenancy.js';
 import { NETWORK_FEDERATION_SCOPES } from './api-keys.js';
-import { getTenantBillingState } from '../billing-plan.js';
+import { getTenantBillingState, hasActivePlan } from '../billing-plan.js';
+import { bookingFeeBpsFor } from '../booking-fee.js';
+import { getMode } from '../stripe.js';
 import { connectPayoutsAvailable } from '../payout-method.js';
 import { isWhiteLabelEntitled, getWhiteLabelState } from '../white-label.js';
 import { currencyInputSchema } from '../currency.js';
@@ -258,6 +267,12 @@ settingsRouter.post('/config/program', requireAuth, requireAdmin, async (req, re
     tenantPatch.updatedAt = now;
     await db<TenantRow>(TABLES.Tenant).where({ id: tenantId }).update(tenantPatch);
   }
+  // Push a renamed brand to its Network listing now instead of at the next
+  // hourly heartbeat. After commit, so it reads the saved name; a Network
+  // blip is logged, never fails the save.
+  if (next.programName !== previous.programName) {
+    afterCommit(req, 'network heartbeat', (trx) => sendHeartbeat(trx, tenantId));
+  }
   // Re-hydrate so the returned shape matches GET (includes logoUrl + brand fields).
   res.json(await readSettings(db, tenantId));
 });
@@ -424,6 +439,44 @@ settingsRouter.post('/config/partner-access', requireAuth, requireAdmin, async (
   res.json(await savePartnerAccessSettings(db, tenantId, body.data));
 });
 
+// ---------- Payout statements ----------
+
+/** Text printed on statements: `''` or null clears it. */
+const statementText = (max: number) => z.string().trim().max(max).nullable().optional();
+
+/** What payout statements print (payout-statements.ts). Omitted fields
+ *  keep their value. */
+export const payoutStatementSettingsSchema = z.object({
+  legalName: statementText(200),
+  address: statementText(500),
+  footer: statementText(2000),
+  numberPrefix: z
+    .string()
+    .trim()
+    .max(20)
+    .regex(/^[A-Za-z0-9/_.#-]*$/, 'use letters, digits and / _ . # -')
+    .nullable()
+    .optional(),
+  taxLines: z
+    .object({
+      enabled: z.boolean().optional(),
+      labels: z.array(z.string().trim().min(1).max(60)).min(1).max(5).optional(),
+    })
+    .optional(),
+});
+
+settingsRouter.get('/config/payout-statements', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  res.json(await readStatementSettings(db, tenantId));
+});
+
+settingsRouter.post('/config/payout-statements', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  const body = payoutStatementSettingsSchema.safeParse(req.body ?? {});
+  if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+  res.json(await saveStatementSettings(db, tenantId, body.data));
+});
+
 // ---------- Payout settings ----------
 
 /**
@@ -511,6 +564,11 @@ async function blockNetworkForWhiteLabel(
   return false;
 }
 
+/** Same test as the onboarding status's `networkConnected`. */
+function isConnected(m: { enabled: boolean; vendorTokenCiphertext: string } | null): boolean {
+  return !!(m?.enabled && m.vendorTokenCiphertext);
+}
+
 export const networkMembershipSchema = z.object({
   enabled: z.boolean().optional(),
   networkUrl: z.string().url().optional().or(z.literal('')),
@@ -532,6 +590,7 @@ settingsRouter.post('/config/network', requireAuth, requireAdmin, async (req, re
   if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
 
   if (body.data.enabled === true && (await blockNetworkForWhiteLabel(db, tenantId, res))) return;
+  const wasConnected = isConnected(await getNetworkMembership(db, tenantId));
   await saveNetworkMembership(db, tenantId, {
     enabled: body.data.enabled,
     networkUrl: body.data.networkUrl === '' ? '' : body.data.networkUrl,
@@ -539,6 +598,11 @@ settingsRouter.post('/config/network', requireAuth, requireAdmin, async (req, re
     scopedKeyId: body.data.scopedKeyId,
     autoEnroll: body.data.autoEnroll,
   });
+  // Only an actual join counts. Toggling autoEnroll ("Offer the Network
+  // to your partners") on a brand that skipped the listing leaves the skip.
+  if (!wasConnected && isConnected(await getNetworkMembership(db, tenantId))) {
+    await clearNetworkListingSkip(db, tenantId);
+  }
   res.json(await getPublicNetworkMembership(db, tenantId));
 });
 
@@ -653,7 +717,7 @@ settingsRouter.post('/config/network/start-connect', requireAuth, requireAdmin, 
       displayName: body.data.displayName ?? (tenantSlug ? tenantSlug : 'OpenPartner instance'),
       contactEmail: body.data.contactEmail ?? '',
       contactName: body.data.contactName,
-      tier: process.env.OPENPARTNER_TENANCY === 'multi' ? 'hosted' : 'self_hosted',
+      tier: networkTier(),
       portalCallbackUrl: body.data.portalCallbackUrl ?? inferredCallback,
     });
   } catch (err) {
@@ -733,7 +797,7 @@ settingsRouter.post('/config/network/auto-enroll', requireAuth, requireAdmin, as
       tier: 'hosted',
       portalCallbackUrl: inferredCallback,
       adminAuthToken: adminToken,
-      reviewStatus: tenantRow.approvalStatus,
+      reviewStatus: await networkReviewFor(db, platformDb, tenantId, tenantRow.approvalStatus),
     });
   } catch (err) {
     return res.status(502).json({ error: 'network_signup_failed', detail: err instanceof Error ? err.message : String(err) });
@@ -753,6 +817,8 @@ settingsRouter.post('/config/network/auto-enroll', requireAuth, requireAdmin, as
     autoEnroll: true,
     vendorId: signup.vendorId,
   });
+  // Joining brings the listing back if the brand had said "Not now".
+  await clearNetworkListingSkip(db, tenantId);
 
   res.json({ ok: true, vendorId: signup.vendorId });
 });
@@ -787,6 +853,7 @@ settingsRouter.post('/config/network/complete-connect', requireAuth, requireAdmi
     vendorToken: result.vendorToken,
     vendorId: result.vendorId,
   });
+  await clearNetworkListingSkip(db, tenantId);
 
   res.json({ ok: true, vendorId: result.vendorId, displayName: result.displayName });
 });
@@ -805,6 +872,10 @@ async function proxy(req: Request, res: Response, fn: (db: Knex, tenantId: strin
     res.status(successStatus).json(out);
   } catch (err) {
     if (err instanceof NetworkProxyError) {
+      if (await heldByTrackingGate(db, tenantId, err)) {
+        res.status(403).json({ error: 'tracking_not_verified', detail: TRACKING_NOT_VERIFIED_DETAIL });
+        return;
+      }
       res.status(err.status).json({ error: 'network_call_failed', detail: err.message });
       return;
     }
@@ -812,15 +883,29 @@ async function proxy(req: Request, res: Response, fn: (db: Knex, tenantId: strin
   }
 }
 
+/**
+ * The Network answers vendor_pending_review for an approved brand only
+ * because the tracking gate holds it back (tracking-verification.ts
+ * networkReviewStatus), so the portal shouldn't tell it it's in review.
+ */
+async function heldByTrackingGate(db: Knex, tenantId: string, err: NetworkProxyError): Promise<boolean> {
+  try {
+    if ((JSON.parse(err.message) as { error?: unknown }).error !== 'vendor_pending_review') return false;
+  } catch {
+    return false;
+  }
+  const tenant = await db(TABLES.Tenant).where({ id: tenantId }).first('approvalStatus');
+  return tenant?.approvalStatus === 'approved';
+}
+
 settingsRouter.get('/admin/network/me', requireAuth, requireAdmin, async (req, res) =>
   proxy(req, res, async (db, tenantId) => {
     // Fire a heartbeat opportunistically so a brand admin who just
     // updated their logo / added a partner / etc. doesn't have to wait
-    // until the next :07 cron. Fire-and-forget — don't block the page
-    // load on a Network blip.
-    sendHeartbeat(db, tenantId).catch((err) => {
-      console.error('[admin/network/me] opportunistic heartbeat failed', err);
-    });
+    // until the next :07 cron. After commit, in a transaction of its own:
+    // handed `db` without being awaited, it raced the response's commit.
+    // A Network blip is logged, never fails the page.
+    afterCommit(req, 'network heartbeat', (trx) => sendHeartbeat(trx, tenantId));
     // Override the Network's stored partnerCount with the local truth.
     // Network's value updates via the hourly heartbeat job — between
     // ticks (or before the first tick after connecting) it lags reality.
@@ -890,24 +975,342 @@ settingsRouter.post('/admin/network/offerings/:id/invite-creator', requireAuth, 
   proxy(req, res, (db, tenantId) => networkProxy.inviteCreator(db, tenantId, req.params.id!, req.body ?? {}), 201),
 );
 
-// Tracked storefront bookings — the brand books a creator's package from
-// Discover creators, then approves the delivered work here; the Network pays
-// it as a bonus through POST /bonuses. Bodies go through verbatim; the
-// Network validates them.
+// The creator index (openpartner-network docs/creator-index.md §4, §5):
+// creators not on OpenPartner yet, which brands on Flex or Enterprise search
+// and invite. The plan is checked here; the Network trusts the flag only from
+// hosted instances. Listing and withdrawing the brand's own invites needs no
+// plan, so a brand that moves off Flex can still see and withdraw them.
+
+/** Flex or Enterprise with the plan active, on the hosted platform. The
+ *  deployment's own mode decides "hosted": a self-hosted install can hold a
+ *  tenant row with a plan (an import from the hosted platform), and the
+ *  billing state's mode follows the plan, not the deployment. */
+export async function creatorIndexAllowed(db: Knex, tenantId: string): Promise<boolean> {
+  if (getMode() === 'selfhost') return false;
+  const state = await getTenantBillingState(db, tenantId);
+  return (state.plan === 'flex' || state.plan === 'enterprise') && hasActivePlan(state);
+}
+
+const INDEX_PLAN_REQUIRED = {
+  error: 'plan_required',
+  detail: 'Creators not on OpenPartner yet come with the Flex and Enterprise plans.',
+};
+
+const INDEX_QUERY_KEYS = [
+  'q',
+  'categories',
+  'locations',
+  'platforms',
+  'topics',
+  'mentions',
+  'minFollowers',
+  'maxFollowers',
+  'openToPartnerships',
+  'minEngagement',
+  'sort',
+  'limit',
+  'after',
+];
+
+/** Like proxy, but the Network's own error code (already_invited,
+ *  unreachable, rate_limited…) reaches the portal as `error`. */
+async function proxyIndex(req: Request, res: Response, fn: (db: Knex, tenantId: string) => Promise<unknown>, successStatus = 200) {
+  const { db, tenantId } = tenantOf(req);
+  try {
+    const out = await fn(db, tenantId);
+    if (successStatus === 204) return res.status(204).send();
+    res.status(successStatus).json(out);
+  } catch (err) {
+    if (!(err instanceof NetworkProxyError)) throw err;
+    if (await heldByTrackingGate(db, tenantId, err)) {
+      return res.status(403).json({ error: 'tracking_not_verified', detail: TRACKING_NOT_VERIFIED_DETAIL });
+    }
+    let code = 'network_call_failed';
+    try {
+      const parsed = JSON.parse(err.message) as { error?: unknown };
+      if (typeof parsed.error === 'string') code = parsed.error;
+    } catch {
+      // Not the Network's JSON (unreachable, not configured): keep the generic code.
+    }
+    res.status(err.status).json({ error: code });
+  }
+}
+
+settingsRouter.get('/admin/network/indexed-creators', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  if (!(await creatorIndexAllowed(db, tenantId))) return res.status(402).json(INDEX_PLAN_REQUIRED);
+  const qs = new URLSearchParams();
+  for (const key of INDEX_QUERY_KEYS) {
+    const v = req.query[key];
+    if (typeof v === 'string' && v) qs.set(key, v);
+  }
+  qs.set('creatorIndex', '1');
+  return proxyIndex(req, res, (db, tenantId) => networkProxy.searchIndexedCreators(db, tenantId, qs.toString()));
+});
+
+settingsRouter.get('/admin/network/indexed-creators/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  if (!(await creatorIndexAllowed(db, tenantId))) return res.status(402).json(INDEX_PLAN_REQUIRED);
+  return proxyIndex(req, res, (db, tenantId) => networkProxy.getIndexedCreator(db, tenantId, req.params.id!));
+});
+
+settingsRouter.post('/admin/network/creator-invites', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  if (!(await creatorIndexAllowed(db, tenantId))) return res.status(402).json(INDEX_PLAN_REQUIRED);
+  const b = bodyOf(req);
+  const fields = {
+    indexedCreatorId: b.indexedCreatorId,
+    message: b.message,
+    ...(b.offeringId ? { offeringId: b.offeringId } : {}),
+  };
+  return proxyIndex(
+    req,
+    res,
+    async (db, tenantId) => networkProxy.createCreatorInvite(db, tenantId, { ...fields, ...(await actingAdmin(req)), creatorIndex: true }),
+    201,
+  );
+});
+
+settingsRouter.get('/admin/network/creator-invites', requireAuth, requireAdmin, async (req, res) =>
+  proxyIndex(req, res, (db, tenantId) => networkProxy.listCreatorInvites(db, tenantId)),
+);
+
+settingsRouter.delete('/admin/network/creator-invites/:id', requireAuth, requireAdmin, async (req, res) =>
+  proxyIndex(req, res, (db, tenantId) => networkProxy.withdrawCreatorInvite(db, tenantId, req.params.id!), 204),
+);
+
+// Storefront bookings and conversations (openpartner-network
+// docs/creator-storefront.md §8). The brand talks to creators in the app,
+// books a package, pays upfront through Checkout on the creator's own Stripe
+// account once they agree a price, and approves the delivered work. Every
+// call that writes carries who at the brand is acting (the creator sees the
+// name; the email is where the brand's notifications go) and the booking fee
+// rate of the brand's plan (booking-fee.ts). The Network validates the rest.
+
+/** The signed-in admin, for the Network's authorName/authorEmail. An API
+ *  key has no person behind it, so it sends neither. */
+async function actingAdmin(req: Request): Promise<{ authorName?: string; authorEmail?: string }> {
+  const principal = req.principal;
+  if (principal?.role !== 'admin' || principal.source !== 'session') return {};
+  const { db, tenantId } = tenantOf(req);
+  const admin = (await db(TABLES.Admin).where({ id: principal.adminId, tenantId }).first(['name', 'email'])) as
+    | { name: string | null; email: string }
+    | undefined;
+  if (!admin) return {};
+  return { ...(admin.name ? { authorName: admin.name.slice(0, 120) } : {}), authorEmail: admin.email };
+}
+
+async function feeRate(db: Knex, tenantId: string): Promise<{ bookingFeeBps?: number }> {
+  const bps = await bookingFeeBpsFor(db, tenantId);
+  return bps == null ? {} : { bookingFeeBps: bps };
+}
+
+function bodyOf(req: Request): Record<string, unknown> {
+  return req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? (req.body as Record<string, unknown>) : {};
+}
+
 settingsRouter.get('/admin/network/bookings', requireAuth, requireAdmin, async (req, res) => {
   const status = typeof req.query.status === 'string' ? req.query.status : undefined;
   return proxy(req, res, (db, tenantId) => networkProxy.listBookings(db, tenantId, status));
 });
 
-settingsRouter.post('/admin/network/bookings', requireAuth, requireAdmin, async (req, res) =>
-  proxy(req, res, (db, tenantId) => networkProxy.createBooking(db, tenantId, req.body ?? {}), 201),
+settingsRouter.post('/admin/network/bookings', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  // A booking on one of the brand's offerings makes the creator its
+  // partner when they accept, and adding partners needs an active plan
+  // (trial-gate.ts). Refuse it here, not on the creator's accept.
+  if (bodyOf(req).offeringId && !hasActivePlan(await getTenantBillingState(db, tenantId))) {
+    return res.status(402).json({ error: 'plan_required', detail: 'Tracking a booking adds the creator as a partner, which needs an active plan.' });
+  }
+  // Only the booking's own fields come from the browser; who is acting and
+  // the fee rate are the server's to say.
+  const b = bodyOf(req);
+  const fields = Object.fromEntries(
+    (['creatorId', 'packageId', 'brief', 'amount', 'currency', 'offeringId'] as const).filter((k) => k in b).map((k) => [k, b[k]]),
+  );
+  return proxy(
+    req,
+    res,
+    async (db, tenantId) => networkProxy.createBooking(db, tenantId, { ...fields, ...(await actingAdmin(req)), ...(await feeRate(db, tenantId)) }),
+    201,
+  );
+});
+
+settingsRouter.post('/admin/network/bookings/claim', requireAuth, requireAdmin, async (req, res) =>
+  proxy(
+    req,
+    res,
+    async (db, tenantId) =>
+      networkProxy.claimBooking(db, tenantId, { token: bodyOf(req).token, ...(await actingAdmin(req)), ...(await feeRate(db, tenantId)) }),
+    201,
+  ),
 );
 
-for (const action of ['cancel', 'approve', 'retry-payout', 'recheck'] as const) {
+settingsRouter.post('/admin/network/bookings/:id/checkout', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, async (db, tenantId) => {
+    const rate = await bookingFeeBpsFor(db, tenantId);
+    return networkProxy.bookingAction(db, tenantId, req.params.id!, 'checkout', {
+      returnPath: typeof bodyOf(req).returnPath === 'string' ? bodyOf(req).returnPath : undefined,
+      ...(rate == null ? {} : { feeRateBps: rate }),
+    });
+  }),
+);
+
+for (const action of ['cancel', 'recheck', 'sync'] as const) {
   settingsRouter.post(`/admin/network/bookings/:id/${action}`, requireAuth, requireAdmin, async (req, res) =>
     proxy(req, res, (db, tenantId) => networkProxy.bookingAction(db, tenantId, req.params.id!, action)),
   );
 }
+
+/** Approving takes what the creator may share from the booking (the
+ *  approval dialog's choice; omitted keeps the brand's default). */
+settingsRouter.post('/admin/network/bookings/:id/approve', requireAuth, requireAdmin, async (req, res) => {
+  const b = bodyOf(req);
+  return proxy(req, res, (db, tenantId) =>
+    networkProxy.bookingAction(db, tenantId, req.params.id!, 'approve', 'creatorShare' in b ? { creatorShare: b.creatorShare } : {}),
+  );
+});
+
+// A delivered booking's report (the Network's docs/campaign-reports.md).
+settingsRouter.get('/admin/network/bookings/:id/report', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) => networkProxy.bookingReport(db, tenantId, req.params.id!)),
+);
+
+settingsRouter.post('/admin/network/bookings/:id/report/refresh', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) => networkProxy.refreshBookingReport(db, tenantId, req.params.id!)),
+);
+
+settingsRouter.patch('/admin/network/bookings/:id/report-sharing', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) =>
+    networkProxy.setBookingReportSharing(db, tenantId, req.params.id!, { creatorShare: bodyOf(req).creatorShare }),
+  ),
+);
+
+settingsRouter.get('/admin/network/bookings/:id/report/shares', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) => networkProxy.listBookingReportShares(db, tenantId, req.params.id!)),
+);
+
+settingsRouter.post('/admin/network/bookings/:id/report/shares', requireAuth, requireAdmin, async (req, res) => {
+  const b = bodyOf(req);
+  const fields = Object.fromEntries((['includeResults', 'includeCost', 'includeReported'] as const).filter((k) => k in b).map((k) => [k, b[k]]));
+  return proxy(req, res, (db, tenantId) => networkProxy.createBookingReportShare(db, tenantId, req.params.id!, fields), 201);
+});
+
+settingsRouter.post('/admin/network/bookings/:id/report/shares/:shareId/revoke', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) => networkProxy.revokeBookingReportShare(db, tenantId, req.params.id!, req.params.shareId!)),
+);
+
+/** What creators may share from the brand's bookings unless one says
+ *  otherwise. Read back through GET /admin/network/me. */
+settingsRouter.patch('/admin/network/report-sharing', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) =>
+    networkProxy.setReportSharingDefault(db, tenantId, { defaultCreatorShare: bodyOf(req).defaultCreatorShare }),
+  ),
+);
+
+settingsRouter.post('/admin/network/bookings/:id/track', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) => networkProxy.bookingAction(db, tenantId, req.params.id!, 'track', { offeringId: bodyOf(req).offeringId })),
+);
+
+settingsRouter.get('/admin/network/conversations', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, (db, tenantId) => networkProxy.listConversations(db, tenantId)),
+);
+
+settingsRouter.post('/admin/network/conversations', requireAuth, requireAdmin, async (req, res) =>
+  proxy(
+    req,
+    res,
+    async (db, tenantId) =>
+      networkProxy.startConversation(db, tenantId, {
+        creatorId: bodyOf(req).creatorId,
+        body: bodyOf(req).body,
+        ...(await actingAdmin(req)),
+      }),
+    201,
+  ),
+);
+
+settingsRouter.get('/admin/network/conversations/:id', requireAuth, requireAdmin, async (req, res) => {
+  const before = typeof req.query.before === 'string' ? req.query.before : undefined;
+  return proxy(req, res, (db, tenantId) => networkProxy.getConversation(db, tenantId, req.params.id!, before));
+});
+
+settingsRouter.post('/admin/network/conversations/:id/messages', requireAuth, requireAdmin, async (req, res) =>
+  proxy(
+    req,
+    res,
+    async (db, tenantId) =>
+      networkProxy.postConversationMessage(db, tenantId, req.params.id!, {
+        body: bodyOf(req).body,
+        // Images uploaded below, in the order they're shown.
+        attachmentIds: bodyOf(req).attachmentIds,
+        ...(await actingAdmin(req)),
+      }),
+    201,
+  ),
+);
+
+/** An image body, raw. Too big or not an image answers here, as JSON, once
+ *  the rest has been read (and thrown away): the browser gets the answer
+ *  rather than a reset connection. */
+const rawConversationImage: RequestHandler = (req, res, next) => {
+  express.raw({ type: CONVERSATION_IMAGE_TYPES, limit: CONVERSATION_IMAGE_MAX_BYTES })(req, res, (err?: unknown) => {
+    const refuse = (status: number, body: Record<string, unknown>) => {
+      const answer = () => {
+        if (!res.headersSent) res.status(status).json(body);
+      };
+      if (req.complete) return answer();
+      req.once('end', answer);
+      req.resume();
+    };
+    if (err) {
+      const e = err as { status?: number; type?: string };
+      if (e.status === 413 || e.type === 'entity.too.large') return refuse(413, { error: 'payload_too_large', maxBytes: CONVERSATION_IMAGE_MAX_BYTES });
+      return refuse(400, { error: 'invalid_body' });
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) return refuse(415, { error: 'unsupported_content_type', allowed: CONVERSATION_IMAGE_TYPES });
+    next();
+  });
+};
+
+// An image to send in the thread: uploaded first, then sent by listing its
+// id on the message. The Network checks what it is from its bytes.
+settingsRouter.post('/admin/network/conversations/:id/attachments', requireAuth, requireAdmin, rawConversationImage, async (req, res) => {
+  const contentType = String(req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+  const image = req.body as Buffer;
+  return proxy(req, res, (db, tenantId) => networkProxy.uploadConversationAttachment(db, tenantId, req.params.id!, image, contentType), 201);
+});
+
+// An image's file, for the thread. Only ever an image: the Network's type
+// is checked (network-client.ts fetchNetworkFile) and pinned here. Never
+// cached, so signing out or a takedown takes effect at once.
+settingsRouter.get('/admin/network/conversations/:id/attachments/:attachmentId', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  try {
+    const file = await networkProxy.conversationAttachmentFile(db, tenantId, req.params.id!, req.params.attachmentId!);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+    res.setHeader('Content-Disposition', 'inline');
+    res.send(file.body);
+  } catch (err) {
+    if (err instanceof NetworkProxyError) {
+      res.status(err.status).json({ error: 'network_call_failed', detail: err.message });
+      return;
+    }
+    throw err;
+  }
+});
+
+// A ticket for the thread's live socket, and where to open it (the
+// Network's realtime.ts). The signed-in admin's name is what the creator
+// sees while they type.
+settingsRouter.post('/admin/network/conversations/:id/realtime', requireAuth, requireAdmin, async (req, res) =>
+  proxy(req, res, async (db, tenantId) => {
+    const { authorName } = await actingAdmin(req);
+    return networkProxy.conversationRealtime(db, tenantId, req.params.id!, authorName ? { authorName } : {});
+  }),
+);
 
 // ---------- Network billing proxy ----------
 // Self-hosted vendors subscribe to Network access ($29/mo + 3% metered)

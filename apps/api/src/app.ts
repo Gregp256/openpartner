@@ -8,11 +8,15 @@ import pinoHttp from 'pino-http';
 import type { DestinationStream } from 'pino';
 import rateLimit from 'express-rate-limit';
 import { ulid } from 'ulid';
+import { trustProxyFromEnv } from '@openpartner/db';
 
 import { stripeWebhookRouter } from './routes/stripe-webhook.js';
 import { stripeAppWebhookRouter } from './routes/stripe-app-webhook.js';
+import { paypalWebhookRouter } from './routes/paypal-webhook.js';
+import { paypalRouter } from './routes/paypal.js';
 import { stripeAppCallbackRouter, stripeAppRouter } from './routes/stripe-app.js';
 import { identifyRouter } from './routes/identify.js';
+import { consentRegionRouter } from './routes/consent-region.js';
 import { eventsRouter } from './routes/events.js';
 import { conversionsRouter } from './routes/conversions.js';
 import { refundsRouter } from './routes/refunds.js';
@@ -36,6 +40,10 @@ import { authRouter } from './routes/auth.js';
 import { partnerAuthRouter } from './routes/partner-auth.js';
 import { adminOverviewRouter } from './routes/admin-overview.js';
 import { funnelRouter } from './routes/funnel.js';
+import { trackingHealthRouter } from './routes/tracking-health.js';
+import { journeyRouter } from './routes/journey.js';
+import { referralsRouter } from './routes/referrals.js';
+import { recruitsRouter } from './routes/recruits.js';
 import { settingsRouter } from './routes/settings.js';
 import { mountStaticUploads, uploadsRouter } from './routes/uploads.js';
 import { brandResourcesRouter } from './routes/brand-resources.js';
@@ -45,18 +53,21 @@ import { fraudReviewRouter } from './routes/fraud-review.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { metricsRouter } from './routes/metrics.js';
 import { signupRouter } from './routes/signup.js';
+import { bookingClaimsRouter } from './routes/booking-claims.js';
 import { partnerSignupRouter } from './routes/partner-signup.js';
 import { networkPartnerRouter } from './routes/network-partner.js';
 import { accountDeletionRouter } from './routes/account-deletion.js';
 import { accountLocationRouter } from './routes/account-location.js';
 import { partnerCampaignsRouter } from './routes/partner-campaigns.js';
 import { partnerPostbacksRouter } from './routes/partner-postbacks.js';
+import { partnerSigninLinkRouter } from './routes/partner-signin-link.js';
 import { payoutProfilesRouter } from './routes/payout-profiles.js';
 import { onboardingRouter } from './routes/onboarding.js';
 import { creatorPortalRouter } from './routes/creator-portal.js';
 import { signinRouter } from './routes/signin.js';
 import { portalDomainGateRouter, portalDomainsRouter } from './routes/portal-domains.js';
 import { clicksRouter } from './routes/clicks.js';
+import { networkRecipientsRouter } from './routes/network-recipients.js';
 import { sessionHomeRouter } from './routes/session-home.js';
 import { platformAuthRouter } from './routes/platform-auth.js';
 import { platformAdminRouter } from './routes/platform-admin.js';
@@ -76,9 +87,12 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
 
   // Trust the first proxy hop so req.ip is the client IP, not the load
   // balancer. DO App Platform and Caddy both terminate TLS and forward
-  // with X-Forwarded-For. One hop is correct — trusting more would let a
-  // client spoof their IP by setting X-Forwarded-For themselves.
-  app.set('trust proxy', 1);
+  // with X-Forwarded-For. Trusting a second hop blindly would let a client
+  // spoof their IP by setting X-Forwarded-For themselves, so
+  // TRUST_PROXY=cloudflare (hosted: Cloudflare sits in front of App
+  // Platform's ingress) trusts it only when it's a Cloudflare address
+  // (packages/db/src/trusted-proxy.ts).
+  app.set('trust proxy', trustProxyFromEnv(process.env.TRUST_PROXY) ?? 1);
 
   app.use(helmet());
   // CORS: credentials: true so the portal can send the op_session cookie
@@ -100,7 +114,9 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   if (corsOrigins.length === 0 && process.env.NODE_ENV === 'production') {
     throw new Error('PORTAL_URL must be set in production so CORS has an origin allowlist');
   }
-  // /attribution/identify is the browser SDK's stitch call, made from the
+  // /attribution/identify is the browser SDK's stitch call (and
+  // /attribution/landing its landing beacon, /consent-region its consent
+  // rule lookup), made from the
   // BRAND'S OWN website origin (acme.com) — an origin we can never
   // allowlist ahead of time. It gets analytics-collector CORS: any origin,
   // NO credentials (the endpoint is deliberately unauthenticated,
@@ -109,7 +125,7 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   // the OPTIONS preflight for this path; the global middleware runs after
   // but never unsets headers, so the open ACAO survives for this route
   // only. Everything else keeps the strict allowlist + credentials.
-  const IDENTIFY_PATH = /^(?:\/(?:api\/)?t\/[a-z0-9-]+)?\/attribution\/identify\/?$/;
+  const IDENTIFY_PATH = /^(?:\/(?:api\/)?t\/[a-z0-9-]+)?\/(?:attribution\/(?:identify|landing)|consent-region)\/?$/;
   const identifyCors = cors({ origin: true, credentials: false });
   app.use((req, res, next) => (IDENTIFY_PATH.test(req.path) ? identifyCors(req, res, next) : next()));
 
@@ -204,6 +220,9 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   // Hosted brands' own Stripe accounts, via the OpenPartner Stripe App —
   // its own route and signing secrets (stripe-app-webhook.ts). Raw body too.
   app.use(stripeAppWebhookRouter);
+  // Brands' own PayPal apps, for Pay with PayPal: verified by PayPal, raw
+  // body, the tenant from the connection the URL names (paypal-webhook.ts).
+  app.use(paypalWebhookRouter);
 
   // /import is a full-database bundle; 1 MB caps out around a few
   // hundred Click rows. Give it its own parser before the global one
@@ -227,6 +246,8 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   // directly and are responsible for their own access control.
   app.use(installRouter);
   app.use(signupRouter);
+  // A public storefront request continuing as a brand (booking-claims.ts).
+  app.use(bookingClaimsRouter);
   app.use(signinRouter);
   app.use(sessionHomeRouter);
   app.use(platformAuthRouter);
@@ -254,6 +275,9 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   // Stripe App OAuth callback: Stripe redirects to one fixed URL with no
   // tenant in it; the signed state names the tenant (routes/stripe-app.ts).
   app.use(stripeAppCallbackRouter);
+  // The SDK's consent rule lookup, tenant prefix or not, with no tenant
+  // transaction: it's one call per page view (routes/consent-region.ts).
+  app.use(consentRegionRouter);
 
   // ----- Tenant scope -----
   // Everything below runs inside a per-request transaction with
@@ -288,6 +312,10 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   app.use(uploadsRouter);
   app.use(brandResourcesRouter);
   app.use(funnelRouter);
+  app.use(trackingHealthRouter);
+  app.use(referralsRouter);
+  app.use(journeyRouter);
+  app.use(recruitsRouter);
   app.use(fraudReviewRouter);
   app.use(webhooksRouter);
   app.use(identifyRouter);
@@ -295,14 +323,17 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   app.use(conversionsRouter);
   app.use(refundsRouter);
   app.use(partnersRouter);
+  app.use(partnerSigninLinkRouter);
   app.use(programsRouter);
   app.use(linksRouter);
   app.use(clicksRouter);
+  app.use(networkRecipientsRouter);
   app.use(dashboardRouter);
   app.use(apiKeysRouter);
   app.use(connectRouter);
   app.use(stripeAppRouter);
   app.use(payoutsRouter);
+  app.use(paypalRouter);
   app.use(recoveryRouter);
   app.use(commissionsRouter);
   app.use(bonusesRouter);
@@ -320,6 +351,13 @@ export function createApp(options: { enableLogger?: boolean; logDestination?: De
   app.use(partnerPostbacksRouter);
   app.use(payoutProfilesRouter);
   app.use(onboardingRouter);
+
+  // Nothing matched: answer in the API's own error shape, not Express's
+  // default HTML "Cannot GET /…" page. A /t/<slug>/ path whose workspace
+  // doesn't exist is answered earlier, by tenantMiddleware.
+  app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'not_found' });
+  });
 
   app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
     req.log?.error({ err }, 'request_failed');

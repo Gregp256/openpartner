@@ -10,7 +10,8 @@ installs aren't metered, so none of this applies to them.
 ## The rule
 
 For every attributed conversion (a non-corrective event a partner was
-credited for):
+credited for; a PayPal sandbox app's payments are test money and never
+count, [paypal-payments.md](paypal-payments.md#sandbox)):
 
 ```
 fee = max( revenueRate × revenue , commissionRate × commissions )
@@ -65,6 +66,13 @@ partners shared it.
 `commissions` is what partners hold on the conversion: the sum of its live
 (not reversed) `Commission` amounts **over every touch**, fixed and percent,
 net of `refund_clawback` adjustments.
+
+That includes recruiter commissions ([two-tier-commissions.md](two-tier-commissions.md)).
+A recruiter's share of a recruit's commission sits on the same attribution,
+so it adds to the commission side of the conversion it was earned on. It
+never decides the revenue side: its `rateType` is `recruiter`, so a
+conversion counts as revenue only through its own commission's rate, type
+or the program's declared types, as before.
 
 ### Refunds and reversals
 

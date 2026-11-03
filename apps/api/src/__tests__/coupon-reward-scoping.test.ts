@@ -81,6 +81,8 @@ const TABLES_TO_CLEAN = [
   TABLES.Program,
   TABLES.ApiKey,
   TABLES.Partner,
+  // An unknown code at /coupons/redeem is counted (tracking-issues.ts).
+  TABLES.TrackingIssue,
 ];
 
 const FREE_YEAR: CustomerReward = { type: 'free_months', value: 12, duration: 'repeating' };
@@ -295,6 +297,18 @@ describe.skipIf(skipIntegration)('coupon reward scoping', () => {
       const res = await mint(ADMIN_KEY, partnerId, { programId, code: 'WELCOME10' });
       expect(res.status).toBe(201);
       expect(fake.client.promotionCodes.list).not.toHaveBeenCalled();
+      // Recorded, so the Stripe webhook credits the partner for that promo.
+      expect(res.body.brandChosen).toBe(true);
+    });
+
+    it("a code the admin didn't type isn't marked as the brand's choice", async () => {
+      const { partnerId, programId } = await seed({ customerReward: null });
+      const generated = await mint(ADMIN_KEY, partnerId, { programId });
+      expect(generated.status).toBe(201);
+      expect(generated.body.brandChosen).toBe(false);
+      const partnerChosen = await mint(await federatedKey(), partnerId, { programId, code: 'PARTNER20' });
+      expect(partnerChosen.status).toBe(201);
+      expect(partnerChosen.body.brandChosen).toBe(false);
     });
 
     it('Stripe unreachable during the check → 503 for a partner-chosen code, nothing minted', async () => {

@@ -27,13 +27,13 @@
 
 import { Router } from 'express';
 import type { Knex } from 'knex';
-import { z } from 'zod';
+import { z } from '../zod.js';
 import type Stripe from 'stripe';
 import { TABLES, type AdminRow, type BillingPlan, type TenantRow } from '@openpartner/db';
 import { requireAdmin, requireAuth, type ApiKeyPrincipal } from '../auth.js';
 import { REVSHARE_FEE_BPS, requireStripe } from '../stripe.js';
 import { describeTenantFee } from '../fee-terms.js';
-import { getTenantBillingState, priceIdsForPlan, type TenantBillingState } from '../billing-plan.js';
+import { BILLING_CUSTOMER_ROLE, getTenantBillingState, priceIdsForPlan, type TenantBillingState } from '../billing-plan.js';
 import {
   applyCustomerTaxDetails,
   InvoiceSubscribeError,
@@ -44,6 +44,7 @@ import {
   type CollectionTerms,
 } from '../invoice-billing.js';
 import { reportUsageToStripe } from '../usage-billing.js';
+import { houseCustomerMetadata } from '../house-program.js';
 import { tenantOf } from '../tenancy.js';
 import { getWhiteLabelState } from '../white-label.js';
 import { getNetworkMembership } from '../network-client.js';
@@ -385,14 +386,17 @@ billingRouter.post('/billing/checkout', requireAuth, requireAdmin, async (req, r
   // Reuse Stripe Customer if one exists from a prior aborted Checkout
   // attempt; otherwise create + persist on Tenant.stripeCustomerId so
   // the Customer Portal works on the same record after subscription
-  // completion.
+  // completion. A brand a partner referred to OpenPartner also gets its
+  // house-program user id (house-program.ts). Never client_reference_id on
+  // the session: handleConnectEvent reads one as "not our subscription".
   let customerId = state.stripeCustomerId;
   if (!customerId) {
     const customer = await stripe.customers.create({
       email: body.data.customerEmail,
       metadata: {
-        openpartner_role: 'merchant_self_subscription',
+        openpartner_role: BILLING_CUSTOMER_ROLE,
         openpartner_tenant_id: tenantId,
+        ...(await houseCustomerMetadata(tenantId)),
       },
     });
     customerId = customer.id;
@@ -642,14 +646,14 @@ function invoiceView(inv: Stripe.Invoice) {
 }
 
 /** Where Stripe emails a tenant's invoices: the signed-in admin, else the
- *  brand's first admin. */
+ *  brand's first full admin. */
 async function adminEmail(db: Knex, tenantId: string, principal: ApiKeyPrincipal | undefined): Promise<string | null> {
   if (principal?.role === 'admin' && principal.source === 'session') {
     const me = await db<AdminRow>(TABLES.Admin).where({ id: principal.adminId, tenantId }).first(['email']);
     if (me) return me.email;
   }
   const first = await db<AdminRow>(TABLES.Admin)
-    .where({ tenantId })
+    .where({ tenantId, role: 'admin' })
     .whereNull('revokedAt')
     .orderBy('createdAt', 'asc')
     .first(['email']);

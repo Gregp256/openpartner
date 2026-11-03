@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router';
-import { CalendarCheck, Globe, Inbox, Link2, LogOut, Megaphone, Menu, Network, Store, UserCog } from 'lucide-react';
+import { CalendarCheck, Globe, Inbox, Link2, LogOut, Megaphone, Menu, MessagesSquare, Network, Store, UserCog } from 'lucide-react';
 import { theme } from '../../theme.js';
 import { useIsMobile } from '../../lib/useMediaQuery.js';
 import { ProfileCompletionBanner } from '../../lib/ProfileCompletionBanner.js';
@@ -22,7 +22,12 @@ import { CreatorProgramDetailPage } from './CreatorProgramDetail.js';
 import { CreatorStorefrontPage } from './CreatorStorefront.js';
 import { CreatorStorefrontSetupPage } from './CreatorStorefrontSetup.js';
 import { CreatorBookingsPage } from './CreatorBookings.js';
+import { CreatorBookingReportPage } from './CreatorBookingReport.js';
+import { CreatorMessagesPage, CreatorThreadPage, useCreatorUnreadMessages } from './CreatorMessages.js';
+import { UnreadDot } from './conversation-shared.js';
+import { clearAttachmentCache } from './conversation-media.js';
 import { CreatorLocationPrompt, useCreatorLocationMissing } from './CreatorLocation.js';
+import { CreatorReviewBanners } from './CreatorReview.js';
 
 interface Whoami {
   creator: { id: string; name: string; email: string; handle: string | null; avatarUrl: string | null; bio: string | null } | null;
@@ -65,6 +70,9 @@ export function CreatorShell() {
         {isMobile && <CreatorMobileTopBar onMenu={() => setDrawerOpen(true)} />}
         <CreatorLocationGate isMobile={isMobile} />
         {!location.pathname.startsWith('/creator/profile') && <ProfileIncompleteBanner isMobile={isMobile} />}
+        {/* Everywhere, the profile page included: a message usually asks
+            for a profile change. */}
+        <CreatorReviewBanners isMobile={isMobile} />
         {/* Redirects are absolute on purpose: this shell sits on a splat
             route (/creator/*), where React Router 7 resolves a relative
             "discover" against the whole URL — /creator/a/b → /creator/a/b/discover,
@@ -82,7 +90,10 @@ export function CreatorShell() {
           <Route path="storefront" element={<CreatorStorefrontPage />} />
           <Route path="storefront/setup" element={<CreatorStorefrontSetupPage />} />
           <Route path="bookings" element={<CreatorBookingsPage />} />
-          <Route path="profile" element={<CreatorMyProfilePage />} />
+          <Route path="bookings/:id/report" element={<CreatorBookingReportPage />} />
+          <Route path="messages" element={<CreatorMessagesPage />} />
+          <Route path="messages/:id" element={<CreatorThreadPage />} />
+          <Route path="profile/*" element={<CreatorMyProfilePage />} />
           <Route path="*" element={<Navigate to="/creator/discover" replace />} />
         </Routes>
       </main>
@@ -202,6 +213,7 @@ function CreatorMobileDrawer({ open, onClose, children }: { open: boolean; onClo
 function CreatorSidebar({ creator, variant = 'sidebar' }: { creator: NonNullable<Whoami['creator']>; variant?: 'sidebar' | 'drawer' }) {
   const nav = useNavigate();
   const isDrawer = variant === 'drawer';
+  const unread = useCreatorUnreadMessages();
   return (
     <aside
       style={{
@@ -233,7 +245,12 @@ function CreatorSidebar({ creator, variant = 'sidebar' }: { creator: NonNullable
           <CreatorNavItem to="/creator/requests" icon={<Inbox size={16} />}>My applications</CreatorNavItem>
         </NavSection>
         <NavSection title="Storefront">
-          <CreatorNavItem to="/creator/storefront" icon={<Store size={16} />}>Packages</CreatorNavItem>
+          <CreatorNavItem to="/creator/storefront" icon={<Store size={16} />}>Setup</CreatorNavItem>
+          <CreatorNavItem to="/creator/messages" icon={<MessagesSquare size={16} />}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              Messages <UnreadDot count={unread} />
+            </span>
+          </CreatorNavItem>
           <CreatorNavItem to="/creator/bookings" icon={<CalendarCheck size={16} />}>Bookings</CreatorNavItem>
         </NavSection>
         <NavSection title="Settings">
@@ -251,6 +268,8 @@ function CreatorSidebar({ creator, variant = 'sidebar' }: { creator: NonNullable
           } catch {
             /* ignore */
           }
+          // Conversation images are kept in memory; nobody else gets them.
+          clearAttachmentCache();
           nav('/');
         }}
         style={{

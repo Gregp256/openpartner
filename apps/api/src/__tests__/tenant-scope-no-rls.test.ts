@@ -17,7 +17,8 @@
  *     onboarding
  *   - routes keyed on a partner ID in the URL, which requirePartnerOrAdmin
  *     lets any admin name: manual payout confirmation and payout history,
- *     Stripe Connect onboarding and status, partner postbacks
+ *     Stripe Connect onboarding and status, partner postbacks, a partner's
+ *     referrals, customers and events
  *   - per-tenant-unique keys: coupon codes, link keys, sign-in emails and
  *     magic links, the public signup
  *
@@ -358,6 +359,38 @@ describe.skipIf(skipIntegration)('payouts and attribution without RLS', () => {
 
     expect(result.status).toBe('no_click');
     expect(await db(TABLES.Attribution).where({ eventId })).toEqual([]);
+  });
+
+  it("attributeEvent reads a click's program in the event's own tenant", async () => {
+    // An imported click in B that names A's program: A's terms must not
+    // decide B's credit.
+    const userId = `u-${ulid()}`;
+    await seedIdentity(B.id, await seedClick(B.id, bPartnerId, aProgramId), userId);
+    const eventId = await seedEvent(B.id, userId);
+    const event = await db(TABLES.Event).where({ id: eventId }).first();
+
+    const result = await attributeEvent(appDb, event);
+
+    expect(result.status).toBe('outside_window');
+    expect(await db(TABLES.Attribution).where({ eventId })).toEqual([]);
+  });
+
+  it("the customer journey shows only the tenant's own customer, touches and events", async () => {
+    // userId is the brand's own user ID, so A and B can both have this one.
+    const userId = `shared-${ulid()}`;
+    await seedIdentity(A.id, await seedClick(A.id, aPartnerId, aProgramId), userId);
+    const aEvent = await seedEvent(A.id, userId);
+
+    expect((await request(app).get(`/t/${B.slug}/customers/${userId}/journey`).set(asB())).status).toBe(404);
+    expect((await request(app).get(`/t/${B.slug}/events/${aEvent}/journey`).set(asB())).status).toBe(404);
+
+    // B's own event for the same userId: none of A's touches, events or credit.
+    await seedEvent(B.id, userId);
+    const own = await request(app).get(`/t/${B.slug}/customers/${userId}/journey`).set(asB());
+    expect(own.status).toBe(200);
+    expect(own.body.touches).toEqual([]);
+    expect(own.body.events).toHaveLength(1);
+    expect(own.body.selected).toMatchObject({ status: 'no_identity', recorded: [] });
   });
 
   it("POST /attribution/identify doesn't stitch another tenant's click", async () => {
@@ -832,6 +865,18 @@ describe.skipIf(skipIntegration)('partner-keyed routes without RLS', () => {
     const res = await request(app).get(`/t/${B.slug}/partners/${aPartnerId}/postbacks`).set(asB());
     expect(res.status).toBe(200);
     expect(res.body.postbacks).toEqual([]);
+  });
+
+  it("GET /partners/:id/referrals, /customers and /events don't list another tenant's partner's customers", async () => {
+    const programId = await seedProgram(A.id);
+    await seedConversion(A.id, aPartnerId, programId, 'accrued');
+    const referrals = await request(app).get(`/t/${B.slug}/partners/${aPartnerId}/referrals`).set(asB());
+    expect(referrals.status).toBe(404);
+    for (const list of ['customers', 'events'] as const) {
+      const res = await request(app).get(`/t/${B.slug}/partners/${aPartnerId}/${list}`).set(asB());
+      expect(res.status).toBe(200);
+      expect(res.body[list]).toEqual([]);
+    }
   });
 
   it("POST /partners/:id/postbacks doesn't add a postback to another tenant's partner", async () => {

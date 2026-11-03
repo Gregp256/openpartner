@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import { theme } from '../theme.js';
+import { useNextPath, withNext } from '../lib/signin-next.js';
 import { Logo } from './auth/Shared.js';
+import { ViewOnlyBadge } from '../lib/viewOnly.js';
 
 interface Workspace {
   tenantSlug: string;
   tenantDisplayName: string;
   adminId: string;
   activated: boolean;
+  role?: 'admin' | 'viewer';
 }
 
 interface WorkspacesResponse {
@@ -20,9 +23,14 @@ interface WorkspacesResponse {
  * an identity session; this page lists the brands the verified email
  * admins and lets the user enter one. Auto-skips when there's only one
  * workspace.
+ *
+ * ?next= (lib/signin-next.ts) is a page inside the workspace to open
+ * instead of its home — /go/creators/:handle lands here with one. Signed
+ * out, it rides along to /signin and comes back.
  */
 export function WorkspacesPage() {
   const nav = useNavigate();
+  const next = useNextPath();
   const [data, setData] = useState<WorkspacesResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busySlug, setBusySlug] = useState<string | null>(null);
@@ -32,7 +40,7 @@ export function WorkspacesPage() {
     fetch('/api/me/workspaces', { credentials: 'include' })
       .then(async (r) => {
         if (r.status === 401) {
-          if (!cancelled) nav('/signin', { replace: true });
+          if (!cancelled) nav(withNext('/signin', next), { replace: true });
           return null;
         }
         if (!r.ok) throw new Error(`${r.status}`);
@@ -72,7 +80,8 @@ export function WorkspacesPage() {
       });
       const j = (await r.json()) as { ok?: boolean; home?: string; error?: string };
       if (!r.ok || !j.ok || !j.home) throw new Error(j.error ?? `${r.status}`);
-      nav(j.home, { replace: true });
+      // home is /t/<slug>/; next is a path inside it.
+      nav(next ? `${j.home.replace(/\/$/, '')}${next}` : j.home, { replace: true });
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Could not enter workspace.');
       setBusySlug(null);
@@ -117,7 +126,10 @@ export function WorkspacesPage() {
               }}
             >
               <div>
-                <div style={{ fontWeight: 600, fontSize: 14 }}>{w.tenantDisplayName}</div>
+                <div style={{ fontWeight: 600, fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {w.tenantDisplayName}
+                  {w.role === 'viewer' && <ViewOnlyBadge />}
+                </div>
                 <div style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
                   /t/{w.tenantSlug}/{!w.activated && ' · activates on entry'}
                 </div>

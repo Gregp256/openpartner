@@ -29,6 +29,7 @@ import { applyWhiteLabelFromSubscription, subscriptionHasWhiteLabel, whiteLabelP
 import { ensureCouponClickAndIdentity, findCouponByCode } from './coupons.js';
 import { handleFundingEvent, InboxEventHeldError } from '../funding/webhook.js';
 import {
+  BILLING_CUSTOMER_ROLE,
   markInvoicePaid,
   mirrorHostedBillingState,
   type InvoiceOverdue,
@@ -38,6 +39,8 @@ import { adoptInvoiceSubscription, invoiceDueTracked, refreshInvoiceDue } from '
 import { getMode } from '../stripe.js';
 import { fromStripeMinor, majorToCents, stripeMinorToCents } from '../stripe-amounts.js';
 import { getTenancyMode } from '../tenancy.js';
+import { recordTestLink } from '../test-clicks.js';
+import { looksLikeClickId, noteTrackingIssue } from '../tracking-issues.js';
 import {
   announceRefund,
   applyRefund,
@@ -319,6 +322,9 @@ export interface BrandStripeSource {
   keyRevenueByTransaction: boolean;
   /** Merged into every recorded Event's metadata. */
   eventMetadata?: Record<string, unknown>;
+  /** How the event reached the pipeline, as StripeEventLog records it.
+   *  Default 'webhook'; the catch-up (stripe-event-catchup.ts) says so. */
+  via?: 'webhook' | 'catchup';
 }
 
 /**
@@ -334,6 +340,17 @@ export async function processBrandStripeEvent(
   event: Stripe.Event,
   tenantId: string,
 ): Promise<{ result: Record<string, unknown>; refunds: NonNullable<MappedEvent['refund']>[] }> {
+  // A brand's own events are logged whatever they come to, in the same
+  // transaction: the catch-up replays only events with no row, so a skipped
+  // event stays skipped and a rolled-back one is tried again. OpenPartner's
+  // billing account (brandAccount false) has nothing to catch up.
+  if (source.brandAccount) {
+    await trx(TABLES.StripeEventLog)
+      .insert({ stripeEventId: event.id, tenantId, type: event.type, via: source.via ?? 'webhook' })
+      .onConflict('stripeEventId')
+      .ignore();
+  }
+
   // Coupon auto-redemption (brand accounts only): if the event carries a
   // discount code that matches an OpenPartner Coupon in this tenant, ensure
   // the synthetic Click + Identity exist BEFORE the standard attribution
@@ -407,6 +424,19 @@ async function recordMappedEvent(
     // Retry of a previously-processed event — the first delivery
     // already attributed it. Return 2xx so Stripe stops retrying.
     const existing = await trx<EventRow>(TABLES.Event).where({ tenantId, externalEventId }).first();
+    // Unless the brand's own call took the key first. recordedFromStripe
+    // refuses a forwarded Checkout Session or invoice id now, but an Event
+    // recorded before that (or forwarded while a connection was down) still
+    // holds it, and this conversion goes unrecorded. Redelivery can't help.
+    if (existing && existing.metadata?.stripeEventId == null) {
+      console.warn('[stripe-webhook] key already taken by a forwarded conversion; not recorded', {
+        stripeEventId: event.id,
+        externalEventId,
+        type: mapped.type,
+        value: mapped.value ?? null,
+        heldBy: { eventId: existing.id, type: existing.type, value: existing.value },
+      });
+    }
     return { idempotent: true, eventId: existing?.id };
   }
 
@@ -1147,13 +1177,34 @@ async function mapStripeEvent(
         // stitchFromCompletedCheckouts. Anywhere else this is OpenPartner's
         // billing account, and the Stripe read would find nobody.
         if (!customerId || !source.brandAccount || !checkoutPaymentRevenue(session, customerId)) return null;
-        const userId = await resolveUserIdFromCustomer(trx, tenantId, stripe, customerId);
+        const userId = await resolveUserIdFromCustomer(trx, tenantId, source, customerId);
         if (!userId) return null;
         if (userId !== customerId) await lockMerchantUser(trx, tenantId, userId);
         return checkoutEvents(revenue(userId));
       };
 
       if (!cref) return withoutLink();
+
+      // A cref that names no click: counted for Admin → Tracking health,
+      // split by shape. One shaped like a click id is a click this tenant
+      // doesn't have (a stale link, another program's script); anything
+      // else is the brand's own id in client_reference_id, where partner
+      // clicks can't ride. Brand accounts only: on OpenPartner's billing
+      // account the field is ours. An admin's test click (test-clicks.ts)
+      // isn't a click either: the checkout links the test, and the sale is
+      // recorded as if nothing had carried it.
+      const unlinked = async (): Promise<MappedEvent[] | null> => {
+        if (source.brandAccount) {
+          if (looksLikeClickId(cref) && (await recordTestLink(trx, tenantId, cref, 'checkout'))) return withoutLink();
+          await noteTrackingIssue(
+            trx,
+            tenantId,
+            looksLikeClickId(cref) ? 'stripe_unknown_click' : 'stripe_foreign_reference',
+            cref,
+          );
+        }
+        return withoutLink();
+      };
 
       if (!customerId) {
         // A guest checkout: mode=payment without a Customer, a Stripe
@@ -1163,7 +1214,7 @@ async function mapStripeEvent(
         // /attribution/conversions does without a userId.
         const userId = redeemed?.userId ?? clickUserId(cref);
         const stitch = await stitchCheckoutCustomer(trx, tenantId, cref, userId);
-        if (!stitch) return withoutLink();
+        if (!stitch) return unlinked();
         return checkoutEvents(signup(userId), revenue(userId));
       }
 
@@ -1178,14 +1229,14 @@ async function mapStripeEvent(
         stripe.customers.retrieve(customerId),
       );
       const customer = fetched && !fetched.deleted ? fetched : null;
-      const metadataUserId = customer?.metadata?.openpartner_user_id;
+      const metadataUserId = customer ? customerUserId(source, customer) : null;
       if (metadataUserId && metadataUserId !== customerId) {
         // Locked before the stitch so a concurrent customer.created or
         // invoice.paid for this user either sees our Identity or has
         // committed the Event our backlog pass below picks up.
         await lockMerchantUser(trx, tenantId, metadataUserId);
         const stitch = await stitchCheckoutCustomer(trx, tenantId, cref, metadataUserId);
-        if (!stitch) return withoutLink();
+        if (!stitch) return unlinked();
         // Events that beat this stitch (customer.created's signup, an
         // early invoice) were recorded under the merchant's id with no
         // click to credit.
@@ -1197,7 +1248,7 @@ async function mapStripeEvent(
       }
 
       const stitch = await stitchCheckoutCustomer(trx, tenantId, cref, customerId);
-      if (!stitch) return withoutLink();
+      if (!stitch) return unlinked();
 
       // Backfill metadata so the cheaper resolve path (metadata lookup)
       // works for downstream invoice.paid / subscription events. Best-
@@ -1219,7 +1270,7 @@ async function mapStripeEvent(
     }
     case 'customer.created': {
       const customer = event.data.object as Stripe.Customer;
-      const userId = customer.metadata?.openpartner_user_id;
+      const userId = customerUserId(source, customer);
       if (!userId) return null;
       // checkout.session.completed records this user's signup too when the
       // customer also checks out with a cref. One per merchant userId.
@@ -1233,7 +1284,7 @@ async function mapStripeEvent(
       const sub = event.data.object as Stripe.Subscription;
       const userId =
         sub.metadata?.openpartner_user_id ??
-        (await resolveUserIdFromCustomer(trx, tenantId, stripe, sub.customer)) ??
+        (await resolveUserIdFromCustomer(trx, tenantId, source, sub.customer)) ??
         (await stitchFromCompletedCheckouts(trx, source, tenantId, sub.customer));
       if (!userId) return null;
       // Keyed to a merchant-set userId: wait out a concurrent checkout
@@ -1249,7 +1300,7 @@ async function mapStripeEvent(
       // on every renewal of every such customer.
       const fromCheckout = !RENEWAL_BILLING_REASONS.has(invoice.billing_reason ?? '');
       const userId =
-        (await resolveUserIdFromCustomer(trx, tenantId, stripe, invoice.customer)) ??
+        (await resolveUserIdFromCustomer(trx, tenantId, source, invoice.customer)) ??
         (fromCheckout ? await stitchFromCompletedCheckouts(trx, source, tenantId, invoice.customer) : null);
       if (!userId) return null;
       // As for customer.subscription.created.
@@ -1291,7 +1342,7 @@ async function mapStripeEvent(
       // A guest one-time purchase has no Customer to resolve; its revenue
       // Event names the PaymentIntent.
       const userId =
-        (await resolveUserIdFromCustomer(trx, tenantId, stripe, charge.customer)) ??
+        (await resolveUserIdFromCustomer(trx, tenantId, source, charge.customer)) ??
         (await userIdForPaymentIntent(trx, tenantId, paymentIntentId));
       if (!userId) return null;
       // Absent, not null, from API version 2025-03-31.basil on: Stripe moved
@@ -1403,7 +1454,7 @@ async function mapStripeEvent(
         ? await stripeReadOrNull('charges.retrieve', chargeId, () => stripe.charges.retrieve(chargeId))
         : null;
       const userId =
-        (await resolveUserIdFromCustomer(trx, tenantId, stripe, charge?.customer ?? null)) ??
+        (await resolveUserIdFromCustomer(trx, tenantId, source, charge?.customer ?? null)) ??
         (await userIdForPaymentIntent(trx, tenantId, paymentIntentId));
       if (!userId) return null;
       return {
@@ -1425,7 +1476,7 @@ async function mapStripeEvent(
       // have fired for this invoice in the first place, so there's nothing to
       // reverse. Useful when an admin is debugging "why didn't this convert?"
       const invoice = event.data.object as Stripe.Invoice;
-      const userId = await resolveUserIdFromCustomer(trx, tenantId, stripe, invoice.customer);
+      const userId = await resolveUserIdFromCustomer(trx, tenantId, source, invoice.customer);
       if (!userId) return null;
       return {
         userId,
@@ -1516,7 +1567,7 @@ async function invoicePaidBy(
 async function resolveUserIdFromCustomer(
   trx: Knex.Transaction,
   tenantId: string,
-  stripe: Stripe,
+  source: BrandStripeSource,
   customer: string | Stripe.Customer | Stripe.DeletedCustomer | null,
 ): Promise<string | null> {
   if (!customer) return null;
@@ -1525,12 +1576,12 @@ async function resolveUserIdFromCustomer(
 
   if (typeof customer === 'string') {
     customerId = customer;
-    const fetched = await stripeReadOrNull('customers.retrieve', customer, () => stripe.customers.retrieve(customer));
-    if (fetched && !fetched.deleted) metadataUserId = fetched.metadata?.openpartner_user_id ?? null;
+    const fetched = await stripeReadOrNull('customers.retrieve', customer, () => source.stripe.customers.retrieve(customer));
+    if (fetched && !fetched.deleted) metadataUserId = customerUserId(source, fetched);
   } else {
     if ('deleted' in customer && customer.deleted) return null;
     customerId = (customer as Stripe.Customer).id;
-    metadataUserId = (customer as Stripe.Customer).metadata?.openpartner_user_id ?? null;
+    metadataUserId = customerUserId(source, customer as Stripe.Customer);
   }
 
   if (metadataUserId) return metadataUserId;
@@ -1541,6 +1592,22 @@ async function resolveUserIdFromCustomer(
   // metadata-backfill on checkout.session.completed lands on Stripe's side.
   const identity = await trx<IdentityRow>(TABLES.Identity).where({ tenantId, userId: customerId }).first();
   return identity ? customerId : null;
+}
+
+/**
+ * The merchant userId a Customer's metadata names (openpartner_user_id).
+ * OpenPartner's own billing Customers can carry one too: a brand a partner
+ * referred to OpenPartner, as a user of OpenPartner's own partner program
+ * (house-program.ts), whose tenant reads the billing account over the
+ * Stripe App. Anywhere else (/webhooks/stripe, where the account isn't a
+ * brand's) the Customer is the brand paying for its own plan, the event
+ * resolved to the brand's own tenant, and the id names none of its users:
+ * read there, it would record the brand's own signup, subscription or
+ * refund as one of its conversions.
+ */
+function customerUserId(source: BrandStripeSource, customer: Stripe.Customer): string | null {
+  if (!source.brandAccount && customer.metadata?.openpartner_role === BILLING_CUSTOMER_ROLE) return null;
+  return customer.metadata?.openpartner_user_id ?? null;
 }
 
 /** Coupons maybeRedeemStripeCoupons matched, and the userId their
@@ -1805,7 +1872,8 @@ async function stitchFromCompletedCheckouts(
  * (Coupon.stripePromotionCodeId, no Stripe read), else by the
  * customer-facing promotion_code.code, else by the Stripe Coupon id —
  * brands setting their Stripe Coupon IDs to match OpenPartner codes works
- * without an extra Stripe API call.
+ * that way. A match by string holds only when that promo or coupon was
+ * meant for the partner's code (findCouponByDiscountCode).
  */
 async function maybeRedeemStripeCoupons(
   trx: Knex.Transaction,
@@ -1829,12 +1897,8 @@ async function maybeRedeemStripeCoupons(
   let firstStitch = false;
   const codes: string[] = [];
   for (const d of await collectDiscounts(stripe, event)) {
-    let coupon = await findCouponByPromotionCodeId(trx, tenantId, d);
-    if (!coupon) {
-      const code = await resolveDiscountCode(stripe, d);
-      if (!code) continue;
-      coupon = await findCouponByCode(trx, tenantId, code);
-    }
+    const coupon =
+      (await findCouponByPromotionCodeId(trx, tenantId, d)) ?? (await findCouponByDiscountCode(trx, stripe, tenantId, d));
     if (!coupon || codes.includes(coupon.code)) continue;
     if (!userId) {
       userId = customerId ? await couponUserId(stripe, customerId) : guestEmail!;
@@ -1869,12 +1933,20 @@ async function couponUserId(stripe: Stripe, customerId: string): Promise<string>
   return (customer && !customer.deleted && customer.metadata?.openpartner_user_id) || customerId;
 }
 
+/** The parts of a Stripe PromotionCode or Coupon a string match is judged
+ *  on (discountMadeForCoupon). */
+interface StripeDiscountObject {
+  id: string;
+  created?: number;
+  metadata?: Record<string, string> | null;
+}
+
 interface DiscountRef {
   id?: string;
-  coupon?: string | { id: string } | null;
-  promotion_code?: string | { id: string; code?: string } | null;
+  coupon?: string | StripeDiscountObject | null;
+  promotion_code?: string | (StripeDiscountObject & { code?: string }) | null;
   // Discount objects name their coupon here (API 2025-03-31 onward).
-  source?: { coupon?: string | { id: string } | null } | null;
+  source?: { coupon?: string | StripeDiscountObject | null } | null;
 }
 
 /**
@@ -1975,23 +2047,104 @@ async function findCouponByPromotionCodeId(
   return row ?? null;
 }
 
-async function resolveDiscountCode(stripe: Stripe, d: DiscountRef): Promise<string | null> {
+/**
+ * The partner coupon a discount names by string: its promotion code's
+ * customer-facing code, else its Stripe Coupon id (resolveDiscountCode).
+ *
+ * A string alone doesn't make the discount the partner's. A partner code
+ * minted while the brand's Stripe was out of reach (on hosted, before the
+ * Stripe App connect), or before codes were checked at all, was never
+ * checked against it, so it can equal a
+ * promo the brand already runs, a sitewide WELCOME10, and would be
+ * credited with every order using it. The match holds only when the brand
+ * meant that promo or coupon for the code (discountMadeForCoupon).
+ * Otherwise the discount credits no partner, as an unknown code wouldn't.
+ */
+async function findCouponByDiscountCode(
+  trx: Knex.Transaction,
+  stripe: Stripe,
+  tenantId: string,
+  d: DiscountRef,
+): Promise<CouponRow | null> {
+  const found = await resolveDiscountCode(stripe, d);
+  if (!found) return null;
+  const coupon = await findCouponByCode(trx, tenantId, found.code);
+  if (!coupon) return null;
+  if (await discountMadeForCoupon(stripe, coupon, found)) return coupon;
+  console.warn("[stripe-webhook] a discount matches a partner code by string but is the brand's own promo; not credited", {
+    tenantId,
+    couponId: coupon.id,
+    code: coupon.code,
+    stripeObject: 'promotionCode' in found ? found.promotionCode.id : stripeObjectId(found.coupon),
+  });
+  return null;
+}
+
+/** A discount's customer-facing code and the Stripe object it is: the
+ *  PromotionCode as read, else the Coupon whose id is the code, by id or
+ *  as the payload carried it. */
+type DiscountCode =
+  | { code: string; promotionCode: StripeDiscountObject }
+  | { code: string; coupon: string | StripeDiscountObject };
+
+async function resolveDiscountCode(stripe: Stripe, d: DiscountRef): Promise<DiscountCode | null> {
   // Prefer the customer-facing PromotionCode string.
   if (d.promotion_code) {
     if (typeof d.promotion_code === 'object' && d.promotion_code.code) {
-      return d.promotion_code.code;
+      return { code: d.promotion_code.code, promotionCode: d.promotion_code };
     }
     const id = typeof d.promotion_code === 'string' ? d.promotion_code : d.promotion_code.id;
     // A transient failure is a 500, so Stripe redelivers the event rather
     // than dropping the redemption for good.
     const promo = await stripeReadOrNull('promotionCodes.retrieve', id, () => stripe.promotionCodes.retrieve(id));
-    if (promo?.code) return promo.code;
+    if (promo?.code) return { code: promo.code, promotionCode: promo };
   }
-  // Fallback: use the Coupon's Stripe ID directly. Brands who set their
-  // Stripe Coupon IDs to match OpenPartner codes don't need the API call.
+  // Fallback: the Coupon's Stripe ID, for brands who set their Stripe
+  // Coupon IDs to match OpenPartner codes.
   const coupon = d.coupon ?? d.source?.coupon;
-  if (coupon) {
-    return typeof coupon === 'string' ? coupon : coupon.id;
-  }
+  if (coupon) return { code: stripeObjectId(coupon), coupon };
   return null;
+}
+
+/**
+ * Did the brand mean this promotion code or coupon for the partner code it
+ * names?
+ *
+ *   - A promotion code we created for that code: metadata source
+ *     'openpartner' and openpartner_code (provisionCustomerReward). Also
+ *     one whose id the Coupon row doesn't hold, such as one minted under an
+ *     earlier connection.
+ *   - Anything, when the brand's admin typed the code (Coupon.brandChosen):
+ *     mapping a promo the brand already runs onto a partner is theirs to
+ *     do (routes/coupons.ts).
+ *   - Otherwise, one created no earlier than the partner's code: the brand
+ *     made it for that code. That's the setup the portal asks for when we
+ *     can't mint the promo ("create a promotion code with the same
+ *     string"), and a self-host brand setting a Stripe Coupon id to match.
+ *
+ * Anything older is the brand's own promo, which the code merely shadows:
+ * the mint-time check (codeExistsInStripe) refuses exactly those codes
+ * whenever it can reach the brand's Stripe. Compared in whole seconds,
+ * Stripe's resolution. A coupon the payload names by id is read back
+ * (transient failure: a 500, so Stripe redelivers; permanent: no match).
+ */
+async function discountMadeForCoupon(stripe: Stripe, coupon: CouponRow, found: DiscountCode): Promise<boolean> {
+  if ('promotionCode' in found) {
+    const meta = found.promotionCode.metadata;
+    if (meta?.source === 'openpartner' && meta.openpartner_code?.toLowerCase() === coupon.code.toLowerCase()) return true;
+  }
+  if (coupon.brandChosen) return true;
+  const object = 'promotionCode' in found ? found.promotionCode : await stripeCouponObject(stripe, found.coupon);
+  if (typeof object?.created !== 'number') return false;
+  return object.created >= Math.floor(coupon.createdAt.getTime() / 1000);
+}
+
+async function stripeCouponObject(stripe: Stripe, coupon: string | StripeDiscountObject): Promise<StripeDiscountObject | null> {
+  if (typeof coupon === 'object' && typeof coupon.created === 'number') return coupon;
+  const id = stripeObjectId(coupon);
+  return stripeReadOrNull('coupons.retrieve', id, () => stripe.coupons.retrieve(id));
+}
+
+function stripeObjectId(object: string | { id: string }): string {
+  return typeof object === 'string' ? object : object.id;
 }

@@ -8,15 +8,25 @@
  * Response is intentionally booleans + small ints — every item the
  * UI shows is something the admin can check off without the response
  * giving them lookup IDs to chase.
+ *
+ * The Network steps are optional: a white-label brand is kept off the
+ * Network, and any other brand can say "Not now" (`POST /config/onboarding`,
+ * onboarding-settings.ts). Either way `complete` stops waiting on them.
  */
 
 import { Router } from 'express';
+import { z } from '../zod.js';
 import { TABLES, type ProgramRow, type PartnerRow } from '@openpartner/db';
 import { requireAdmin, requireAuth } from '../auth.js';
-import { tenantOf } from '../tenancy.js';
+import { getTenancyMode, tenantOf } from '../tenancy.js';
 import { getNetworkMembership, networkProxy, NetworkProxyError } from '../network-client.js';
 import { getTenantBillingState } from '../billing-plan.js';
 import { brandSetupFor } from '../brand-setup.js';
+import { getWhiteLabelState } from '../white-label.js';
+import { readOnboardingSettings, saveOnboardingSettings } from '../onboarding-settings.js';
+import { db as platformDb } from '../db.js';
+import { getTrackingGateSettings } from '../platform-settings.js';
+import { isTrackingVerified } from '../tracking-verification.js';
 
 export const onboardingRouter = Router();
 
@@ -25,6 +35,9 @@ interface BrandOnboardingStatus {
   campaignCount: number;
   networkConnected: boolean;
   offeringPublishedCount: number;
+  /** The brand said "Not now" to the Network listing. Joining the Network
+   *  clears it (onboarding-settings.ts). */
+  networkListingSkipped: boolean;
   partnerCount: number;
   /** Pending creator applications waiting for brand approval on the
    *  Network. Drives the "X partners are waiting" subscribe-now banner
@@ -128,12 +141,20 @@ onboardingRouter.get('/admin/onboarding-status', requireAuth, requireAdmin, asyn
   const approvalRow = await db('Tenant').where({ id: tenantId }).first(['approvalStatus']);
   const approvalStatus = (approvalRow?.approvalStatus as BrandOnboardingStatus['approvalStatus'] | undefined) ?? 'approved';
 
+  // Listing on the Network is optional. A white-label brand can't join it
+  // (the portal drops both Network steps for it), and any other brand can
+  // skip it. "Offer the Network to your partners" (autoEnroll) says
+  // nothing either way: it is about partners, not the brand's listing.
+  const { networkListingSkipped } = await readOnboardingSettings(db, tenantId);
+  const whiteLabel = (await getWhiteLabelState(db, tenantId)).effective;
+  const networkSettled =
+    whiteLabel || networkListingSkipped || (networkConnected && offeringPublishedCount > 0);
+
   const complete =
     trackingInstalled &&
     brandInfoComplete &&
     campaignCount > 0 &&
-    networkConnected &&
-    offeringPublishedCount > 0 &&
+    networkSettled &&
     partnerCount > 0 &&
     billingReady;
 
@@ -142,6 +163,7 @@ onboardingRouter.get('/admin/onboarding-status', requireAuth, requireAdmin, asyn
     campaignCount,
     networkConnected,
     offeringPublishedCount,
+    networkListingSkipped,
     partnerCount,
     pendingPartnershipRequests,
     billingReady,
@@ -152,4 +174,45 @@ onboardingRouter.get('/admin/onboarding-status', requireAuth, requireAdmin, asyn
     complete,
   };
   res.json(out);
+});
+
+/**
+ * Whether the portal locks the pages that only work once partners can join
+ * (Partners, Commissions, Payouts, the Network's creator pages): while the
+ * brand has no partner yet and isn't both approved and tracking-verified
+ * (tracking-verification.ts). A brand that already has partners keeps every
+ * page, whatever its state. The setup pages are never locked. Hosted only:
+ * a self-hosted install is its own operator.
+ */
+onboardingRouter.get('/admin/setup-lock', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  const tenant = await db('Tenant').where({ id: tenantId }).first(['approvalStatus']);
+  const approved = (tenant?.approvalStatus ?? 'approved') === 'approved';
+  const verified = await isTrackingVerified(db, tenantId);
+  const hasPartner = !!(await db(TABLES.Partner).where({ tenantId }).first('id'));
+  const { enforceFrom } = await getTrackingGateSettings(platformDb);
+  res.json({
+    locked: getTenancyMode() === 'multi' && !hasPartner && !(approved && verified),
+    reason: !approved ? 'review' : !verified ? 'tracking' : null,
+    trackingVerified: verified,
+    trackingGateFrom: enforceFrom,
+  });
+});
+
+export const onboardingSettingsSchema = z.object({
+  networkListingSkipped: z.boolean().optional(),
+});
+
+onboardingRouter.get('/config/onboarding', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  res.json(await readOnboardingSettings(db, tenantId));
+});
+
+/** "Not now" (and its undo) on the Getting started card's Network step.
+ *  Omitted fields keep their value. */
+onboardingRouter.post('/config/onboarding', requireAuth, requireAdmin, async (req, res) => {
+  const { db, tenantId } = tenantOf(req);
+  const body = onboardingSettingsSchema.safeParse(req.body ?? {});
+  if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+  res.json(await saveOnboardingSettings(db, tenantId, body.data));
 });

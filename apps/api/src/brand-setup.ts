@@ -10,11 +10,15 @@
  *   program   — at least one program exists
  *   listing   — a program is shared to the marketplace (on-Network,
  *               non-white-label brands only; a white-label brand is
- *               isolated from the marketplace by design)
- *   tracking  — OpenPartner has seen real conversion data: an Identity
- *               (SDK identify / signup stitch) or an Event, or a verified
- *               coupon redemption. Clicks alone prove nothing — the router
- *               records those without the brand integrating at all.
+ *               isolated from the marketplace by design, and a brand that
+ *               said "Not now" to the Network listing isn't asked again —
+ *               onboarding-settings.ts)
+ *   tracking  — verified (tracking-verification.ts): a test click reached
+ *               identify, or a partner click is linked to a customer
+ *               (an Identity, which a coupon redemption writes too). Clicks
+ *               alone prove nothing — the router records those without the
+ *               brand integrating at all — and neither does an event that
+ *               no click led to.
  *   partners  — at least one partner on the roster (approved brands only;
  *               a pending brand can't invite yet, so nagging is pointless)
  *
@@ -25,6 +29,8 @@
 
 import type { Knex } from 'knex';
 import { TABLES, type TenantRow } from '@openpartner/db';
+import { ONBOARDING_CONFIG_KEY } from './onboarding-settings.js';
+import { trackingVerifiedFor } from './tracking-verification.js';
 
 export type SetupStepKey = 'program' | 'listing' | 'tracking' | 'partners';
 
@@ -45,7 +51,7 @@ export interface BrandSetup {
 export const SETUP_STEP_LABELS: Record<SetupStepKey, string> = {
   program: 'Create your first program',
   listing: 'List your program on the OpenPartner marketplace',
-  tracking: 'Connect conversion tracking (SDK or Stripe) so partners get credited',
+  tracking: 'Install tracking and send a test click so partners get credited',
   partners: 'Invite your first partner',
 };
 
@@ -79,18 +85,7 @@ export async function brandSetupFor(db: Knex, tenantIds: string[]): Promise<Map<
     .count({ total: '*' })) as Array<{ tenantId: string; total: string | number }>;
   const partnersBy = new Map(partners.map((r) => [r.tenantId, Number(r.total)]));
 
-  // Existence probes — `exists` stops at the first row, so a brand with
-  // millions of events costs the same as one with a single event.
-  const tracked = (
-    (await db.raw(
-      `select t.id as "tenantId"
-         from unnest(?::text[]) as t(id)
-        where exists (select 1 from "Identity" i where i."tenantId" = t.id)
-           or exists (select 1 from "Event" e where e."tenantId" = t.id)`,
-      [tenantIds],
-    )) as { rows: Array<{ tenantId: string }> }
-  ).rows;
-  const trackedSet = new Set(tracked.map((r) => r.tenantId));
+  const trackedSet = await trackingVerifiedFor(db, tenantIds);
 
   const memberships = (await db(TABLES.Config)
     .whereIn('tenantId', tenantIds)
@@ -98,12 +93,20 @@ export async function brandSetupFor(db: Knex, tenantIds: string[]): Promise<Map<
     .select('tenantId', 'value')) as Array<{ tenantId: string; value: { enabled?: boolean } | null }>;
   const onNetwork = new Set(memberships.filter((m) => m.value?.enabled).map((m) => m.tenantId));
 
+  const onboarding = (await db(TABLES.Config)
+    .whereIn('tenantId', tenantIds)
+    .andWhere({ key: ONBOARDING_CONFIG_KEY })
+    .select('tenantId', 'value')) as Array<{ tenantId: string; value: { networkListingSkipped?: boolean } | null }>;
+  const listingSkipped = new Set(
+    onboarding.filter((o) => o.value?.networkListingSkipped === true).map((o) => o.tenantId),
+  );
+
   for (const t of tenants) {
     const p = programsBy.get(t.id);
     const steps: SetupStep[] = [
       { key: 'program', label: SETUP_STEP_LABELS.program, done: Number(p?.total ?? 0) > 0 },
     ];
-    if (onNetwork.has(t.id) && !t.whiteLabel) {
+    if (onNetwork.has(t.id) && !t.whiteLabel && !listingSkipped.has(t.id)) {
       steps.push({ key: 'listing', label: SETUP_STEP_LABELS.listing, done: Number(p?.listed ?? 0) > 0 });
     }
     steps.push({

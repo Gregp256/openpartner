@@ -5,6 +5,7 @@ import { api, currentTenantSlug } from '../../api.js';
 import { alpha, theme } from '../../theme.js';
 import { useBrand } from '../../lib/useBrand.js';
 import { Button, Card, ErrorBanner, Input, Label, Page, Textarea } from '../../ui.js';
+import { PaypalPaymentsCard } from './PaypalPaymentsCard.js';
 
 /**
  * Integration API key surface. Mints scoped keys covering the union
@@ -63,7 +64,7 @@ interface ScopeOption {
 const CORE_SCOPES: ScopeOption[] = [
   { scope: 'events:write', description: 'Record conversion events (the CRM webhook path).' },
   { scope: 'partners:write', description: 'Create, invite and revoke partners (Zapier/ActivePieces actions). Revoking emails the partner unless told not to.' },
-  { scope: 'partners:read', description: 'List partners, look one up by id or email, and read a partner’s dashboard stats.' },
+  { scope: 'partners:read', description: 'List partners, look one up by id or email, and read a partner’s dashboard stats and referrals.' },
   { scope: 'commissions:read', description: 'List commissions — tenant-wide or per partner, paged with a cursor.' },
   { scope: 'webhooks:write', description: 'Subscribe + unsubscribe webhook endpoints (Zapier/ActivePieces triggers register their callback URLs through these).' },
 ];
@@ -87,11 +88,14 @@ export function AdminIntegrations() {
   const { programName } = useBrand();
   return (
     <Page
+      edits
       title="Integrations"
       subtitle={`Pipe conversions from your CRM, lender systems or affiliate networks into ${programName} so partners get attributed for full-funnel deals, not just self-serve signups.`}
     >
       <UnmatchedEventTypes />
       <StripeAppCard />
+      <PaypalPaymentsCard />
+      <div style={{ height: 18 }} />
       <WhyCard />
       <div style={{ height: 18 }} />
       <KeysPanel />
@@ -114,6 +118,10 @@ interface UnmatchedEventType {
 
 const STRIPE_GUIDE_URL =
   'https://github.com/getcoherence/openpartner/blob/main/docs/headless-referral.md#stripe-payment-links-on-openpartner-cloud';
+
+/** What reads the brand's Stripe: the app their Stripe Dashboard lists as
+ *  installed. Never the brand's program name — this admin is that brand. */
+const STRIPE_APP_NAME = 'OpenPartner';
 
 /** Conversions a sender reported under a type no commission rule takes,
  *  e.g. `funded` for `loan_funded`. They're recorded and credited, and pay
@@ -198,7 +206,26 @@ interface StripeAppStatus {
     refreshError: string | null;
     permissionsOutdated: boolean;
     rewards: boolean;
+    /** Partner codes with a customer discount that have no promotion code
+     *  in the connected account yet. */
+    rewardCodesNotInStripe: number;
+    /** A pass creating them is running now. */
+    rewardCodesSyncing: boolean;
+    /** Codes created before this connection have been checked against this
+     *  account (an earlier account's promotion codes don't carry over). */
+    rewardCodesChecked: boolean;
   } | null;
+}
+
+/** The connection line's word on customer discounts. */
+function rewardsSummary(conn: NonNullable<StripeAppStatus['connection']>): string {
+  if (!conn.rewards) return 'customer discounts set up by you';
+  if (conn.rewardCodesSyncing) return 'creating customer discounts in Stripe…';
+  // A pass stopped early; the hourly retry finishes the check.
+  if (!conn.rewardCodesChecked) return 'customer discounts being checked in Stripe';
+  const missing = conn.rewardCodesNotInStripe;
+  if (missing > 0) return `customer discounts created in Stripe, except ${missing} partner code${missing === 1 ? '' : 's'}`;
+  return 'customer discounts created in Stripe';
 }
 
 /**
@@ -214,10 +241,12 @@ interface StripeAppStatus {
  */
 function StripeAppCard() {
   const qc = useQueryClient();
-  const { programName } = useBrand();
   const status = useQuery({
     queryKey: ['stripe-app'],
     queryFn: () => api<StripeAppStatus>('/stripe-app/connection'),
+    // Right after a connect, partner codes get their promotion codes in the
+    // background: follow along until that's done.
+    refetchInterval: (query) => (query.state.data?.connection?.rewardCodesSyncing ? 3000 : false),
   });
   const [notice, setNotice] = useState<string | null>(null);
   const refresh = () => qc.invalidateQueries({ queryKey: ['stripe-app'] });
@@ -286,10 +315,10 @@ function StripeAppCard() {
       <Card>
         <h3 style={{ marginTop: 0, marginBottom: 4, fontSize: 15, fontWeight: 500 }}>Stripe</h3>
         <p style={{ fontSize: 13, color: theme.textMuted, margin: '0 0 12px', lineHeight: 1.55 }}>
-          Bill with Stripe? Connect your Stripe account and {programName} reads it directly: Checkout and
+          Bill with Stripe? Connect your Stripe account and {STRIPE_APP_NAME} reads it directly: Checkout and
           Payment Link purchases, invoices, refunds and disputes credit the partner who referred the customer,
           with nothing forwarded from your server. Partner codes with a customer discount get their promotion
-          code created in your Stripe. {programName} can read your payments but never move money.
+          code created in your Stripe. {STRIPE_APP_NAME} can read your payments but never move money.
         </p>
         <ErrorBanner error={status.error ?? complete.error ?? start.error ?? disconnect.error} />
         {notice && (
@@ -340,7 +369,7 @@ function StripeAppCard() {
                   lineHeight: 1.5,
                 }}
               >
-                <strong>Reconnect needed.</strong> Stripe stopped accepting {programName}&rsquo;s access
+                <strong>Reconnect needed.</strong> Stripe stopped accepting {STRIPE_APP_NAME}&rsquo;s access
                 {conn.refreshError ? <> ({conn.refreshError})</> : null}, so new Stripe payments aren&rsquo;t
                 being recorded. Reconnect to pick up from here.
               </div>
@@ -381,7 +410,7 @@ function StripeAppCard() {
                 {' · '}
                 {conn.lastEventAt ? `last event ${new Date(conn.lastEventAt).toLocaleString()}` : 'no events yet'}
                 {' · '}
-                {conn.rewards ? 'customer discounts created in Stripe' : 'customer discounts set up by you'}
+                {rewardsSummary(conn)}
               </div>
               {(conn.needsReconnect || conn.permissionsOutdated) && (
                 <Button onClick={() => start.mutate(conn.livemode ? 'live' : 'test')} disabled={busy}>
@@ -393,7 +422,7 @@ function StripeAppCard() {
                 style={{ ...mutedButton, border: `1px solid ${alpha(theme.danger, 0.333)}`, color: theme.danger }}
                 disabled={busy}
                 onClick={() => {
-                  if (confirm(`Disconnect Stripe? ${programName} stops reading your Stripe account. Payments already recorded stay.`)) {
+                  if (confirm(`Disconnect Stripe? ${STRIPE_APP_NAME} stops reading your Stripe account. Payments already recorded stay.`)) {
                     disconnect.mutate();
                   }
                 }}
@@ -401,6 +430,15 @@ function StripeAppCard() {
                 Disconnect
               </button>
             </div>
+            {conn.rewards && !conn.rewardCodesSyncing && conn.rewardCodesNotInStripe > 0 && (
+              <div style={{ fontSize: 12, color: theme.textMuted, marginTop: 8, lineHeight: 1.5 }}>
+                {conn.rewardCodesNotInStripe === 1
+                  ? '1 partner code with a customer discount has no promotion code in your Stripe yet, so customers can’t use it'
+                  : `${conn.rewardCodesNotInStripe} partner codes with a customer discount have no promotion code in your Stripe yet, so customers can’t use them`}{' '}
+                at Stripe Checkout. {STRIPE_APP_NAME} retries every hour. A code that is already one of your own
+                Stripe promotion codes or coupon IDs is left alone: give that partner a new code instead.
+              </div>
+            )}
             <StripeCheckoutGuide rewards={conn.rewards} />
           </>
         )}
@@ -468,6 +506,17 @@ function StripeCheckoutGuide({ rewards }: { rewards: boolean }) {
   );
   const body = { fontSize: 13, color: theme.textMuted, margin: '10px 0 0', lineHeight: 1.55 } as const;
 
+  // Behind a consent banner the tag waits for an answer; without one the
+  // clicks of visitors who decline still can't be credited, but nothing
+  // is stored for them.
+  const consentNote = (
+    <span style={{ display: 'block', marginTop: 8 }}>
+      Using a cookie consent banner? Add <code style={codeInline}>data-consent=&quot;pending&quot;</code> to the tag and
+      call <code style={codeInline}>openpartner.setConsent(&apos;granted&apos;)</code> when the visitor accepts. Until then
+      nothing is stored.
+    </span>
+  );
+
   return (
     <div style={{ marginTop: 16 }}>
       <div style={{ fontSize: 14, fontWeight: 500, color: theme.text }}>Credit partners for Stripe checkouts</div>
@@ -526,6 +575,7 @@ function StripeCheckoutGuide({ rewards }: { rewards: boolean }) {
           <span style={{ display: 'block', marginTop: 8 }}>
             Payment Links on your own domain? Add <code style={codeInline}>data-stripe-hosts=&quot;pay.yourbrand.com&quot;</code> to the tag.
           </span>
+          {consentNote}
         </div>
       )}
       {path === 'server' && (
@@ -541,6 +591,7 @@ function StripeCheckoutGuide({ rewards }: { rewards: boolean }) {
             Visitors land on one subdomain and check out on another (<code style={codeInline}>www.</code> and{' '}
             <code style={codeInline}>app.</code>)? Add <code style={codeInline}>data-cookie-domain=&quot;.yourbrand.com&quot;</code> to the tag.
           </span>
+          {consentNote}
         </div>
       )}
       {path === 'codes' && (
@@ -984,7 +1035,6 @@ function PayloadGuide() {
  *  partner link's destination and comes back with the conversion. */
 function ClickIdGuide() {
   const { apiBase } = useApiBase();
-  const { programName } = useBrand();
   return (
     <Card>
       <h3 style={{ marginTop: 0, marginBottom: 4, fontSize: 15, fontWeight: 500 }}>
@@ -1004,7 +1054,7 @@ function ClickIdGuide() {
       </p>
       <p style={{ fontSize: 13, color: theme.textMuted, margin: '0 0 10px', lineHeight: 1.55 }}>
         With your Stripe account connected (above), or on a self-hosted install whose Stripe
-        webhook points at {programName}, that purchase is then recorded automatically: a signup,
+        webhook points at {STRIPE_APP_NAME}, that purchase is then recorded automatically: a signup,
         plus its amount as <code>invoice_paid</code>. Don&rsquo;t also report it here. Without a
         connection, forward Stripe&rsquo;s checkout events to the call below from a small handler of
         your own:{' '}

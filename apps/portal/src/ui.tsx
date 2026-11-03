@@ -1,21 +1,30 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { alpha, theme } from './theme.js';
 import { useIsMobile } from './lib/useMediaQuery.js';
+import { useViewOnly, ViewOnlyFieldset } from './lib/viewOnly.js';
 
 // ---------------- Layout ----------------
 
 export function Page({
   title,
   subtitle,
+  back,
   actions,
+  edits,
   children,
 }: {
   title: string;
-  subtitle?: string;
+  subtitle?: ReactNode;
+  /** A link back to the parent page, shown above the title. */
+  back?: ReactNode;
   actions?: ReactNode;
+  /** A page of edits (forms, connections): on a view-only seat its
+   *  actions are hidden and its controls disabled (lib/viewOnly.tsx). */
+  edits?: boolean;
   children: ReactNode;
 }) {
   const isMobile = useIsMobile();
+  const locked = useViewOnly() && !!edits;
   return (
     <div style={{ padding: isMobile ? '20px 16px' : '32px 40px', maxWidth: 1280, margin: '0 auto' }}>
       <header
@@ -31,14 +40,15 @@ export function Page({
         }}
       >
         <div>
+          {back && <div style={{ fontSize: 13, marginBottom: 8 }}>{back}</div>}
           <h1 style={{ margin: 0, fontSize: isMobile ? 21 : 24, fontWeight: 600, letterSpacing: '-0.01em' }}>{title}</h1>
           {subtitle && (
             <div style={{ color: theme.textMuted, fontSize: 14, marginTop: 4 }}>{subtitle}</div>
           )}
         </div>
-        {actions && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>{actions}</div>}
+        {actions && !locked && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>{actions}</div>}
       </header>
-      {children}
+      {locked ? <ViewOnlyFieldset>{children}</ViewOnlyFieldset> : children}
     </div>
   );
 }
@@ -117,10 +127,20 @@ export function Table({
   columns,
   rows,
   empty = 'No rows yet.',
+  maxHeight,
+  footer,
+  dense,
 }: {
   columns: (string | { label: string; align?: 'left' | 'right' })[];
   rows: ReactNode[][];
   empty?: string;
+  /** Scrolls the rows within this height, both ways, with the header kept
+   *  in view: the sideways scrollbar then never sits below the page fold. */
+  maxHeight?: number;
+  /** Under the rows, inside the scroll: a "load more", say. */
+  footer?: ReactNode;
+  /** Tighter cells, for a wide table to fit a laptop screen. */
+  dense?: boolean;
 }) {
   const cols = columns.map((c) => (typeof c === 'string' ? { label: c, align: 'left' as const } : c));
   const isMobile = useIsMobile();
@@ -191,6 +211,7 @@ export function Table({
             })}
           </div>
         ))}
+        {footer}
       </Card>
     );
   }
@@ -199,7 +220,7 @@ export function Table({
     <Card padded={false} style={{ overflow: 'hidden' }}>
       {/* Horizontal scroll as a fallback for very wide content on tablet/
           desktop widths; phones use the stacked card layout above. */}
-      <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+      <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch', ...(maxHeight !== undefined && { maxHeight, overflowY: 'auto' }) }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14, minWidth: 'max-content' }}>
         <thead>
           <tr>
@@ -208,7 +229,7 @@ export function Table({
                 key={c.label}
                 style={{
                   textAlign: c.align ?? 'left',
-                  padding: '12px 18px',
+                  padding: dense ? '10px 12px' : '12px 18px',
                   fontWeight: 500,
                   color: theme.textMuted,
                   fontSize: 12,
@@ -216,6 +237,7 @@ export function Table({
                   letterSpacing: '0.05em',
                   borderBottom: `1px solid ${theme.border}`,
                   background: theme.surface2,
+                  ...(maxHeight !== undefined && { position: 'sticky', top: 0, zIndex: 1 }),
                 }}
               >
                 {c.label}
@@ -237,7 +259,7 @@ export function Table({
                   <td
                     key={j}
                     style={{
-                      padding: '14px 18px',
+                      padding: dense ? '10px 12px' : '14px 18px',
                       textAlign: cols[j]?.align ?? 'left',
                       fontVariantNumeric: 'tabular-nums',
                     }}
@@ -250,6 +272,7 @@ export function Table({
           )}
         </tbody>
       </table>
+      {footer}
       </div>
     </Card>
   );
@@ -295,6 +318,8 @@ export function Button({
       style={{
         display: 'inline-flex',
         alignItems: 'center',
+        // A button wider than its label (width: 100%, flex: 1) keeps it centred.
+        justifyContent: 'center',
         gap: 6,
         background: p.bg,
         color: p.color,
@@ -571,12 +596,15 @@ export function formatDate(d: string | Date | null, opts: { relative?: boolean }
   if (!d) return '—';
   const date = typeof d === 'string' ? new Date(d) : d;
   if (opts.relative) {
+    // Future dates (a commission's matureAt) read "in 3d", past "3d ago".
     const diff = Date.now() - date.getTime();
+    const abs = Math.abs(diff);
+    const rel = (n: number, unit: string) => (diff < 0 ? `in ${n}${unit}` : `${n}${unit} ago`);
     const min = 60_000;
-    if (diff < min) return 'just now';
-    if (diff < 60 * min) return `${Math.floor(diff / min)}m ago`;
-    if (diff < 24 * 60 * min) return `${Math.floor(diff / (60 * min))}h ago`;
-    if (diff < 30 * 24 * 60 * min) return `${Math.floor(diff / (24 * 60 * min))}d ago`;
+    if (abs < min) return 'just now';
+    if (abs < 60 * min) return rel(Math.floor(abs / min), 'm');
+    if (abs < 24 * 60 * min) return rel(Math.floor(abs / (60 * min)), 'h');
+    if (abs < 30 * 24 * 60 * min) return rel(Math.floor(abs / (24 * 60 * min)), 'd');
   }
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }

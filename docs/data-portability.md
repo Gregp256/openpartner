@@ -14,14 +14,21 @@ that overstates itself is worse than one with a documented hole.
 ```json
 {
   "exportedAt": "2026-08-09T12:00:00.000Z",
-  "schemaVersion": 9,
-  "tables": { "Partner": [ … ], "Program": [ … ], … }
+  "schemaVersion": 11,
+  "tables": { "Partner": [ … ], "Program": [ … ], … },
+  "network": { "status": "included", "tables": { "Conversation": [ … ], … }, … }
 }
 ```
 
+`network` is what the OpenPartner Network holds for the brand (see
+[The Network section](#the-network-section)): a record that travels with
+the file, not part of the restore.
+
 Rows are raw DB rows — the same shape `select *` returns, no reshaping,
 no derived fields. Anything derived (attribution, commissions) is present
-as its own table *and* re-derivable from the raw layers. Two exceptions,
+as its own table *and* re-derivable from the raw layers. Views built on
+read, such as the [customer journey](customer-journey.md), store nothing
+of their own, so a restored instance shows the same ones. Two exceptions,
 both deliberate: credential columns are dropped (see
 [Credentials](#credentials)), and `Config` carries only the brand's own
 settings (see [Settings](#settings-config)).
@@ -47,20 +54,21 @@ appears after everything it references.
 | 7 | `Coupon` | `id` | **code → (partner, program) attribution** |
 | 8 | `Link` | `id` | tracking links |
 | 9 | `Click` | `id` | raw click log |
-| 10 | `Identity` | `id` | click → user stitch |
-| 11 | `Event` | `id` | raw conversion events |
-| 12 | `Attribution` | `id` | derived attribution (re-derivable) |
-| 13 | `Bounty` | `id` | **performance bounties**: goals on a program that pay a bonus |
-| 14 | `Bonus` | `id` | **rewards not tied to a sale** (manual, performance bounty, Network bounty) |
-| 15 | `Commission` | `id` | derived commission ledger |
-| 16 | `Payout` | `id` | payout ledger |
-| 17 | `PortalCustomDomain` | `id` | white-label domain history (inert on self-host) |
-| 18 | `CommissionAdjustment` | `id` | clawbacks / corrections |
-| 19 | `BrandAsset` | `id` | **the marketing-asset library** (image URLs, text snippets) |
-| 20 | `WebhookEndpoint` | `id` | **your outbound webhook endpoints** (not the signing secret) |
-| 21 | `PartnerPostback` | `id` | **each partner's own tracker callbacks** (the URL opened) |
-| 22 | `ConversionPostbackToken` | `id` | **the GET /postback allowlist and rotation history** (not the token) |
-| 23 | `Config` | (`tenantId`, `key`) | **program settings, the join-page policy and the portal-access default** |
+| 10 | `ClickLanding` | `clickId` | **the browser SDK saw the click arrive on your site** (Tracking health) |
+| 11 | `Identity` | `id` | click → user stitch |
+| 12 | `Event` | `id` | raw conversion events |
+| 13 | `Attribution` | `id` | derived attribution (re-derivable) |
+| 14 | `Bounty` | `id` | **performance bounties**: goals on a program that pay a bonus |
+| 15 | `Bonus` | `id` | **rewards not tied to a sale** (manual, performance bounty, Network bounty) |
+| 16 | `Commission` | `id` | derived commission ledger |
+| 17 | `Payout` | `id` | payout ledger |
+| 18 | `PortalCustomDomain` | `id` | white-label domain history (inert on self-host) |
+| 19 | `CommissionAdjustment` | `id` | clawbacks / corrections |
+| 20 | `BrandAsset` | `id` | **the marketing-asset library** (image URLs, text snippets) |
+| 21 | `WebhookEndpoint` | `id` | **your outbound webhook endpoints** (not the signing secret) |
+| 22 | `PartnerPostback` | `id` | **each partner's own tracker callbacks** (the URL opened) |
+| 23 | `ConversionPostbackToken` | `id` | **the GET /postback allowlist and rotation history** (not the token) |
+| 24 | `Config` | (`tenantId`, `key`) | **program settings, the join-page policy, the portal-access default, the onboarding Network skip, the payout-statement and Pay with PayPal INR settings, and the referral-stage setting** |
 
 Rows 3, 4 and 7 were added in schemaVersion 2 (Aug 2026). Without them a
 restored instance had the roster but no grants, no coupon attribution, and
@@ -75,12 +83,12 @@ v2 or v3 bundle restores with no consent rows, so every restored partner
 starts undecided and nobody is sent to the Network until they opt in on
 the new instance.
 
-Rows 19 to 23 were added in schemaVersion 5 (Oct 2026). Before that a
+Rows 20 to 24 were added in schemaVersion 5 (Oct 2026). Before that a
 restored instance had the attribution and money ledger but none of the
 brand's configuration: no program name or support email, no join-page
 policy, no asset library, no webhooks, and no partner postbacks.
 
-Row 14 was added in schemaVersion 6 (Oct 2026). A `Bonus` is a reward paid
+Row 15 was added in schemaVersion 6 (Oct 2026). A `Bonus` is a reward paid
 to a partner that isn't tied to an attributed sale
 ([bounties.md](bounties.md)): who got it, how much, under which program,
 where it came from (`manual`, `performance_bounty`, `network`), the
@@ -92,7 +100,7 @@ it is never re-derived from the event log; it travels as recorded. A v1–v5
 bundle has no bonuses, and its `Commission` rows restore with `bonusId`
 null.
 
-Row 13 was added in schemaVersion 7 (Oct 2026). A `Bounty` is a goal on a
+Row 14 was added in schemaVersion 7 (Oct 2026). A `Bounty` is a goal on a
 program ("10 new sales by Dec 31 earns $500"): its metric, threshold,
 window, reward, partner allowlist, status, and the stamps that keep its
 partner emails from going out twice. A bonus a bounty paid names it in
@@ -118,6 +126,40 @@ account, a UPI ID or free-text instructions
 it travels opened; see [Payout details](#payout-details). A v1–v8 bundle
 restores with no payout details, and partners enter them again.
 
+Row 10 was added in schemaVersion 12 (Oct 2026). A `ClickLanding` is the
+browser SDK's record that a click arrived on the brand's own site
+(`POST /attribution/landing`): one row per click, the first landing, with the
+page's hostname and never its path. Admin → Tracking health compares them
+with clicks to show the ones lost before the page. A v11 bundle restores no
+landings, which is what an instance that predates the beacon recorded.
+
+`Coupon` rows carry `brandChosen` (schemaVersion 10, Oct 2026): the
+brand's admin typed the code, rather than it being generated or picked by
+the partner. The Stripe webhook matches a discount to a partner code by
+its string, and only for a code the admin chose does a promotion code or
+coupon the brand already had under that string credit the partner. Any
+other code matches only Stripe promos made for it. It is raw data about
+who picked the code, which nothing can re-derive, so the column bumps the
+version. A v1–v9 bundle's coupons restore with `brandChosen` false, the
+value the migration `20261021020000_coupon_brand_chosen` gave every
+existing code.
+
+Two-tier commissions (schemaVersion 11, Oct 2026,
+[two-tier-commissions.md](two-tier-commissions.md)) add columns to three
+tables. `Partner` rows carry `recruitedByPartnerId` and `recruitedAt` (who
+recruited the partner and when that started) and `recruitCode` (their own
+code for the join page's `?ref=`). `Program` rows carry
+`recruiterCommissionPercent` and `recruiterCommissionMonths`, the
+recruiter's share and how long it lasts. `Commission` rows carry
+`sourceCommissionId`, set on a recruiter's share and naming the recruit's
+commission it was worked out from. Who recruited whom is raw data nothing
+can re-derive, and a recruiter's share is ledger history, so the columns
+bump the version. Both self-references (a recruit and their recruiter, a
+share and its source) are checked at commit, so a SQL restore that writes
+`Partner` or `Commission` in several chunks restores them in any order. A
+v1–v10 bundle restores with every new column null: no recruiters, no codes,
+no programs paying a share.
+
 `Partner` rows carry `portalAccess` (schemaVersion 5, Oct 2026): whether
 the partner may sign in to the partner portal. A headless program turns it
 off so its customers can't, and a restored instance keeps them out too. A
@@ -139,6 +181,63 @@ table rather than assuming `id`. `Config` (primary key `tenantId, key`) and
 `ConversionPostbackToken` (at most one live token per tenant, a partial
 unique index) skip on any unique collision too, so a setting or live token
 the destination already has is kept and the bundle's copy is skipped.
+
+### The Network section
+
+A brand on the OpenPartner Network talks to creators and books them there
+(storefront conversations, bookings paid upfront through Checkout). Those
+rows live on the Network, in no local table, so `GET /export.json` reads
+them from the Network's `GET /vendors/me/export`
+([network-protocol.md](network-protocol.md#storefront-bookings-and-conversations-vendorsmebookings-vendorsmeconversations))
+while it builds the file, and writes them as `network`:
+
+```json
+"network": {
+  "status": "included",
+  "exportedAt": "2026-10-25T09:00:00.000Z",
+  "tables": {
+    "Conversation": [ … ],
+    "ConversationMessage": [ … ],
+    "BookingRequest": [ … ]
+  },
+  "creators": [ { "id": "crt_…", "name": "Ada Lovelace", "handle": "ada", "avatarUrl": "https://…" } ]
+}
+```
+
+- `tables` holds the Network's raw rows: every conversation the brand has
+  with a creator, every message in them, and every booking the brand made
+  or claimed, with its payment record: price and booking fee in Stripe's
+  integer form, the fee rate, the Checkout Session, PaymentIntent, charge
+  and application-fee ids, and what was paid, refunded or disputed and
+  when. `creators` names the creators those rows point at, by their public
+  face.
+- What isn't the brand's stays on the Network: the creator's email and
+  other private fields, the creator's Stripe account id, when the creator
+  read a thread or was emailed about it, a booking's confirmation-token
+  hash and the requester's IP hash, and public requests nobody confirmed.
+  network-protocol.md has the full list.
+- **`status`** is `included`, `not_connected` (the brand never finished
+  connecting, so it holds no Network token and there is nothing to read),
+  or `skipped`. A brand that switched the Network off is still read: its
+  conversations and bookings are still there, and still its. A Network outage
+  never fails the export: the local tables come back as always, and
+  `network` says `skipped` with a `reason`: `network_unreachable`,
+  `network_error` (with the Network's `httpStatus`), `invalid_response`,
+  `network_url_unresolvable` or `vendor_token_undecryptable`. Download it
+  again once the Network is back.
+- **Not restored.** `POST /import` ignores the section, and neither the
+  SQL dump nor the per-table downloads carry it: the rows are the
+  Network's, and a self-hosted instance has nowhere to put them. They are
+  the brand's record of its correspondence and payments.
+- **Export before you delete the workspace.** Deleting it ends the
+  brand's Network membership straight away, and once the workspace is
+  gone the Network removes its conversations too. **Download workspace
+  data** in the Danger zone downloads this same file.
+
+The section came without a version bump. It sits outside `tables`, which
+is what `SCHEMA_VERSION` describes, and `POST /import` drops it whatever
+the version: an older instance imports a newer bundle as before, and a
+bundle from before the section simply has none.
 
 ### Credentials
 
@@ -186,6 +285,10 @@ To finish a restore:
 - **Conversion postbacks.** Rotate the token, then update the URL at every
   network or lender that fires it. The host changes on a hosted to
   self-host move anyway.
+- **Pay with PayPal.** Your PayPal app's credentials never travel (the
+  whole `PaypalConnection` table stays out): connect the app again under
+  Settings → Pay with PayPal. See
+  [What is deliberately NOT in the bundle](#what-is-deliberately-not-in-the-bundle).
 
 Partner postback URLs travel opened; see
 [Partner postback URLs](#partner-postback-urls).
@@ -264,6 +367,9 @@ The PayPal and Wise files a brand made from its payout runs
 file is a stamp on each of its payouts (`Payout.metadata.manualExport`),
 which travels with the `Payout` rows. On a restored instance a file's
 unconfirmed payouts still show under "Files made", to confirm or discard.
+So does the payment reference a brand gave when it confirmed a payout sent
+one at a time (`Payout.metadata.externalReference`), which the payout's
+statement prints.
 
 ### Settings (`Config`)
 
@@ -274,6 +380,29 @@ Only these keys are exported, and only these are imported:
 | `program_settings` | program name, support email, router URL, whether partners see the Network |
 | `partner_signup` | the join page: auto-approve or review, or closed |
 | `partner_access` | whether partners created without an invite may sign in to the partner portal (a headless program turns it off) |
+| `onboarding` | whether the brand said "Not now" to listing on the OpenPartner Network (the dashboard's Getting started card) |
+| `payout_statements` | what payout statements print: legal name, address, footer, statement-number prefix, and the tax-lines placeholder (docs/payout-statements.md) |
+| `paypal_payouts` | whether Pay with PayPal sends INR balances in USD (`sendUnsupportedAs`), [paypal-payouts.md](paypal-payouts.md#balances-paypal-cant-send-inr) |
+| `partner_referrals` | which event types partners see as referral stages, with their labels and order, and whether partners see customer labels ([referral timeline](referral-timeline.md)) |
+| `tracking_alerts` | whether new Tracking health flags are emailed to the admins (`email`), [tracking-health.md](tracking-health.md#email) |
+
+`onboarding`, `payout_statements`, `paypal_payouts`, `partner_referrals` and
+`tracking_alerts` were added in Oct 2026 without a version bump. Each is a
+new key in a table the bundle already carries, not a new table or column. An
+instance from before it skips the key on import (Config import takes only the
+keys it knows): the restored brand sees the Network step on its Getting
+started card again, prints statements under its brand name until it enters
+its statement settings again, reads the PayPal setting as off, its partners
+see the default referral stages with no customer labels (less than before,
+never more), and an instance that predates the alert email sends none.
+
+Payout statements themselves aren't exported: each is built from the
+`Payout`, `Commission`, `Bonus` and `CommissionAdjustment` rows the bundle
+carries, so a restored instance prints the same line items and totals. Two
+things on a hosted statement don't travel: the GSTIN, read from the hosted
+`HostedBillingProfile`, and the "reversed after payment" lines of a Stripe
+transfer, read from `PayoutReversal`, which isn't in the bundle either. The
+payout's own `status` still says it was reversed.
 
 Every other key stays out, on purpose:
 
@@ -376,6 +505,10 @@ that should attribute every event against the window alone.
 | 7 (Oct 2026) | added `Bounty` (performance bounties; `Bonus.bountyId` references it) |
 | 8 (Oct 2026) | `Click` rows carry `subId`, the publisher's `?sub_id=` (older bundles restore it as null) |
 | 9 (Oct 2026) | added `PartnerPayoutProfile`, its `details` opened (older bundles restore no payout details) |
+| 10 (Oct 2026) | `Coupon` rows carry `brandChosen`, whether the brand's admin typed the code (older bundles restore it as false) |
+| 11 (Oct 2026) | two-tier commissions: `Partner` rows carry `recruitedByPartnerId`, `recruitedAt` and `recruitCode`, `Program` rows `recruiterCommissionPercent` and `recruiterCommissionMonths`, `Commission` rows `sourceCommissionId` (older bundles restore them as null) |
+| 12 (Oct 2026) | added `ClickLanding`, the browser SDK's record that a click reached the brand's site (older bundles restore no landings) |
+| 13 (Oct 2026) | `Program` rows carry `couponsYieldToLinks`, whether partner link clicks beat the program's coupon codes (older bundles restore it as false) |
 
 **Importing a v1 or v2 bundle.** `POST /import` upgrades older rows before
 inserting them (`upgradeBundle` in `apps/api/src/export.ts`). A v2
@@ -525,10 +658,60 @@ doesn't keep is worse than a documented gap.
 
 **Never exported** (credentials, platform-operational state, or delivery
 logs — not customer data):
-`Session`, `MagicLinkToken`, `ApiKey`, `ConversionPostbackToken`, `TenantStripeConnection`, `Admin`, `PlatformSession`,
+`Session`, `MagicLinkToken`, `ApiKey`, `ConversionPostbackToken`, `TenantStripeConnection`, `PaypalConnection`, `PaypalPayoutBatch`, `Admin`, `PlatformSession`,
 `PlatformSessionBundle`, `PlatformAdmin`, `PlatformAdminSession`,
 `PlatformAuditLog`, `SignupBlocklist`, `WebhookDelivery`, `NetworkOutbox`,
-`StripeWebhookInbox`, `LocationDeclaration`, `SanctionsScreening`.
+`StripeWebhookInbox`, `LocationDeclaration`, `SanctionsScreening`,
+`PartnerSigninLinkLog`, `TrackingIssue`, `TrackingAlert`, `StripeEventLog`,
+`PaymentEventLog`, `PaypalSubscription`, `TestClick`.
+
+`TrackingIssue` counts, per day, the input this deployment had to drop: a
+click id that `identify()`, a conversion or the landing beacon named but the
+tenant doesn't have, a Checkout Session `client_reference_id` that isn't a
+click, a coupon code nobody holds, a partner code whose discount Stripe
+refused, with Stripe's answer (Admin → Tracking health). Like
+`WebhookDelivery` it is a log of what reached one deployment, nothing
+re-derives from it, and a restored instance starts counting afresh.
+
+`TrackingAlert` records which Tracking health flags and failing setup checks
+this deployment has already emailed, so each is emailed once
+([tracking-health.md](tracking-health.md#email)). The flags and checks are
+derived from the exported clicks, landings, identities, events, attributions
+and codes (plus a fresh fetch of each destination and a Stripe read), so a
+restored instance shows the same ones, with two exceptions: it quotes no
+Stripe refusal for a partner code until one happens again (that's kept in
+`TrackingIssue`), and it compares Stripe payments with events only from when
+its own event log began. Its first alert run emails what fails then, once.
+
+`TestClick` holds an admin's test clicks
+([tracking-health.md](tracking-health.md#send-a-test-click)): when each test
+link was opened, when the brand's site reported it landing, and when and how
+(`linkedVia`: identify, checkout or conversion) it was linked to a customer.
+A test click is never a `Click`, so it isn't partner traffic
+and nothing in the export derives from it. Rows are deleted 90 days after
+they were made.
+
+`StripeEventLog` lists the brand Stripe events this deployment's attribution
+pipeline processed, so the Stripe catch-up ([stripe-app.md](stripe-app.md#missed-events--the-catch-up))
+can replay the ones no webhook delivered. A delivery log of one deployment,
+pruned after 35 days. What the events recorded is in the exported `Event`
+rows, and a recovered one carries `metadata.recoveredBy`.
+
+`PaymentEventLog` (Nov 2026) is the provider-neutral counterpart for PayPal
+payments ([paypal-payments.md](paypal-payments.md)): each capture, sale,
+refund, subscription and dispute this deployment settled, and what became of
+it, so the webhook and the catch-up never settle one twice and Tracking
+health can count payments that came without a click. A delivery log, pruned
+after 95 days. `PaypalSubscription` caches the `custom_id` each PayPal
+subscription was created with, to join renewals to it: PayPal's own data,
+read back from PayPal by another instance that needs it. What either led to
+is in the exported `Event` rows (`metadata.via = 'paypal'`, PayPal's ids,
+the raw `paypalCustomId`), with the click's `Identity`.
+
+`PartnerSigninLinkLog` records each sign-in link a brand's backend minted for
+a partner (`POST /partners/{id}/signin-link`): which partner, which key,
+when. Like `Session` and `MagicLinkToken` it is a record of access to one
+deployment, and the `ApiKey` ids it names never travel.
 
 `LocationDeclaration` is the hosted platform's record of where each brand
 and partner said it is based ([country-access.md](country-access.md)), and
@@ -539,7 +722,10 @@ attribution data, and a self-hosted install doesn't use them.
 
 `Admin` is the consequential one: it is authentication data, so it stays
 out — which is exactly why `HostedFundingAuthorization` (whose `adminId`
-is an FK to it) can't simply be added to the bundle. Credential *columns*
+is an FK to it) can't simply be added to the bundle. Each admin's `role`
+(full or view only, [view-only-seats.md](view-only-seats.md)) stays out
+with it: on a restored instance the admin who installed it invites the
+rest again, each with their role. Credential *columns*
 of exported tables, and the `Config` keys that aren't settings, are listed
 under [Credentials](#credentials) and [Settings](#settings-config).
 
@@ -552,6 +738,24 @@ own `STRIPE_SECRET_KEY` is the connection. What the connection *recorded* is
 in the bundle as ordinary raw `Event` rows (tagged `metadata.via =
 'stripe_app'`, with the Stripe account id), and those re-derive on any
 instance like every other Event.
+
+`PaypalConnection` and `PaypalPayoutBatch` (Oct 2026) are the same kind of
+thing for Pay with PayPal ([paypal-payouts.md](paypal-payouts.md)): the
+brand's own PayPal REST app credentials (client secret, cached token and
+webhook id, all sealed) and the delivery state of the batches sent with
+them. Credentials for one deployment, and state that only those
+credentials can follow, so neither is exported, in any format; on another
+instance the brand connects its PayPal app again. What the batches did is
+on the payouts, which are exported: each paid payout's
+`metadata.manualExport` carries `via: "api"`, PayPal's `payoutBatchId`,
+item id, transaction id and status, and a released one carries
+`metadata.paypalReleases`. A payout whose INR balance was sent in USD
+keeps `amount` and `currency` in INR; its stamp's `conversion` holds the
+INR amount, the USD amount sent, the ECB rate and its date, and a released
+one keeps that `conversion` in its `paypalReleases` entry. A restored payout still stamped with a batch
+that didn't travel is never released, because PayPal may still pay that
+batch: once checked in PayPal it can be marked sent. Settle every PayPal
+batch before you migrate.
 
 **Not exported yet — known gaps, not decisions:**
 

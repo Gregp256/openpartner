@@ -132,6 +132,7 @@ async function seedEverything(tenantId: string): Promise<void> {
     landingUrl: 'https://brand.example.test/?cref=x',
   });
   await db(TABLES.Identity).insert({ id: u(), tenantId, clickId, userId: 'user_purge' });
+  await db(TABLES.ClickLanding).insert({ clickId, tenantId, host: 'www.purge.test' });
   await db(TABLES.Event).insert({ id: eventId, tenantId, userId: 'user_purge', type: 'invoice_paid' });
   await db(TABLES.Attribution).insert({
     id: attributionId,
@@ -251,6 +252,40 @@ async function seedEverything(tenantId: string): Promise<void> {
     permissionsVersion: 1,
     refreshTokenEnc: 'enc',
   });
+  const paypalConnectionId = u();
+  await db(TABLES.PaypalConnection).insert({
+    id: paypalConnectionId,
+    tenantId,
+    environment: 'sandbox',
+    clientId: `client_${short()}`,
+    clientSecretEnc: 'enc',
+  });
+  await db(TABLES.PaypalPayoutBatch).insert({
+    id: u(),
+    tenantId,
+    connectionId: paypalConnectionId,
+    environment: 'sandbox',
+    runId: u(),
+    currency: 'USD',
+    itemCount: 1,
+    total: '10.00',
+    createdBy: 'admin',
+  });
+  await db(TABLES.PaypalSubscription).insert({
+    tenantId,
+    subscriptionId: `I-${short()}`,
+    connectionId: paypalConnectionId,
+    environment: 'sandbox',
+  });
+  await db(TABLES.PaymentEventLog).insert({
+    tenantId,
+    provider: 'paypal',
+    eventKey: `capture:${short()}`,
+    connectionId: paypalConnectionId,
+    type: 'PAYMENT.CAPTURE.COMPLETED',
+    via: 'webhook',
+    outcome: 'no_reference',
+  });
   await db(TABLES.PortalCustomDomain).insert({
     id: u(),
     tenantId,
@@ -295,6 +330,24 @@ async function seedEverything(tenantId: string): Promise<void> {
     principalKind: 'admin',
     principalId: adminId,
   });
+  await db(TABLES.PartnerSigninLinkLog).insert({
+    id: u(),
+    tenantId,
+    partnerId,
+    magicLinkTokenId: u(),
+    actorKind: 'operator_key',
+    expiresAt: new Date(Date.now() + DAY),
+  });
+  await db(TABLES.TrackingIssue).insert({ tenantId, day: '2026-10-01', kind: 'identify_unknown_click', count: 3 });
+  await db(TABLES.TrackingAlert).insert({ id: u(), tenantId, kind: 'fast_sales', subject: partnerId, notifiedAt: new Date() });
+  await db(TABLES.TestClick).insert({
+    id: u(),
+    tenantId,
+    programId,
+    tokenHash: `${u()}${u()}`.slice(0, 64),
+    expiresAt: new Date(Date.now() + DAY),
+  });
+  await db(TABLES.StripeEventLog).insert({ stripeEventId: `evt_${u()}`, tenantId, type: 'invoice.paid', via: 'webhook' });
   await db(TABLES.PasswordCredential).insert({
     id: u(),
     tenantId,

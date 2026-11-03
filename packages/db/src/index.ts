@@ -53,6 +53,16 @@ export {
 export type { AudienceSize, PartnerApplication } from './partner-application.js';
 export { COUNTRY_CODES, OCCUPIED_REGION_COUNTRY, isCountryCode } from './countries.js';
 export type { CountryCode } from './countries.js';
+export { NEXT_PATH_MAX_LENGTH, safeNextPath, safePortalPath } from './next-path.js';
+export { FREE_MAIL_DOMAINS, isFreeMailAddress } from './free-mail.js';
+export { TENANT_TABLES, RESTRICTED_GRANTS, grantAppRole } from './app-role-grants.js';
+export {
+  CLOUDFLARE_IP_RANGES,
+  forwardedClientAddress,
+  isCloudflareAddress,
+  trustProxyFromEnv,
+} from './trusted-proxy.js';
+export type { TrustProxy } from './trusted-proxy.js';
 
 export interface DbConfig {
   connectionString: string;
@@ -114,6 +124,7 @@ export const TABLES = {
   PartnerProgram: 'PartnerProgram',
   Link: 'Link',
   Click: 'Click',
+  ClickLanding: 'ClickLanding',
   Identity: 'Identity',
   Event: 'Event',
   Attribution: 'Attribution',
@@ -127,6 +138,7 @@ export const TABLES = {
   Admin: 'Admin',
   MagicLinkToken: 'MagicLinkToken',
   PasswordCredential: 'PasswordCredential',
+  PartnerSigninLinkLog: 'PartnerSigninLinkLog',
   Session: 'Session',
   PlatformSession: 'PlatformSession',
   PlatformSessionBundle: 'PlatformSessionBundle',
@@ -146,7 +158,12 @@ export const TABLES = {
   HostedFundingAuthorization: 'HostedFundingAuthorization',
   HostedBillingState: 'HostedBillingState',
   TenantStripeConnection: 'TenantStripeConnection',
+  PaypalConnection: 'PaypalConnection',
+  PaypalPayoutBatch: 'PaypalPayoutBatch',
+  PaypalSubscription: 'PaypalSubscription',
+  PaymentEventLog: 'PaymentEventLog',
   StripeWebhookInbox: 'StripeWebhookInbox',
+  StripeEventLog: 'StripeEventLog',
   PayoutReversal: 'PayoutReversal',
   CommissionAdjustment: 'CommissionAdjustment',
   OperatorRecoveryRequest: 'OperatorRecoveryRequest',
@@ -154,4 +171,7 @@ export const TABLES = {
   HostedFeeTerms: 'HostedFeeTerms',
   HostedBillingProfile: 'HostedBillingProfile',
   UsageFeeShadow: 'UsageFeeShadow',
+  TrackingIssue: 'TrackingIssue',
+  TrackingAlert: 'TrackingAlert',
+  TestClick: 'TestClick',
 } as const;

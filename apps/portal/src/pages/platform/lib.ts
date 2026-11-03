@@ -35,6 +35,9 @@ export interface PlatformBrand {
   /** Local setup checklist (program / listing / tracking / partners). */
   setupComplete: boolean;
   setupMissing: string[];
+  /** A test click reached identify, or a partner click is linked to a
+   *  customer. Approving without it takes "Approve anyway". */
+  trackingVerified: boolean;
   setupRemindersSent: number;
   lastSetupReminderAt: string | null;
   /** Latest marketplace policy warning sent to this brand, if any. */
@@ -175,6 +178,38 @@ export interface NetworkCreator {
     attempts: number;
     lastAttemptAt: string;
   }>;
+  // ---- Review (absent on a Network that predates creator review) ----
+  /** Brands and the public see the creator only once 'approved' (and
+   *  complete). */
+  reviewStatus?: ApprovalStatus;
+  reviewedAt?: string | null;
+  /** Internal note on the last decision. */
+  reviewReason?: string | null;
+  reviewedByEmail?: string | null;
+  /** When the creator last edited their profile. */
+  profileUpdatedAt?: string;
+  platforms?: Array<{
+    platform: string;
+    handle: string;
+    profileUrl: string | null;
+    followerCount: number | null;
+    verified: boolean;
+  }>;
+  messageCount?: number;
+  unreadMessageCount?: number;
+  lastMessageAt?: string | null;
+}
+
+/** An operator's message to a creator (shown in their portal). */
+export interface NetworkCreatorMessage {
+  id: string;
+  body: string;
+  sentByEmail: string | null;
+  createdAt: string;
+  /** Null when it wasn't emailed. */
+  emailedAt: string | null;
+  /** When the creator marked it read. */
+  readAt: string | null;
 }
 
 /** A Network vendor (brand) as the marketplace sees it. Featured fields are
@@ -234,12 +269,21 @@ export interface NetworkVendorReview {
 export interface NotificationSettings {
   brandSetupReminders: boolean;
   creatorProfileReminders: boolean;
+  creatorStorefrontNudge: boolean;
 }
 
 export interface NotificationsState {
   settings: NotificationSettings;
   brandRemindersSentLast7Days: number;
   networkConfigured: boolean;
+}
+
+/** OpenPartner's own partner program (house-program.ts on the API). */
+export interface HouseProgramState {
+  settings: { tenantId: string | null };
+  tenant: { id: string; slug: string; displayName: string; status: string; approvalStatus: string } | null;
+  stripeConnection: { stripeAccountId: string; livemode: boolean; connectedAt: string; lastEventAt: string | null } | null;
+  referredBrands: number;
 }
 
 /** Who a reminder run would email (dryRun) or did email. Brand rows carry a
@@ -254,6 +298,26 @@ export interface ReminderRunResult {
     email: string;
     step: number;
     missing: string[];
+  }>;
+  sent: number;
+  failed: number;
+}
+
+/** Who the storefront nudge would email (dryRun) or did email. */
+export interface StorefrontNudgeRunResult {
+  dryRun: boolean;
+  eligible: Array<{
+    creatorId: string;
+    email: string;
+    name: string;
+    handle: string | null;
+    /** Their biggest channel, when it has 1,000 or more followers. */
+    audience: { platform: string; count: number } | null;
+    /** Packages saved, drafts included, and how many are published. */
+    packages: number;
+    publishedPackages: number;
+    bookingsOpen: boolean;
+    paymentsReady: boolean;
   }>;
   sent: number;
   failed: number;
@@ -413,6 +477,11 @@ export interface InvoiceBillingState {
   tenants: InvoiceBillingTenant[];
 }
 
+/** Who may create a brand (platform-settings.ts BrandSignupSettings). */
+export interface BrandSignupSettings {
+  workEmailRequired: boolean;
+}
+
 export interface BlocklistEntry {
   id: string;
   type: 'email' | 'domain';
@@ -476,6 +545,8 @@ export async function papi<T = unknown>(
     }
     throw new PlatformApiError(res.status, message);
   }
+  // No Content (a removal): nothing to read.
+  if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
@@ -507,10 +578,18 @@ export function friendlyPlatformError(err: unknown): string {
       return 'The email couldn’t be sent — check the platform mail settings and try again.';
     case 'vendor_not_found':
       return 'That brand is no longer on the Network — refresh and try again.';
+    case 'creator_not_active':
+      return 'That creator is blocked or deleting their account, so they can’t read a message.';
     case 'managed_by_brand_review':
       return 'That vendor is one of our hosted brands — approve or reject it on the Brands tab.';
     case 'network_not_configured':
       return 'NETWORK_URL / NETWORK_ADMIN_API_KEY aren’t set, so creator reminders can’t reach the Network.';
+    case 'already_running':
+      return 'That job is already running. Its progress shows under Runs.';
+    case 'outreach_off':
+      return 'Switch the outreach email on in Settings first.';
+    case 'mailer_not_configured':
+      return 'The Network has no outreach mailbox set up, so nothing can be sent.';
     case 'cutover_in_past':
       return 'The cutover can’t be more than a day in the past: it would reprice plans bought under the old pricing.';
     case 'no_cutover':
@@ -533,6 +612,8 @@ export function friendlyPlatformError(err: unknown): string {
       return 'The brand has no card on file. It can add one in the Stripe Customer Portal from its Billing page.';
     case 'not_found':
       return 'No brand with that id or slug.';
+    case 'tenant_not_found':
+      return 'No brand has that slug.';
     default:
       return raw;
   }

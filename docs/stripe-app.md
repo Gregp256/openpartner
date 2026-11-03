@@ -11,7 +11,7 @@ drive attribution, the way a single-tenant self-host's do through its own
 | Stripe-billed SaaS brands reported every invoice from their server | `invoice.paid` is recorded directly, for any customer linked to a click |
 | A refund needed an admin to reverse the commission | `charge.refunded` reverses the commissions on a full refund and prorates them on a partial one, exactly as on self-host (see *Refunds and disputes*) |
 | Disputes were invisible | `charge.dispute.created` is recorded. It reverses nothing until the brand reports a lost dispute as a chargeback |
-| Customer-reward promo codes were created by hand in the brand's Stripe | They're created in the brand's account automatically, and redemptions at Stripe Checkout attribute with no `POST /coupons/redeem` call |
+| Customer-reward promo codes were created by hand in the brand's Stripe | They're created in the brand's account automatically, including for codes minted before the brand connected, and redemptions at Stripe Checkout attribute with no `POST /coupons/redeem` call |
 | The platform fee was computed from self-reported amounts | Stripe-sourced amounts win over self-reported ones for the same transaction (see *Stripe wins*) |
 
 Self-host is unchanged: it never connects anything, and `/webhooks/stripe`
@@ -21,7 +21,7 @@ Code: `apps/api/src/stripe-app.ts` (tokens, rules), `routes/stripe-app.ts`
 (install + admin API), `routes/stripe-app-webhook.ts` (events),
 `routes/stripe-webhook.ts` (`processBrandStripeEvent`, the mapping both
 routes share). Manifest: `stripe-app/`. Table: `TenantStripeConnection`
-(migration `20261017000000`).
+(migration `20261017000000`; `rewardsVerifiedAt` from `20261021010000`).
 
 ---
 
@@ -178,6 +178,45 @@ processing. Stripe has no API for an app to uninstall itself, so the admin is
 told to uninstall it under Settings → Installed apps to remove it from Stripe
 too.
 
+### Missed events — the catch-up
+
+Stripe retries a failed webhook delivery for three days and then gives up. An
+outage longer than that would lose those checkouts, invoices and refunds for
+good, while every report still looked plausible. So every six hours the
+scheduler's `stripe-event-catchup` job (`apps/api/src/stripe-event-catchup.ts`)
+lists each live connection's events through the app (`event_read`) and runs
+the ones nobody processed through the same pipeline the webhook uses.
+
+- **What counts as processed.** `processBrandStripeEvent` writes a
+  `StripeEventLog` row for every brand event it runs, whatever the event comes
+  to, in the same transaction. The catch-up replays only events with no row.
+- **Window.** The last 72 hours, never the last hour (a webhook may still be on
+  its way), and never before the connection's `eventLogSince`: the moment the
+  log started for it, so the first run after the deploy doesn't replay what
+  the webhook handled before it. (Events an older instance handled during the
+  rolling deploy itself have no row and may be replayed; the pipeline is
+  idempotent per event, so that's harmless.) A brand that disconnects and connects again gets a
+  new connection and a new start; one that only had to reconnect keeps its
+  start, so events skipped while the connection was broken are recorded when
+  it works again, within the 72 hours.
+- **Order and bounds.** The window is walked oldest first in six-hour slices,
+  and each slice's missed events are replayed in the order they happened, so
+  an original sale is recorded before the renewal that inherits its partner.
+  At most 50,000 events listed and 1,000 replayed per connection per run; a
+  run that stops early starts again from the window's start next time, and
+  the window slides with each run, so every event is listed before it ages
+  out while six hours hold fewer than 50,000 events. Events of the other mode
+  (test vs live) are ignored. One connection failing doesn't stop the others;
+  the next run retries.
+- **Tagging.** Recorded Events carry `metadata.recoveredBy = 'stripe_catchup'`.
+  **Admin → Tracking health** counts them: anything above zero means webhook
+  deliveries are failing, and the log line `[stripe-catchup] recorded events the
+  webhook missed` names the tenants.
+- **Retention.** Log rows older than 35 days are pruned by the same job: Stripe
+  lists events for 30. `StripeEventLog` is never exported (a delivery log).
+- **Self-host** isn't covered yet: there `/webhooks/stripe` shares the account
+  with OpenPartner's own billing and funding events.
+
 ### Stripe wins — forwarded conversions vs. Stripe-sourced revenue
 
 While a tenant's connection is healthy, a forwarded conversion whose
@@ -194,6 +233,11 @@ The order of arrival doesn't matter:
   platform fee is billed on.
 - A `/coupons/redeem` keyed on a Checkout Session can't claim the key first and
   turn the checkout's revenue into a dropped "replay".
+
+A single-tenant self-host whose `/webhooks/stripe` has a platform (or legacy)
+signing secret refuses a Checkout Session id the same way, for the same reason.
+Its webhook keys invoices on the Stripe event id, so an invoice id is accepted
+there.
 
 Two limits:
 
@@ -226,6 +270,35 @@ The portal's build produces `/op.js` from `packages/sdk/src/auto.ts`
 the platform origin and on every white-label domain, with no npm release
 needed.
 
+### Partner codes and the brand's own promos
+
+A discount at the brand's checkout credits a partner when its promotion code
+is the one stored on the partner's code (`Coupon.stripePromotionCodeId`).
+Failing that, it falls back to the string: the promotion code's customer-facing
+code, or the Stripe coupon id (`stripe-webhook.ts findCouponByDiscountCode`).
+A string match credits the partner only when the brand meant that promo for
+the code (`discountMadeForCoupon`):
+
+- a promotion code OpenPartner created for the code (metadata
+  `source: openpartner` and `openpartner_code`), even one the row doesn't
+  store, such as one minted under an earlier connection;
+- any promo or coupon, when the brand's admin typed the code
+  (`Coupon.brandChosen`). Mapping a promo the brand already runs onto a
+  partner is allowed;
+- otherwise, a promo or coupon created no earlier than the partner's code: the
+  brand made it for that code, as the portal asks when a program's discount
+  isn't minted for them.
+
+A promo that predates the code is the brand's own, for example a sitewide
+`WELCOME10` that a partner code minted before the connect happens to equal.
+The mint-time check (`codeExistsInStripe`) refuses exactly those codes when it
+can reach the brand's Stripe, and the webhook applies the same rule to the
+codes it couldn't check. The discount then credits no partner, and a warning
+naming the code and the Stripe object is logged. If the brand did map that
+promo on purpose with a code created before `brandChosen` existed, set it on
+that code's row (there's no setting for it in the portal yet). The same rule
+applies to a single-tenant self-host's `/webhooks/stripe`.
+
 ### Customer rewards
 
 `customer-rewards.ts rewardStripe(tenantId)` returns the brand's own client on
@@ -236,6 +309,87 @@ OpenPartner's billing account. Reward promos were once wrongly minted there
 partner code gets its Coupon + PromotionCode in the brand's account. Deactivating
 a code deactivates its promo there. That's best-effort, and a promo minted under
 a previously connected account is out of reach.
+
+#### Codes minted before the connection
+
+A code gets its promo when it's minted, and codes are minted when a partner is
+granted a program. Brands usually add partners first and connect Stripe later,
+so most codes exist before there's an account to put them in. Without a
+backfill they kept `Coupon.stripePromotionCodeId = null`, and a customer typing
+one at the brand's Stripe Checkout got "invalid code".
+
+`customer-rewards.ts backfillCustomerRewards` gives them their promos:
+
+- **When.** `POST /stripe-app/connection/complete` starts a pass in the
+  background once the connection has committed, on every connect and
+  reconnect. A failure is logged and never fails the connect. The hourly
+  scheduler job `stripe-app-reward-backfill` retries:
+  - a connection whose check never finished (`TenantStripeConnection.rewardsVerifiedAt`
+    is null: the pass stopped early, or the process running it died). The
+    sweep runs the full check again. Connections from before this change start
+    unchecked, so the first sweep after deploy checks every connected brand once.
+  - a checked connection whose tenant still has codes without a promo: a
+    pass that couldn't provision them, a mint whose Stripe call failed, or a
+    program that gained a customer reward after its codes were minted.
+- **Which codes.** Active codes (`deactivatedAt` null) on programs with a
+  `customerReward`, held by partners who aren't suspended (`revokedAt` null).
+- **Permissions.** It goes through the same client as `rewardStripe`, so a
+  connection without `coupon_write` + `promotion_code_write` (or one waiting for
+  a reconnect) gets no Stripe calls at all, and the sweep skips that tenant. The
+  client is fetched again for each code, so a disconnect stops the pass at the
+  next code.
+- **Idempotent.** A code whose promo is in the account is left alone, even one
+  the brand deactivated in its Dashboard. A code without one is first looked up
+  by its string (`promotionCodes.list`, every page):
+  - an active promo with `metadata.source = 'openpartner'` and the same
+    `openpartner_code` is ours. A pass whose write didn't land, or an earlier
+    connection to this account, created it. It's recorded, not created again.
+  - any other promo with that string, active or not, or a Stripe coupon with
+    it as its id, is the brand's own (as in `codeExistsInStripe`). The code is
+    left without a promo, and an `ALERT` is logged. Codes minted before the
+    connection were never checked against the brand's Stripe, so this can
+    happen. Whether a purchase with that promo credits the partner depends on
+    whether the brand meant it for the code (see *Partner codes and the
+    brand's own promos*). One older than the code credits nobody, so the brand
+    gives the partner a new code.
+- **Safe across processes.** The write to `Coupon` only lands if the code is
+  still active, still holds what the pass read, and (hosted) the connection the
+  promo came through is still live. That connection row is held `FOR SHARE`
+  while the write commits. A pass that outlives a reconnect can't write the old
+  account's ids under the new one. Its promo stays in the old account like any
+  other minted there, or, when the same account was reconnected, the next pass
+  adopts it by its code. A promo created for a code retired meanwhile is
+  deactivated again, as the mint path does: no pass adopts a promo for a
+  retired code. Stripe keeps active codes unique, so two passes can't both
+  create one. Retiring a
+  code (`DELETE /partners/:id/coupons/:couponId`, or revoking the program
+  grant) sets `deactivatedAt` first and reads the promo id back from that
+  update. A promo a pass recorded a moment earlier is deactivated in Stripe
+  too, once the retirement has committed. The pass locks the Coupon row before
+  the connection row, which is the order that can't wait in a cycle.
+- **Another account.** A connect also checks the promo ids already stored
+  (`promotionCodes.retrieve`). A promo from a previous connection, the other
+  mode (test then live is the common case), a self-host's key, or OpenPartner's
+  own billing account before #97 isn't in the new account. Its id is cleared,
+  then the code is handled like one without a promo. Switching back to an
+  earlier account finds that account's promos by their string and reuses them.
+  The old account's promos stay active there, out of reach, as before. The
+  check covers every active code that holds a promo id, including a suspended
+  partner's and one on a program whose customer reward was switched off. Their
+  stale ids are cleared too, but only codes eligible for a discount get a new
+  promo, so a reinstated partner or a reward switched back on gets one from the
+  next sweep. A pass that checks every code against one connection, without
+  stopping, sets `rewardsVerifiedAt`. A connect clears it.
+- **Stops early** on a Stripe error that isn't about one code (auth,
+  permission, rate limit, outage), so the rest wait for the next pass. A
+  refused request (`StripeInvalidRequestError`) only skips that code.
+
+Integrations reports the result. `GET /stripe-app/connection` returns
+`rewardCodesNotInStripe` (codes with no promo yet), `rewardCodesSyncing` (a
+pass is running in this API process) and `rewardCodesChecked` (the connection
+is verified). The card says "customer discounts created in Stripe" only when
+the connection is checked and the count is zero. Otherwise it says the check
+is pending, or names the count and explains why. It polls while a pass runs.
 
 ---
 
@@ -253,10 +407,10 @@ money (CLAUDE.md principle 4), and nothing edits customers.
 | `invoice_read` | Record paid invoices for referred customers so partners earn commission on them, including the promo code used. | `invoice.paid`, `invoice.payment_failed`; `invoices.retrieve` with expanded discounts (`collectDiscounts`); `invoicePayments.list`, the invoice a refunded charge paid on API versions from 2025-03-31.basil (`invoicePaidBy`) |
 | `charge_read` | Read refunds and disputed charges so commissions on refunded revenue are reversed or flagged. | `charge.refunded`; `charges.retrieve` (a dispute's customer) |
 | `dispute_read` | Flag commissions on disputed payments for your review. | `charge.dispute.created` |
-| `promotion_code_read` | Match promotion codes used at checkout to your partners' codes. | `promotionCodes.retrieve` (`resolveDiscountCode`); `promotionCodes.list` (`codeExistsInStripe`); expanding a discount's promotion code |
-| `promotion_code_write` | Create each partner's customer-discount promotion code in your account, and deactivate it when the code is retired. | `provisionCustomerReward`, `deactivateCustomerReward` |
-| `coupon_read` | Check that a new partner code doesn't collide with one of your own coupons. | `coupons.retrieve` (`codeExistsInStripe`) |
-| `coupon_write` | Create the coupon behind each partner's customer discount. | `provisionCustomerReward` |
+| `promotion_code_read` | Match promotion codes used at checkout to your partners' codes. | `promotionCodes.retrieve` (`resolveDiscountCode`, and `backfillCustomerRewards` checking a stored promo is in this account); `promotionCodes.list` (`codeExistsInStripe`, `backfillCustomerRewards`); expanding a discount's promotion code |
+| `promotion_code_write` | Create each partner's customer-discount promotion code in your account, and deactivate it when the code is retired. | `provisionCustomerReward`, `backfillCustomerRewards`, `deactivateCustomerReward` |
+| `coupon_read` | Check that a new partner code doesn't collide with one of your own coupons. | `coupons.retrieve` (`codeExistsInStripe`, `backfillCustomerRewards`; `discountMadeForCoupon`, when a coupon id matched a code) |
+| `coupon_write` | Create the coupon behind each partner's customer discount. | `provisionCustomerReward`, `backfillCustomerRewards` |
 
 `STRIPE_APP_PERMISSIONS` in `stripe-app.ts` is the source of truth, and a test
 holds the manifest to it. Changing the list:
@@ -298,7 +452,8 @@ Done Oct 18 2026: versions 0.1.0 and then 0.1.1 (the real icon) are uploaded to
 the **OpenPartner Apps** account (`acct_1URepJLKsWusNm7Z`). For a later version,
 bump `version` in `stripe-app.json`, repeat the last command, and switch the
 External test (step 5) to the new version: it stays on the version it was
-started with.
+started with. Now that the app is published (step 6), a new version also goes
+through App Review before Stripe releases it.
 
 ```bash
 stripe login --interactive --project-name openpartner-apps   # paste the live secret key
@@ -412,7 +567,7 @@ installed.
 | `STRIPE_APP_SECRET_KEY_SANDBOX` / `STRIPE_APP_CLIENT_ID_SANDBOX` | Optional: the app's managed-sandbox key and link |
 | `STRIPE_APP_WEBHOOK_SECRET` | The endpoint signing secrets from step 3, comma-separated |
 | `STRIPE_APP_REDIRECT_URI` | Optional. Defaults to `${PORTAL_URL}/api/stripe-app/oauth/callback`, and must exactly match a manifest URI |
-| `STRIPE_APP_AUTHORIZE_URL` | **Until the app is published.** Paste the External test tab's live-mode link whole (`https://marketplace.stripe.com/oauth/v2/chnlink_…/authorize?…`). Only its origin and path are used; `client_id` still comes from the vars above. It applies to every mode unless `_TEST` / `_SANDBOX` overrides it, since the live and test links have shared one channel so far. Unset = the public link, which works only after publishing. |
+| `STRIPE_APP_AUTHORIZE_URL` | **Leave unset.** The app is published, so installs use the public link. Before App Review it held the External test tab's live-mode link, pasted whole (`https://marketplace.stripe.com/oauth/v2/chnlink_…/authorize?…`), because the public link only works once the app is published. Only its origin and path are used; `client_id` still comes from the vars above. A `_TEST` / `_SANDBOX` variant overrides it for that mode. |
 
 Each mode is offered in the portal only when both its key and client id are set:
 
@@ -423,6 +578,9 @@ With nothing set, the card is hidden. Set these on the DO app's `api` component.
 `SECRETS_ENCRYPTION_KEY` (already set) encrypts the stored tokens.
 
 ### 5. External test
+
+Passed in prod on Oct 19 2026, before App Review. Setting
+`STRIPE_APP_AUTHORIZE_URL` (item 2) was only needed until the app was published.
 
 1. App details → **External test** → Get started, picking the uploaded version.
 2. Under **Test OAuth**, copy the **Live mode link** and the **Test mode link**.
@@ -474,13 +632,21 @@ so approve it first. Once published:
    use the public link.
 3. Redeploy.
 
+**Published Oct 28 2026.** Stripe approved the app, and it's listed at
+<https://marketplace.stripe.com/apps/openpartner>. Prod's `api` component has
+no `STRIPE_APP_AUTHORIZE_URL` (checked Oct 28 with `doctl apps spec get`), so
+items 2 and 3 are already done and installs use the public link. Item 1 still
+needs a look: compare the live `client_id` on the app's Settings tab with prod's
+`STRIPE_APP_CLIENT_ID`.
+
 ---
 
 ## Operations
 
 - **Reconnect needed.** The ops email names the brand and account. The brand
   reconnects from Integrations, and the same row is refreshed. Events delivered
-  while the connection was broken were skipped (see follow-ups).
+  while the connection was broken were skipped; the catch-up records the ones
+  from the last 72 hours on its next run (see *Missed events*).
 - **Rotating a webhook secret.** Add the new secret to
   `STRIPE_APP_WEBHOOK_SECRET` (comma-separated) before rolling it in Stripe, and
   remove the old one after.
@@ -512,11 +678,16 @@ so approve it first. Once published:
 
 - **Stripe Dashboard UI extension**: show the referring partner on a customer's
   page in the brand's Stripe Dashboard.
-- **Backfill after a reconnect**: replay the events skipped while a connection
-  needed reconnecting, through the Events API (`event_read` allows 30 days).
+- **Longer backfill after a reconnect**: the catch-up reaches back 72 hours.
+  A connection broken for longer could replay up to 30 days (`event_read`
+  allows it) with a one-off run from the reconnect.
+- **Catch-up on a self-host**: list the brand account's events with
+  `STRIPE_SECRET_KEY` and replay them through `/webhooks/stripe`'s full handler
+  (funding, billing, then attribution), not only the attribution pipeline.
 - **Per-account Coupon provenance**: deactivating a promo minted under a
   previously connected account. Needs a hosted sidecar, because Coupon is a core
-  table.
-- **The same `/coupons/redeem` key collision on self-host**: a redemption keyed
-  on a Checkout Session id can take the key before `/webhooks/stripe` records
-  that checkout's revenue.
+  table. (A new account does get its own promos: see *Codes minted before the
+  connection*.)
+- **Changed reward terms**: editing a program's `customerReward` doesn't
+  touch promos already created. Their Stripe coupons keep the old terms. A fix
+  would create a new coupon + promo per code and deactivate the old promo.

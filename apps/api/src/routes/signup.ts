@@ -13,13 +13,15 @@
  *   - slug not already taken (Tenant.slug unique)
  *   - adminEmail not already in use under that slug (which is impossible
  *     since the tenant is brand new, but we check anyway for symmetry)
+ *   - adminEmail not at a free mail provider while ops require a work
+ *     email (GET /signup/settings says which)
  *
  * Mounted BEFORE tenantMiddleware in app.ts because there's no tenant
  * context yet — we use the privileged `db` for the writes.
  */
 
 import { Router } from 'express';
-import { z } from 'zod';
+import { z } from '../zod.js';
 import { ulid } from 'ulid';
 import { TABLES, type AdminRow, type TenantRow } from '@openpartner/db';
 import { db } from '../db.js';
@@ -29,9 +31,12 @@ import { holdSignupPassword, passwordSchema } from '../passwords.js';
 import { getMailer } from '../mailer.js';
 import { adminInviteEmail, buildMagicLinkUrl } from '../email-templates.js';
 import { RESERVED_SLUGS, getTenancyMode } from '../tenancy.js';
+import { networkReviewFor } from '../tracking-verification.js';
 import { newTrialEnd } from '../billing-plan.js';
-import { findBlockingEntry, notifyOpsNewBrand } from '../brand-review.js';
+import { findBlockingEntry, notifyOpsNewBrand, workEmailRequiredFor } from '../brand-review.js';
+import { getBrandSignupSettings } from '../platform-settings.js';
 import { screenTenantInBackground } from '../sanctions-screening.js';
+import { recordHouseSignup, signupCrefs } from '../house-program.js';
 import {
   checkCountryAccess,
   countryAccessStatus,
@@ -69,6 +74,9 @@ const signupSchema = z.object({
    *  when the activation link is redeemed (passwords.ts claimSignupPassword),
    *  and never replaces a password the address already has. */
   password: passwordSchema.optional(),
+  /** The partner click on the signup page's URL (`?cref=`), for
+   *  OpenPartner's own partner program (house-program.ts). */
+  cref: z.string().max(200).optional(),
 });
 
 class SignupGuardError extends Error {
@@ -76,6 +84,14 @@ class SignupGuardError extends Error {
     super(code);
   }
 }
+
+/** What the signup forms need to know before anything is sent: whether a
+ *  free mail address will be refused (the forms check it with
+ *  isFreeMailAddress as it's typed). */
+signupRouter.get('/signup/settings', async (_req, res) => {
+  const settings = await getBrandSignupSettings(db);
+  res.json({ workEmailRequired: settings.workEmailRequired });
+});
 
 signupRouter.post('/signup', signupLimit, async (req, res) => {
   if (getTenancyMode() !== 'multi') {
@@ -90,6 +106,12 @@ signupRouter.post('/signup', signupLimit, async (req, res) => {
 
   if (RESERVED_SLUGS.has(slug)) {
     return res.status(409).json({ error: 'slug_reserved' });
+  }
+
+  // A brand signs up from its own domain while ops require that
+  // (workEmailRequiredFor), so a Gmail address can't open a brand here.
+  if (await workEmailRequiredFor(db, adminEmail)) {
+    return res.status(403).json({ error: 'work_email_required' });
   }
 
   // Countries the platform doesn't serve: refused before anything is
@@ -213,6 +235,15 @@ signupRouter.post('/signup', signupLimit, async (req, res) => {
   // In the background: a possible match lands in the ops review queue,
   // and the response doesn't wait on the list.
   screenTenantInBackground(db, tenantId, 'signup');
+  // A partner of OpenPartner's own program referred this brand: credit the
+  // signup there (house-program.ts). Best-effort; never fails the signup.
+  await recordHouseSignup({
+    brandTenantId: tenantId,
+    adminId,
+    brandSlug: slug,
+    displayName: body.data.displayName,
+    crefs: signupCrefs(body.data.cref, req.cookies),
+  });
 
   // Email the activation magic link. If this fails the Tenant + Admin row
   // remain — the operator can hit /admins/:id/invite later (after first
@@ -335,7 +366,8 @@ export async function autoEnrollBrandOnNetwork(opts: {
       tier: 'hosted',
       portalCallbackUrl: `${opts.protoHost}/t/${opts.slug}/admin/network/complete`,
       adminAuthToken: networkAdminKey,
-      reviewStatus: opts.approvalStatus,
+      // An auto-approved brand the tracking gate holds back reads 'pending'.
+      reviewStatus: await networkReviewFor(db, db, opts.tenantId, opts.approvalStatus),
     });
     if (signupResult.status === 'active') {
       await saveNetworkMembership(db, opts.tenantId, {

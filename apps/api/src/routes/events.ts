@@ -1,12 +1,12 @@
 import { Router } from 'express';
-import { z } from 'zod';
+import { utcDateTime, z } from '../zod.js';
 import { ulid } from 'ulid';
 import { TABLES, type EventRow } from '@openpartner/db';
 import { attributeEvent } from '../attribution.js';
 import { grantScope, requireAdmin, requireAuth } from '../auth.js';
 import { sameConversion, storedAttribution } from '../conversion-ingest.js';
 import { currencyInputSchema, ingestCurrency } from '../currency.js';
-import { RECORDED_FROM_STRIPE_DETAIL, recordedFromStripe } from '../stripe-app.js';
+import { recordedFromStripe, recordedFromStripeDetail } from '../stripe-app.js';
 import { tenantOf } from '../tenancy.js';
 
 export const schema = z.object({
@@ -17,8 +17,8 @@ export const schema = z.object({
   /** ISO 4217, any case; stored upper case. Omitted → the tenant's
    *  default currency (Settings → Program). */
   currency: currencyInputSchema.optional(),
-  metadata: z.record(z.unknown()).optional(),
-  ts: z.string().datetime().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  ts: utcDateTime().optional(),
   /** Idempotency key — the source system's stable id for this one event
    *  (order id, invoice id, CRM deal-stage change id). A retry with the
    *  same key replays the original result instead of inserting a second
@@ -52,10 +52,11 @@ eventsRouter.post('/attribution/events', requireAuth, grantScope('events:write')
 
   const eventId = ulid();
   const { userId, type, value, currency, metadata, ts, externalEventId } = body.data;
-  // A Stripe invoice / Checkout Session the brand's connected Stripe account
-  // reports itself: Stripe's record of that payment wins (stripe-app.ts).
+  // A Stripe invoice / Checkout Session the brand's Stripe account reports
+  // itself (connected, or a self-host's own webhook): Stripe's record of that
+  // payment wins (stripe-app.ts).
   if (await recordedFromStripe(db, tenantId, externalEventId)) {
-    return res.status(409).json({ error: 'recorded_from_stripe', detail: RECORDED_FROM_STRIPE_DETAIL });
+    return res.status(409).json({ error: 'recorded_from_stripe', detail: recordedFromStripeDetail() });
   }
   const row = {
     id: eventId,

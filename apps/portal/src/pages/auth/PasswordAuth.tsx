@@ -38,14 +38,40 @@ export function useAuthProviders(): AuthProviders {
   return q.data ?? { google: false, googleStartUrl: null };
 }
 
+/** Shown wherever a free mail address is refused as a brand's (the API's
+ *  work_email_required). */
+export const WORK_EMAIL_NEEDED = 'Use your work email to sign up as a brand.';
+
+/** React Query key of GET /signup/settings, for the ops switch to refresh. */
+export const SIGNUP_SETTINGS_KEY = ['signup-settings'] as const;
+
+/** Whether this deployment refuses new brands on free mail addresses
+ *  (GET /signup/settings); the forms check an address with
+ *  isFreeMailAddress from @openpartner/db. */
+export function useWorkEmailRequired(): boolean {
+  const q = useQuery({
+    queryKey: SIGNUP_SETTINGS_KEY,
+    queryFn: async (): Promise<{ workEmailRequired: boolean }> => {
+      const r = await fetch('/api/signup/settings', { credentials: 'include' });
+      if (!r.ok) throw new Error(`${r.status}`);
+      return (await r.json()) as { workEmailRequired: boolean };
+    },
+    staleTime: 60_000,
+  });
+  return q.data?.workEmailRequired ?? false;
+}
+
 export function googleStartHref(
   startUrl: string,
-  flow: 'account' | 'account_add' | 'ops' | 'portal',
+  flow: 'account' | 'account_add' | 'ops' | 'portal' | 'creator',
   slug?: string | null,
+  /** account flows: where to land after entering a workspace (lib/signin-next.ts). */
+  next?: string | null,
 ): string {
   const url = new URL(startUrl, window.location.origin);
   url.searchParams.set('flow', flow);
   if (slug) url.searchParams.set('slug', slug);
+  if (next) url.searchParams.set('next', next);
   return url.toString();
 }
 
@@ -89,6 +115,14 @@ export function authErrorMessage(code: string): string {
   if (code.includes('google_unavailable')) return 'Google sign-in isn’t set up on this deployment.';
   if (code.includes('google_failed')) return 'Google sign-in didn’t work. Try again.';
   if (code.includes('not_an_operator')) return 'That account isn’t an OpenPartner operator.';
+  // Creator portal (the Network's answers).
+  if (code.includes('creator_not_active')) return 'This creator account can’t sign in. Contact support if you think that’s a mistake.';
+  if (code.includes('pending_deletion'))
+    return 'Your account is scheduled for deletion. Sign in with an emailed link and recover it first.';
+  if (code.includes('google_signup_expired')) return 'Your Google sign-in timed out. Continue with Google again.';
+  if (code.includes('google_not_authoritative'))
+    return 'Google can’t vouch for that address on its own. Sign in with your password or an emailed link instead.';
+  if (code.includes('creator_exists')) return 'You already have a creator account with this address. Sign in instead.';
   if (code.includes('invalid_body')) return `Check the fields — passwords need at least ${MIN_PASSWORD_LENGTH} characters.`;
   return code || 'Something went wrong. Try again.';
 }
@@ -320,6 +354,7 @@ export function EmailPasswordForm({
   onForgot,
   linkSentText,
   forgotSentText,
+  forgotHint,
   emailPlaceholder = 'you@example.com',
   footer,
 }: {
@@ -331,6 +366,8 @@ export function EmailPasswordForm({
   onForgot: (email: string) => Promise<void>;
   linkSentText: (email: string) => ReactNode;
   forgotSentText: (email: string) => ReactNode;
+  /** Extra line under the "forgot password" explanation. */
+  forgotHint?: ReactNode;
   emailPlaceholder?: string;
   footer?: ReactNode;
 }) {
@@ -430,6 +467,7 @@ export function EmailPasswordForm({
         {mode === 'forgot' && (
           <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 12, lineHeight: 1.5 }}>
             We&rsquo;ll email you a link to choose a new password. Never had one? This sets your first.
+            {forgotHint && <div style={{ marginTop: 6 }}>{forgotHint}</div>}
           </div>
         )}
         {err && <div style={{ color: theme.danger, fontSize: 13, marginBottom: 8 }}>{err}</div>}

@@ -49,6 +49,9 @@ export interface TenantRow {
    *  gate large coupon mints behind a "you've actually wired up the
    *  /coupons/redeem integration" check. Null = never verified. */
   couponIntegrationVerifiedAt: Date | null;
+  /** When the brand first passed a test click through to identify
+   *  (apps/api/src/tracking-verification.ts). Null = never. */
+  trackingTestPassedAt: Date | null;
   /** Public URL for the tenant's brand logo, set via the upload endpoint.
    *  Null when the brand hasn't uploaded one — UI falls back to text. */
   logoUrl: string | null;
@@ -347,6 +350,19 @@ export interface PartnerRow {
   // links, no sessions. For headless programs, where the brand's own app
   // is the partner's only view. Default true. See partner-portal-access.ts.
   portalAccess: boolean;
+  /** The partner who recruited this one (docs/two-tier-commissions.md), or
+   *  null. Set from the recruiter's join-page link or by an admin; in a
+   *  program with recruiterCommissionPercent the recruiter earns that share
+   *  of this partner's commissions. */
+  recruitedByPartnerId: string | null;
+  /** When the recruitment started: the join, or the admin setting it. Only
+   *  this partner's events from then on pay their recruiter, and
+   *  Program.recruiterCommissionMonths counts from here. Set iff
+   *  recruitedByPartnerId is. */
+  recruitedAt: Date | null;
+  /** This partner's own code for recruiting others (`?ref=` on the join
+   *  page). Minted the first time they ask for it; unique per tenant. */
+  recruitCode: string | null;
 }
 
 export type CommissionType = 'percent' | 'fixed';
@@ -481,7 +497,11 @@ export type MagicLinkPurpose =
    *  resets a brand admin's / operator's password and is redeemed by
    *  POST /password/reset; principalKind 'partner' resets one brand's
    *  partner password via POST /auth/password/reset. */
-  | 'password_reset';
+  | 'password_reset'
+  /** Minted by the brand's backend (POST /partners/{id}/signin-link) and
+   *  handed to the partner's browser, never emailed. Verifies like
+   *  partner_signin; each one has a PartnerSigninLinkLog row. */
+  | 'partner_signin_link';
 
 export type PrincipalKind = 'partner' | 'admin' | 'platform';
 
@@ -556,11 +576,18 @@ export interface PlatformSessionBundleRow {
   lastUsedAt: Date;
 }
 
+/** 'viewer' sees the admin portal and changes nothing
+ *  (docs/view-only-seats.md). */
+export type AdminRole = 'admin' | 'viewer';
+
+export const ADMIN_ROLES = ['admin', 'viewer'] as const satisfies readonly AdminRole[];
+
 export interface AdminRow {
   id: string;
   tenantId: string;
   email: string;
   name: string;
+  role: AdminRole;
   activatedAt: Date | null;
   revokedAt: Date | null;
   revokeReason: string | null;
@@ -629,6 +656,22 @@ export interface PlatformAuditLogRow {
   createdAt: Date;
 }
 
+/** One sign-in link a brand's backend minted for a partner (migration
+ *  20261022000000_partner_signin_link_log). Append-only. */
+export interface PartnerSigninLinkLogRow {
+  id: string;
+  tenantId: string;
+  partnerId: string;
+  magicLinkTokenId: string;
+  /** 'api_key': an ApiKey row (actorId); 'operator_key': ADMIN_API_KEY. */
+  actorKind: 'api_key' | 'operator_key';
+  actorId: string | null;
+  returnTo: string | null;
+  ip: string | null;
+  expiresAt: Date;
+  createdAt: Date;
+}
+
 /** Operator runtime switch (platform-scoped; migration 20261012000000). */
 export interface PlatformSettingRow {
   key: string;
@@ -642,7 +685,8 @@ export interface PlatformSettingRow {
 export interface BrandNotificationRow {
   id: string;
   tenantId: string;
-  kind: 'setup_incomplete';
+  /** 'tracking_required': the tracking gate's one-time notice (step 1). */
+  kind: 'setup_incomplete' | 'tracking_required';
   step: number;
   recipientEmail: string;
   sentByEmail: string | null;
@@ -726,6 +770,12 @@ export interface ProgramRow {
    *  False: every event is attributed on its own within the window.
    *  Spec: docs/renewal-attribution.md. */
   renewalsStayWithPartner: boolean;
+  /** True: this program's coupon codes credit only when the customer has
+   *  no partner link click inside the window. False (default): a code
+   *  competes as a click stamped at checkout, so under last click it beats
+   *  an earlier link. Decides first conversions; renewals follow the
+   *  winner (renewalsStayWithPartner). Migration 20261024120000. */
+  couponsYieldToLinks: boolean;
   /** Where partner share-links for this Campaign land by default. Brand
    *  controls this; partners can only override if deepLinkAllowedDomains
    *  is set and their override matches. */
@@ -801,6 +851,13 @@ export interface ProgramRow {
   blockedReason: string | null;
   /** Email of the operator who blocked it. */
   blockedByEmail: string | null;
+  /** Two-tier commissions (docs/two-tier-commissions.md): a recruiter earns
+   *  this percent of each commission their recruit earns in this program
+   *  (10 = 10%). Decimal, comes back as string from pg. Null = off. */
+  recruiterCommissionPercent: string | null;
+  /** How many months after Partner.recruitedAt the recruiter keeps earning
+   *  that share. Null = for as long as the recruit earns. */
+  recruiterCommissionMonths: number | null;
   createdAt: Date;
 }
 
@@ -861,6 +918,105 @@ export interface ClickRow {
   ts: Date;
 }
 
+/** The browser SDK saw a click arrive on the brand's site (migration
+ *  20261024100000_click_landing_tracking_issue). One row per click, the
+ *  first landing; append-only. */
+export interface ClickLandingRow {
+  clickId: string;
+  tenantId: string;
+  landedAt: Date;
+  /** The landing page's hostname only; never its path or query. */
+  host: string | null;
+}
+
+/** An admin's test of a program's tracking chain (migration
+ *  20261028010000_test_click, apps/api/src/test-clicks.ts). Never a Click:
+ *  nothing that reads clicks can see it. Not exported. */
+export interface TestClickRow {
+  id: string;
+  tenantId: string;
+  programId: string;
+  /** sha256 hex of the single-use token in the test link. */
+  tokenHash: string;
+  createdAt: Date;
+  /** The link must be opened by then. */
+  expiresAt: Date;
+  /** The click id the router sent to the destination; null until opened. */
+  clickId: string | null;
+  clickedAt: Date | null;
+  /** The URL the router redirected to, click id included. */
+  destination: string | null;
+  landedAt: Date | null;
+  /** The landing page's hostname only. */
+  landingHost: string | null;
+  /** When it was first linked to a customer (the "identify" step). */
+  identifiedAt: Date | null;
+  /** What linked it; null on rows linked before the column (all identify). */
+  linkedVia: TestClickLinkedVia | null;
+}
+
+/** How a test click was linked to a customer (apps/api/src/test-clicks.ts). */
+export type TestClickLinkedVia = 'identify' | 'checkout' | 'conversion' | 'paypal';
+
+/** What a TrackingIssue counts (apps/api/src/tracking-issues.ts). */
+export type TrackingIssueKind =
+  | 'identify_unknown_click'
+  | 'landing_unknown_click'
+  | 'conversion_unknown_click'
+  | 'stripe_unknown_click'
+  | 'stripe_foreign_reference'
+  | 'paypal_unknown_click'
+  | 'paypal_foreign_reference'
+  | 'paypal_dispute_unmatched'
+  | 'coupon_unknown_code'
+  | 'reward_code_refused';
+
+/** Dropped input, counted per (tenant, day, kind). Not exported. */
+export interface TrackingIssueRow {
+  tenantId: string;
+  /** YYYY-MM-DD, UTC. */
+  day: string;
+  kind: TrackingIssueKind;
+  count: number;
+  /** The latest value seen, cut to 64 characters. */
+  sampleRef: string | null;
+  /** What went wrong with it, for kinds that know (Stripe's answer to a
+   *  partner code's discount), cut to 500 characters. Migration
+   *  20261028000000. */
+  detail: string | null;
+  firstSeenAt: Date;
+  lastSeenAt: Date;
+}
+
+/** A Tracking health flag (apps/api/src/tracking-flags.ts). */
+export type TrackingFlagKind = 'linkage_drop' | 'fast_sales';
+
+/** A setup check (apps/api/src/setup-checks.ts), as the alert job records
+ *  it: `setup_<check id>`. */
+export type SetupAlertKind =
+  | 'setup_destination'
+  | 'setup_script'
+  | 'setup_linking'
+  | 'setup_stripe'
+  | 'setup_codes'
+  | 'setup_partners';
+
+/** One episode of a flag the alert job has seen, so it emails each once
+ *  (apps/api/src/tracking-alerts.ts). Not exported. */
+export interface TrackingAlertRow {
+  id: string;
+  tenantId: string;
+  kind: TrackingFlagKind | SetupAlertKind;
+  /** `<browser>|<device>|<metric>` for a linkage drop; the partner id for
+   *  fast sales; a program id or `account` for a setup check. */
+  subject: string;
+  openedAt: Date;
+  lastSeenAt: Date;
+  notifiedAt: Date | null;
+  resolvedAt: Date | null;
+  detail: Record<string, unknown>;
+}
+
 export interface IdentityRow {
   id: string;
   tenantId: string;
@@ -907,6 +1063,12 @@ export interface CommissionRow {
    *  an attributed sale's commission, or a bonus's (BonusRow). */
   attributionId: string | null;
   bonusId: string | null;
+  /** Set on a recruiter commission (docs/two-tier-commissions.md): the
+   *  recruit's commission it is a share of. It sits on that commission's
+   *  attribution, so `partnerId` (the recruiter) differs from the
+   *  attribution's partner. A refund's replacement of a recruiter commission
+   *  keeps the same source. Null on every other commission. */
+  sourceCommissionId: string | null;
   partnerId: string;
   amount: string; // decimal as string
   currency: string;
@@ -1152,10 +1314,17 @@ export interface CouponRow {
   code: string;
   /** Stripe Coupon ID provisioned alongside the OpenPartner Coupon when
    *  the bound Campaign has a customerReward. Null = no customer-side
-   *  reward, OR Stripe wasn't configured at mint time. */
+   *  reward, OR no promo in the brand's Stripe yet (Stripe wasn't reachable
+   *  at mint time; on hosted, a connect and an hourly sweep backfill it —
+   *  apps/api/src/customer-rewards.ts backfillCustomerRewards). */
   stripeCouponId: string | null;
   /** Stripe PromotionCode ID — what the customer types at checkout. */
   stripePromotionCodeId: string | null;
+  /** The brand's admin typed this code (not generated, not the partner's
+   *  pick). Lets the Stripe webhook credit the partner for a promo the
+   *  brand already had in Stripe under this string; any other code matches
+   *  only promos made for it (migration 20261021020000). */
+  brandChosen: boolean;
   /** When the partner / admin retired this code. NULL = active (still
    *  redeemable at checkout, still attributes). Non-null = deactivated:
    *  the Stripe PromotionCode is disabled too, so customers entering the
@@ -1338,6 +1507,16 @@ export type StripeAppKeyMode = 'live' | 'test' | 'sandbox';
 /** Hosted-only sidecar: a brand's own Stripe account, connected through the
  *  OpenPartner Stripe App (migration 20261017000000). Credentials — never
  *  exported. At most one live row per tenant and per Stripe account. */
+/** A brand Stripe event the attribution pipeline processed (migration
+ *  20261024110000_stripe_event_log). Not exported. */
+export interface StripeEventLogRow {
+  stripeEventId: string;
+  tenantId: string;
+  type: string;
+  via: 'webhook' | 'catchup';
+  receivedAt: Date;
+}
+
 export interface TenantStripeConnectionRow {
   id: string;
   tenantId: string;
@@ -1356,9 +1535,152 @@ export interface TenantStripeConnectionRow {
   refreshFailedAt: Date | null;
   refreshError: string | null;
   lastEventAt: Date | null;
+  /** When a reward backfill last finished checking every partner code's
+   *  promotion code against this account. Cleared by every connect; the
+   *  hourly sweep re-runs the check while it's null (migration
+   *  20261021010000). */
+  rewardsVerifiedAt: Date | null;
+  /** When this connection's events started being logged in StripeEventLog;
+   *  the Stripe catch-up never reaches back past it (migration
+   *  20261024110000). */
+  eventLogSince: Date;
   disconnectedAt: Date | null;
   disconnectReason: 'admin' | 'deauthorized' | 'replaced' | null;
   updatedAt: Date;
+}
+
+export type PaypalEnvironment = 'live' | 'sandbox';
+
+/** A brand's own PayPal REST app (migration 20261022010000). Credentials
+ *  for one deployment: never exported. */
+export interface PaypalConnectionRow {
+  id: string;
+  tenantId: string;
+  environment: PaypalEnvironment;
+  clientId: string;
+  /** AES-GCM envelope (crypto.ts). Null once disconnected. */
+  clientSecretEnc: string | null;
+  accessTokenEnc: string | null;
+  accessTokenExpiresAt: Date | null;
+  appId: string | null;
+  payoutsScope: boolean;
+  /** Sealed PayPal webhook id; null when none is registered. */
+  webhookIdEnc: string | null;
+  webhookError: string | null;
+  active: boolean;
+  connectedByAdminId: string | null;
+  connectedAt: Date;
+  verifiedAt: Date | null;
+  lastError: string | null;
+  lastErrorAt: Date | null;
+  disconnectedAt: Date | null;
+  disconnectReason: 'admin' | 'replaced' | null;
+  /** 'payouts': Pay with PayPal's app. 'checkout': an app connected only to
+   *  report payments, never to send (migration 20261102140000). */
+  purpose: PaypalConnectionPurpose;
+  /** Payment tracking on since; null = off (docs/paypal-payments.md). */
+  paymentsSince: Date | null;
+  lastPaymentEventAt: Date | null;
+  /** Whether this app may call Transaction Search; null until tried. */
+  transactionSearch: 'ok' | 'unavailable' | null;
+  transactionSearchCheckedAt: Date | null;
+  updatedAt: Date;
+}
+
+export type PaypalConnectionPurpose = 'payouts' | 'checkout';
+
+/** One provider payment fact a deployment settled (migration
+ *  20261102140000_paypal_payment_tracking). Not exported. */
+export interface PaymentEventLogRow {
+  tenantId: string;
+  provider: 'paypal';
+  /** The provider's id for the fact, prefixed by its kind
+   *  (`capture:…`, `sale:…`, `refund:…`, `subscription:…`, `dispute:…`). */
+  eventKey: string;
+  connectionId: string | null;
+  /** The provider's event type, or its transaction event code. */
+  type: string;
+  via: 'webhook' | 'catchup';
+  outcome: string;
+  receivedAt: Date;
+}
+
+/** A PayPal subscription's custom_id and the click it named (migration
+ *  20261102140000). A cache of PayPal's data: not exported. */
+export interface PaypalSubscriptionRow {
+  tenantId: string;
+  subscriptionId: string;
+  connectionId: string;
+  environment: PaypalEnvironment;
+  customId: string | null;
+  clickId: string | null;
+  planId: string | null;
+  status: string | null;
+  createdAt: Date | null;
+  firstSeenAt: Date;
+  updatedAt: Date;
+}
+
+export type PaypalBatchState =
+  | 'intent'
+  | 'posted'
+  | 'submitted'
+  | 'completed'
+  | 'failed'
+  | 'denied'
+  | 'released'
+  | 'reconcile_required';
+
+/** One PayPal Payouts batch sent with a brand's credentials (migration
+ *  20261022010000). Its id is the payouts' export id and PayPal's
+ *  sender_batch_id. */
+export interface PaypalPayoutBatchRow {
+  id: string;
+  tenantId: string;
+  connectionId: string;
+  environment: PaypalEnvironment;
+  runId: string;
+  currency: string;
+  itemCount: number;
+  total: string;
+  state: PaypalBatchState;
+  /** Sealed frozen request body; null once PayPal has the batch. */
+  requestEnc: string | null;
+  payoutBatchId: string | null;
+  batchStatus: string | null;
+  itemSummary: Record<string, number>;
+  attempts: number;
+  postedAt: Date | null;
+  leaseAt: Date | null;
+  lastSyncedAt: Date | null;
+  nextSyncAt: Date | null;
+  lastError: string | null;
+  createdBy: 'admin' | 'api';
+  createdAt: Date;
+  completedAt: Date | null;
+  resolution: 'released' | 'linked' | null;
+  /** A batch that sends a balance PayPal can't send in its own currency
+   *  (INR) in `currency` (USD), at the rate quoted before sending
+   *  (migration 20261023010000). Null when the payouts are sent in their
+   *  own currency. */
+  conversion: PaypalBatchConversion | null;
+  updatedAt: Date;
+}
+
+export interface PaypalBatchConversion {
+  /** The payouts' own currency (INR). */
+  sourceCurrency: string;
+  /** What the payouts add up to in it. */
+  sourceTotal: string;
+  /** Units of the batch currency per unit of sourceCurrency, a decimal
+   *  string: each item's sent amount is its source amount times this,
+   *  rounded per item. */
+  rate: string;
+  rateSource: 'ecb';
+  /** The ECB reference date the rate is from (YYYY-MM-DD). */
+  rateDate: string;
+  /** When the brand was shown the rate. */
+  quotedAt: string;
 }
 
 export interface StripeWebhookInboxRow {

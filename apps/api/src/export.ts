@@ -22,6 +22,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { Knex } from 'knex';
 import { DEFAULT_TENANT_ID, TABLES } from '@openpartner/db';
+import { z } from './zod.js';
+import { getNetworkMembership, networkProxy, NetworkProxyError } from './network-client.js';
 import { mintSecret } from './webhook-secret.js';
 import { openForExport, sealForImport } from './payout-profile.js';
 import { openPostbackForExport, sealPostbackForImport } from './postback-url.js';
@@ -44,8 +46,20 @@ import { openPostbackForExport, sealPostbackForImport } from './postback-url.js'
  *  v7 → v8 (Oct 2026): Click rows carry `subId` (the publisher's `?sub_id=`
  *  off the partner link).
  *  v8 → v9 (Oct 2026): added PartnerPayoutProfile (where each partner wants
- *  manual payouts sent), its `details` opened (see SealedSpec). */
-export const SCHEMA_VERSION = 9;
+ *  manual payouts sent), its `details` opened (see SealedSpec).
+ *  v9 → v10 (Oct 2026): Coupon rows carry `brandChosen` (the brand's admin
+ *  typed the code; the Stripe webhook credits a promo the brand already had
+ *  under it only then).
+ *  v10 → v11 (Oct 2026): two-tier commissions. Partner rows carry
+ *  `recruitedByPartnerId`, `recruitedAt` and `recruitCode`, Program rows
+ *  `recruiterCommissionPercent` and `recruiterCommissionMonths`, and
+ *  Commission rows `sourceCommissionId` (set on a recruiter's share of a
+ *  recruit's commission).
+ *  v11 → v12 (Oct 2026): added ClickLanding (the browser SDK saw the click
+ *  arrive on the brand's site; Admin → Tracking health).
+ *  v12 → v13 (Oct 2026): Program rows carry `couponsYieldToLinks` (link
+ *  clicks beat the program's coupon codes). */
+export const SCHEMA_VERSION = 13;
 /** Older bundles still import — a v1 bundle is a v2 bundle minus three
  *  tables, a v2 bundle's PartnerCommission rows are partner-wide v3 rows
  *  (see upgradeBundle), a v3 bundle is a v4 bundle minus
@@ -59,10 +73,19 @@ export const SCHEMA_VERSION = 9;
  *  a v7 bundle with no bounties: none of its bonuses name one. A v7 bundle's
  *  Click rows have no `subId`, so it takes its default (null): no click
  *  carried one before the column existed. A v8 bundle is a v9 bundle with no
- *  payout details: every restored partner starts without any.
+ *  payout details: every restored partner starts without any. A v9 bundle's
+ *  Coupon rows have no `brandChosen`, so it takes its default (false), the
+ *  value the migration gave every existing code. A v10 bundle has no
+ *  recruiting: its partners have no recruiter or code, its programs pay no
+ *  recruiter share and none of its commissions is one, so the new columns
+ *  take their defaults (null). A v11 bundle is a v12 bundle with no landings:
+ *  every restored click reads as never landed, which is what an instance
+ *  that predates the beacon recorded. A v12
+ *  bundle's Program rows have no `couponsYieldToLinks`, so it takes its
+ *  default (false): every program's codes competed as clicks before.
  *  Dropping support for a version people hold on disk would break the
  *  portability promise, so this list only ever grows. */
-export const SUPPORTED_IMPORT_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9] as const;
+export const SUPPORTED_IMPORT_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] as const;
 
 /**
  * The Config keys that travel: the brand's own program and portal settings.
@@ -81,6 +104,31 @@ export const PORTABLE_CONFIG_KEYS = [
   // (partner-portal-access.ts). A headless program keeps its customers out
   // of the portal, and a restored instance must keep doing so.
   'partner_access',
+  // "Not now" to the Network listing on the Getting started card
+  // (onboarding-settings.ts). A key, not a table or column, so no version
+  // bump: an instance that predates it skips the key on import, and the
+  // brand just sees the Network step again.
+  'onboarding',
+  // What payout statements print: legal name, address, footer, number
+  // prefix, the tax-lines stub (payout-statements.ts). No version bump,
+  // as for 'onboarding': an older instance skips it and prints statements
+  // under the brand name until the settings are entered again.
+  'payout_statements',
+  // "Pay balances PayPal can't send in: USD" (paypal-send-as.ts). A brand
+  // setting with no credential in it (the PayPal app never travels). Added
+  // without a version bump, like `onboarding`: an instance that predates it
+  // skips the key, and the setting reads as off.
+  'paypal_payouts',
+  // Which event types partners see as referral stages, and whether they
+  // see customer labels (referrals.ts). A key, so no version bump: an
+  // instance that predates it skips the key, and partners see the default
+  // stages and no labels, which shows them less, never more.
+  'partner_referrals',
+  // Whether new Tracking health flags are emailed to the admins
+  // (tracking-alerts.ts). A key, so no version bump: an instance that
+  // predates it skips the key and has no alert email at all; one that
+  // knows it but restores an older bundle reads it as on, the default.
+  'tracking_alerts',
 ] as const;
 
 /**
@@ -183,6 +231,8 @@ export const EXPORT_TABLES = [
   { table: TABLES.Coupon, primaryKey: 'id' },
   { table: TABLES.Link, primaryKey: 'id' },
   { table: TABLES.Click, primaryKey: 'id' },
+  // Landings (v12): raw, one per click, keyed on the click.
+  { table: TABLES.ClickLanding, primaryKey: 'clickId' },
   { table: TABLES.Identity, primaryKey: 'id' },
   { table: TABLES.Event, primaryKey: 'id' },
   { table: TABLES.Attribution, primaryKey: 'id' },
@@ -416,6 +466,75 @@ export async function exportAll(db: Knex, tenantId: string): Promise<Record<stri
     out[table] = await exportTable(db, table as ExportableTable, tenantId);
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// The brand's records on the OpenPartner Network
+// ---------------------------------------------------------------------------
+
+/**
+ * What the Network holds for this brand and no local table has: its
+ * storefront conversations with creators, their messages, and its bookings
+ * with their payment records (GET /vendors/me/export, docs/network-protocol.md).
+ * The JSON bundle carries it as `network`, next to `tables`.
+ *
+ * A record, not a restore: the rows live on the Network, `POST /import`
+ * ignores the section, and the SQL dump doesn't carry it.
+ *
+ * The local export never depends on it. When the call fails, the section
+ * says `skipped` and why, so the file says what it's missing rather than
+ * looking complete.
+ */
+export type NetworkExportSection =
+  | { status: 'not_connected' }
+  | { status: 'skipped'; reason: string; httpStatus?: number }
+  | {
+      status: 'included';
+      exportedAt: string;
+      tables: Record<string, Array<Record<string, unknown>>>;
+      creators: Array<Record<string, unknown>>;
+    };
+
+const networkRows = z.array(z.record(z.string(), z.unknown()));
+
+/** The three tables must be there for the section to count as included;
+ *  a table the Network adds later travels too. */
+const networkExportSchema = z.object({
+  exportedAt: z.string().datetime(),
+  tables: z
+    .object({ Conversation: networkRows, ConversationMessage: networkRows, BookingRequest: networkRows })
+    .catchall(networkRows),
+  creators: z.array(z.object({ id: z.string() }).catchall(z.unknown())),
+});
+
+/** Failures that happen before the Network answers keep their own code;
+ *  anything the Network answered with is `network_error`. */
+const LOCAL_NETWORK_FAILURE = /^(network_unreachable|network_url_unresolvable|vendor_token_undecryptable)\b/;
+
+export async function exportNetwork(db: Knex, tenantId: string): Promise<NetworkExportSection> {
+  // A stored token is enough: a brand that switched the Network off still
+  // has its conversations and bookings there.
+  const membership = await getNetworkMembership(db, tenantId);
+  if (!membership?.vendorTokenCiphertext) return { status: 'not_connected' };
+  let skipped: Extract<NetworkExportSection, { status: 'skipped' }>;
+  try {
+    const parsed = networkExportSchema.safeParse(await networkProxy.exportVendorData(db, tenantId));
+    if (parsed.success) return { status: 'included', ...parsed.data };
+    skipped = { status: 'skipped', reason: 'invalid_response' };
+  } catch (err) {
+    if (err instanceof NetworkProxyError) {
+      const local = LOCAL_NETWORK_FAILURE.exec(err.message);
+      skipped = local ? { status: 'skipped', reason: local[1]! } : { status: 'skipped', reason: 'network_error', httpStatus: err.status };
+    } else if (err instanceof SyntaxError) {
+      // A 2xx body that isn't JSON.
+      skipped = { status: 'skipped', reason: 'invalid_response' };
+    } else {
+      // The body stopped arriving: the timeout, or a dropped connection.
+      skipped = { status: 'skipped', reason: 'network_unreachable' };
+    }
+  }
+  console.warn('[export] Network records skipped', { tenantId, reason: skipped.reason, httpStatus: skipped.httpStatus });
+  return skipped;
 }
 
 export function rowsToCsv(rows: Record<string, unknown>[]): string {

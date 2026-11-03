@@ -5,6 +5,7 @@
  * templating engine.
  */
 
+import type { AdminRole } from '@openpartner/db';
 import { getPortalBaseUrl, type PortalLinkTenant } from './portal-url.js';
 
 /**
@@ -14,9 +15,13 @@ import { getPortalBaseUrl, type PortalLinkTenant } from './portal-url.js';
  * platform/single-host case gets a bare PORTAL_URL link. Note that a
  * freshly-signed-up white-label tenant has no customDomain yet — its first
  * admin invite is necessarily path-based until the domain verifies.
+ *
+ * `next` (platform sign-in only) is where the landing goes once the user
+ * enters a workspace; callers pass it through safeNextPath first.
  */
-export function buildMagicLinkUrl(token: string, tenant?: PortalLinkTenant | null): string {
-  return `${getPortalBaseUrl(tenant)}/auth/magic?token=${encodeURIComponent(token)}`;
+export function buildMagicLinkUrl(token: string, tenant?: PortalLinkTenant | null, next?: string | null): string {
+  const link = `${getPortalBaseUrl(tenant)}/auth/magic?token=${encodeURIComponent(token)}`;
+  return next ? `${link}&next=${encodeURIComponent(next)}` : link;
 }
 
 export interface EmailTemplate {
@@ -65,6 +70,11 @@ export interface PartnerApplicationSummary {
   pitch: string;
 }
 
+/** The greeting on mail to a brand's own admins: "Hi Acme team,". */
+function brandTeamGreeting(brandName: string | null): string {
+  return brandName ? `Hi ${brandName} team,` : 'Hi there,';
+}
+
 /** Brand admin: someone applied through the public join page and is
  *  waiting for review. */
 export function partnerApplicationAdminEmail(
@@ -90,7 +100,7 @@ export function partnerApplicationAdminEmail(
       ]
     : [];
   const text = [
-    `Hi${brandName ? ` from ${brandName}` : ''},`,
+    brandTeamGreeting(brandName),
     ``,
     `${applicantName} (${applicantEmail}) applied to your partner program and is waiting for review.`,
     ``,
@@ -118,13 +128,22 @@ export function partnerSigninEmail(name: string, link: string, brandName: string
   return { subject, text, html: wrap(text, link, 'Sign in') };
 }
 
-export function adminInviteEmail(name: string, link: string, programName: string | null): EmailTemplate {
+/** `role` 'viewer': a view-only seat (docs/view-only-seats.md). */
+export function adminInviteEmail(
+  name: string,
+  link: string,
+  programName: string | null,
+  role: AdminRole = 'admin',
+): EmailTemplate {
   const brand = programName || 'your partner program';
-  const subject = `You've been invited to administer ${brand}`;
+  const viewer = role === 'viewer';
+  const subject = viewer ? `You've been invited to view ${brand}` : `You've been invited to administer ${brand}`;
   const text = [
     `Hi ${name},`,
     ``,
-    `You've been invited as an administrator for ${brand}. Click the link below`,
+    viewer
+      ? `You've been given view-only access to ${brand}. Click the link below`
+      : `You've been invited as an administrator for ${brand}. Click the link below`,
     `to accept the invitation and sign in:`,
     ``,
     link,
@@ -209,6 +228,69 @@ export function payoutDetailsChangedEmail(opts: {
   return { subject, text, html: plainHtml(text) };
 }
 
+/** What a PayPal item status means for the brand, in the alert below. */
+const PAYPAL_ITEM_OUTCOME: Record<string, string> = {
+  UNCLAIMED: 'unclaimed: the partner has no PayPal account at that email yet. PayPal returns the money after 30 days unless they claim it',
+  FAILED: 'failed, nothing was sent',
+  RETURNED: 'returned to your PayPal balance',
+  BLOCKED: 'blocked by PayPal',
+  REFUNDED: 'refunded to you by the partner',
+  REVERSED: 'reversed',
+  DENIED: 'refused by PayPal',
+  CANCELED: 'canceled',
+  not_sent: 'not sent',
+};
+
+/** Brand admins: a PayPal Payouts batch needs a look (paypal-payouts.ts):
+ *  items that didn't go through or wait to be claimed, a batch PayPal
+ *  refused, or one OpenPartner can't settle on its own. */
+export function paypalBatchAttentionEmail(opts: {
+  brandName: string | null;
+  kind: 'failed' | 'held' | 'items';
+  environment: 'live' | 'sandbox';
+  batchId: string;
+  lastError: string | null;
+  items: Array<{ partnerName: string; amount: string; currency: string; status: string; error: string | null }>;
+  payoutsUrl: string;
+}): EmailTemplate {
+  const env = opts.environment === 'sandbox' ? ' (sandbox)' : '';
+  const subject =
+    opts.kind === 'held'
+      ? `A PayPal payout batch needs you to check it${env}`
+      : opts.kind === 'failed'
+        ? `A PayPal payout batch wasn't sent${env}`
+        : `PayPal payouts that didn't go through${env}`;
+  const lines = opts.items.slice(0, 50).map((i) => {
+    const outcome = PAYPAL_ITEM_OUTCOME[i.status] ?? i.status.toLowerCase();
+    return `- ${i.partnerName}: ${Number(i.amount).toFixed(2)} ${i.currency.toUpperCase()}, ${outcome}${i.error ? ` (${i.error})` : ''}`;
+  });
+  if (opts.items.length > 50) lines.push(`- and ${opts.items.length - 50} more`);
+  const intro =
+    opts.kind === 'held'
+      ? [
+          `OpenPartner sent a PayPal Payouts batch (${opts.batchId}) from your PayPal account, but can't tell for certain whether it went out.`,
+          ...(opts.lastError ? [``, `Reason: ${opts.lastError}`] : []),
+          ``,
+          `Its payouts stay out of other files and batches until you settle it. Look for the batch in your PayPal account (Activity), then on the Payouts page either link the batch PayPal shows, or release the payouts if it never went out.`,
+        ]
+      : opts.kind === 'failed'
+        ? [
+            `A PayPal Payouts batch (${opts.batchId}) wasn't sent, so no money left your PayPal account for it.`,
+            ...(opts.lastError ? [``, `Reason: ${opts.lastError}`] : []),
+            ``,
+            `Its payouts are back to "to send": you can send them again once the problem is fixed.`,
+          ]
+        : [
+            `Some payouts in a PayPal Payouts batch (${opts.batchId}) didn't reach the partner:`,
+            ``,
+            ...lines,
+            ``,
+            `Payouts that failed or were returned are back to "to send", so you can pay them again, for example once the partner fixes their PayPal email. An unclaimed one stays in the batch until it is claimed or returned; you can cancel it on the Payouts page to get the money back now.`,
+          ];
+  const text = [brandTeamGreeting(opts.brandName), ``, ...intro, ``, `Payouts page:`, ``, opts.payoutsUrl].join('\n');
+  return { subject, text, html: wrap(text, opts.payoutsUrl, 'Open Payouts') };
+}
+
 /** Brand admin: 7-day notice that a Campaign is about to end. */
 export function campaignEndingBrandEmail(
   brandName: string | null,
@@ -219,7 +301,7 @@ export function campaignEndingBrandEmail(
   const dateStr = endsAt.toUTCString().replace(/ \d\d:\d\d:\d\d GMT$/, '');
   const subject = `"${campaignName}" ends in 7 days`;
   const text = [
-    `Hi${brandName ? ` from ${brandName}` : ''},`,
+    brandTeamGreeting(brandName),
     ``,
     `Your campaign "${campaignName}" is scheduled to end ${dateStr}.`,
     ``,
@@ -258,6 +340,59 @@ export function campaignEndingPartnerEmail(
     programUrl,
   ].join('\n');
   return { subject, text, html: wrap(text, programUrl, 'View program') };
+}
+
+/** Brand admin: setup checks that turned failing and new Tracking health
+ *  flags (tracking-alerts.ts). `checks` are describeSetupCheck's sentences,
+ *  `flags` describeFlag's, one per check or flag; at least one of them. */
+export function trackingFlagsEmail(
+  brandName: string | null,
+  lines: { checks: string[]; flags: string[] },
+  pageUrl: string,
+): EmailTemplate {
+  const { checks, flags } = lines;
+  const checksPart = checks.length === 1 ? 'a setup check failing' : `${checks.length} setup checks failing`;
+  const flagsPart = flags.length === 1 ? 'a change flagged' : `${flags.length} changes flagged`;
+  const subject =
+    checks.length === 0
+      ? flags.length === 1
+        ? 'Tracking health flagged a change'
+        : `Tracking health flagged ${flags.length} changes`
+      : flags.length === 0
+        ? `Tracking health: ${checksPart}`
+        : `Tracking health: ${checksPart}, ${flagsPart}`;
+  const text = [
+    brandTeamGreeting(brandName),
+    ``,
+    ...(checks.length
+      ? [
+          `Setup checks test each step of your tracking, from a partner's link`,
+          `to the payment. ${checks.length === 1 ? 'This one has' : 'These have'} stopped passing:`,
+          ``,
+          ...checks.map((l) => `- ${l}`),
+          ``,
+        ]
+      : []),
+    ...(flags.length
+      ? [
+          `Tracking health ${checks.length ? 'also compares' : 'compares'} each browser and each partner with its own`,
+          `recent past. ${flags.length === 1 ? 'This changed' : 'These changed'} enough to look at:`,
+          ``,
+          ...flags.map((l) => `- ${l}`),
+          ``,
+        ]
+      : []),
+    `The numbers, and what usually causes each, are on the Tracking health`,
+    `page:`,
+    ``,
+    pageUrl,
+    ``,
+    checks.length
+      ? `You get one email when a check fails or a flag first appears, not one`
+      : `You get one email when a flag first appears, not one a day while it`,
+    checks.length ? `a day while it stays. Turn these emails off on the same page.` : `stays. Turn these emails off on the same page.`,
+  ].join('\n');
+  return { subject, text, html: wrap(text, pageUrl, 'Open Tracking health') };
 }
 
 // ---------------------------------------------------------------------------
@@ -346,18 +481,30 @@ export function bountyAwardedEmail(opts: {
 // Brand review (approval gate) — brand-facing + platform-ops-facing.
 // ---------------------------------------------------------------------------
 
-/** Brand admin: your brand cleared review and is live. */
+/** Brand admin: your brand cleared review and is live. `trackingPending`:
+ *  approved before its tracking was verified, while the tracking gate holds
+ *  partners back (tracking-verification.ts). */
 export function brandApprovedEmail(
   adminName: string,
   brandName: string,
   enterUrl: string,
+  trackingPending = false,
 ): EmailTemplate {
-  const subject = `${brandName} is approved — you're live`;
+  const subject = trackingPending ? `${brandName} is approved` : `${brandName} is approved — you're live`;
   const text = [
     `Hi ${adminName},`,
     ``,
-    `Good news — ${brandName} has been approved on OpenPartner. Your`,
-    `partner links now redirect, and you can invite partners and go live.`,
+    ...(trackingPending
+      ? [
+          `Good news — ${brandName} has been approved on OpenPartner. Your`,
+          `partner links now redirect. Partners can join once your tracking is`,
+          `verified: install the tracking script, then send a test click from`,
+          `Tracking health.`,
+        ]
+      : [
+          `Good news — ${brandName} has been approved on OpenPartner. Your`,
+          `partner links now redirect, and you can invite partners and go live.`,
+        ]),
     ``,
     `Jump back into your dashboard:`,
     ``,
@@ -440,6 +587,33 @@ export function signinNoAccountEmail(opts: {
     ...closing,
   ].join('\n');
   return { subject, text, html: wrap(text, opts.signupUrl, 'Create a brand') };
+}
+
+/** "Forgot password" on the platform sign-in page, for an address with no
+ *  platform password to reset but a partner account on some brands
+ *  (routes/password-auth.ts). A partner's password belongs to each brand, so
+ *  this points at the portals whose own "Forgot password" resets it. */
+export function passwordResetPartnerPortalsEmail(opts: {
+  email: string;
+  portals: Array<{ brandName: string; signinUrl: string }>;
+  creatorSigninUrl: string;
+}): EmailTemplate {
+  const subject = `No OpenPartner admin password for this address`;
+  const text = [
+    `Someone asked to reset the OpenPartner password for ${opts.email}, but there's`,
+    `no OpenPartner admin password for this address, so no reset link was sent.`,
+    ``,
+    `This address is a partner. Each brand's partner password is its own: sign in`,
+    `at that brand's partner portal, and use "Forgot password" there to reset it.`,
+    ``,
+    ...opts.portals.flatMap((p) => [p.brandName, p.signinUrl, ``]),
+    `If you're an OpenPartner Network creator, sign in at the creator portal:`,
+    ``,
+    opts.creatorSigninUrl,
+    ``,
+    `If you didn't ask for this, ignore this email. Nothing changed.`,
+  ].join('\n');
+  return { subject, text, html: linkedHtml(text, [...opts.portals.map((p) => p.signinUrl), opts.creatorSigninUrl]) };
 }
 
 /** Platform ops: a new brand signed up and is waiting for review. */
@@ -617,6 +791,69 @@ export function opsNetworkVendorsPendingEmail(
     reviewUrl,
   ].join('\n');
   return { subject, text, html: wrap(text, reviewUrl, 'Review vendors') };
+}
+
+/** Platform ops: Network creators finished their profile and are waiting
+ *  for review (brands and the public don't see them until approved), and
+ *  creators who edited their profile after an operator wrote to them. */
+export function opsNetworkCreatorsPendingEmail(
+  creators: Array<{ name: string; handle: string | null }>,
+  reviewUrl: string,
+  updated: Array<{ name: string; handle: string | null }> = [],
+): EmailTemplate {
+  const n = creators.length;
+  const total = n + updated.length;
+  const label = (c: { name: string; handle: string | null }) => (c.handle ? `${c.name} (@${c.handle})` : c.name);
+  const subject =
+    total === 1
+      ? `[Review] Creator ${label((creators[0] ?? updated[0])!)} ${n === 1 ? 'is waiting' : 'updated their profile'}`
+      : `[Review] ${total} creators are waiting`;
+  // Indented so the HTML wrapper renders what the creator typed as text.
+  const text = [
+    ...(n > 0
+      ? [
+          `${n === 1 ? 'A creator has' : `${n} creators have`} finished their OpenPartner Network profile and ${n === 1 ? 'is' : 'are'} waiting for review.`,
+          `Brands and the public don't see them until approved.`,
+          ``,
+          ...creators.map((c) => `  ${label(c)}`),
+          ``,
+        ]
+      : []),
+    ...(updated.length > 0
+      ? [
+          `Updated their profile after your message:`,
+          ``,
+          ...updated.map((c) => `  ${label(c)}`),
+          ``,
+        ]
+      : []),
+    `Approve, reject or message them in the ops console:`,
+    ``,
+    reviewUrl,
+  ].join('\n');
+  return { subject, text, html: wrap(text, reviewUrl, 'Review creators') };
+}
+
+/** Platform admins: a creator-index mailbox's Microsoft connection was lost
+ *  (revoked, a password change, 90 days unused), so it sends nothing until
+ *  someone reconnects it. */
+export function opsMailboxLostEmail(input: {
+  mailbox: 'outreach' | 'invite';
+  account: string;
+  reason: string | null;
+  consoleUrl: string;
+}): EmailTemplate {
+  const label = input.mailbox === 'outreach' ? 'outreach email' : 'brands’ invites';
+  const subject = `[Action] Reconnect the ${label} mailbox`;
+  const text = [
+    `Microsoft refused the ${label} mailbox's sign-in (${input.account}), so the Network has stopped sending from it.`,
+    ...(input.reason ? [``, `  ${input.reason}`] : []),
+    ``,
+    `Reconnect it in the ops console:`,
+    ``,
+    input.consoleUrl,
+  ].join('\n');
+  return { subject, text, html: wrap(text, input.consoleUrl, 'Reconnect') };
 }
 
 /** Platform ops: a decision was recorded (audit copy to the ops inbox). */
@@ -838,6 +1075,50 @@ export function brandSetupReminderEmail(opts: {
 }
 
 /**
+ * Brand admin: advance notice of the tracking gate (tracking-gate-notice.ts).
+ * From `enforceFrom`, until its tracking is verified, new partners can't
+ * join the brand and its marketplace listings are hidden.
+ */
+export function trackingRequiredNoticeEmail(opts: {
+  adminName: string | null;
+  brandName: string;
+  enforceFrom: Date;
+  /** The brand has a program on the marketplace. */
+  listed: boolean;
+  trackingHealthUrl: string;
+  unsubscribeUrl: string;
+}): EmailTemplate {
+  const day = opts.enforceFrom.toISOString().slice(0, 10);
+  const subject = `${opts.brandName}: verify your tracking before ${day}`;
+  const text = [
+    `Hi ${opts.adminName?.trim() || 'there'},`,
+    ``,
+    `From ${day}, partners can only join brands whose tracking is verified, so every partner who sends you a customer gets credited for it.`,
+    ``,
+    `${opts.brandName} isn't verified yet. Until it is, from ${day}:`,
+    ``,
+    `  - New partners can't join your programs. Partners you already have keep their links and earnings.`,
+    ...(opts.listed ? [`  - Your programs are hidden from the OpenPartner marketplace.`] : []),
+    ``,
+    `To verify, install the tracking script on your site, then send a test click from Tracking health. It takes a few minutes:`,
+    ``,
+    opts.trackingHealthUrl,
+    ``,
+    `Questions? Just reply to this email.`,
+  ].join('\n');
+  return {
+    subject,
+    text: `${text}\n\n--\nYou're receiving this because you manage ${opts.brandName} on OpenPartner. Stop setup reminders: ${opts.unsubscribeUrl}`,
+    html: wrapWithFooter(
+      text,
+      opts.trackingHealthUrl,
+      'Send a test click',
+      `You're receiving this because you manage ${escapeHtml(opts.brandName)} on OpenPartner. <a href="${escapeHtml(opts.unsubscribeUrl)}" style="color:#6b7280">Stop setup reminders</a>.`,
+    ),
+  };
+}
+
+/**
  * Brand admin: a marketplace listing breaks the listing policy (typically,
  * it funnels creators to a different affiliate platform). Sent manually by
  * an operator from the ops console; `details` is the operator's own
@@ -955,12 +1236,43 @@ export function plainHtml(text: string): string {
 </html>`;
 }
 
+/** {@link plainHtml} for a mail offering several destinations, so no one
+ *  button: each line that is one of `urls` links to itself. Only those lines
+ *  — a line of free text (a brand name) that looks like a URL stays text. */
+function linkedHtml(text: string, urls: string[]): string {
+  const links = new Set(urls);
+  return `<!DOCTYPE html>
+<html>
+  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f4f4f5; padding:24px 0; margin:0;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+      <tr><td align="center">
+        <table role="presentation" width="520" cellspacing="0" cellpadding="0" border="0" data-op-email="card" style="background:#ffffff; border-radius:8px; overflow:hidden;">
+          <tr><td style="padding:28px 32px; color:#1f2937; font-size:14px; line-height:1.6;">
+            ${text
+              .split('\n')
+              .map((line) =>
+                links.has(line)
+                  ? `<a href="${escapeHtml(line)}" data-op-email="link" style="color:#2dd4bf">${escapeHtml(line)}</a>`
+                  : escapeHtml(line),
+              )
+              .join('<br>')}
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>`;
+}
+
 function wrap(text: string, cta: string, ctaLabel: string): string {
+  // The link goes into HTML: a second query param's & (a sign-in link's
+  // &next=) is &amp; there.
+  const href = cta.replace(/&/g, '&amp;');
   const escaped = text
     .split('\n')
     .map((line) =>
       line.startsWith('http')
-        ? `<a href="${cta}" data-op-email="link" style="color:#2dd4bf">${cta}</a>`
+        ? `<a href="${href}" data-op-email="link" style="color:#2dd4bf">${href}</a>`
         : line.replace(/</g, '&lt;').replace(/>/g, '&gt;'),
     )
     .join('<br>');
@@ -973,7 +1285,7 @@ function wrap(text: string, cta: string, ctaLabel: string): string {
           <tr><td style="padding:28px 32px; color:#1f2937; font-size:14px; line-height:1.6;">
             ${escaped}
             <br><br>
-            <a href="${cta}" data-op-email="button" style="display:inline-block; background:#2dd4bf; color:#041115; padding:10px 18px; border-radius:6px; text-decoration:none; font-weight:600;">${ctaLabel}</a>
+            <a href="${href}" data-op-email="button" style="display:inline-block; background:#2dd4bf; color:#041115; padding:10px 18px; border-radius:6px; text-decoration:none; font-weight:600;">${ctaLabel}</a>
           </td></tr>
         </table>
       </td></tr>

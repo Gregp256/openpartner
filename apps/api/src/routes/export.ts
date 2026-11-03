@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { z } from 'zod';
+import { z } from '../zod.js';
 import { requireAdmin, requireAuth } from '../auth.js';
 import {
   SCHEMA_VERSION,
@@ -8,6 +8,7 @@ import {
   isSafeTenantId,
   exportAll,
   exportColumnTypes,
+  exportNetwork,
   exportTable,
   tableColumnTypes,
   importBundle,
@@ -63,12 +64,16 @@ exportRouter.get('/export/:table.:format', requireAuth, requireAdmin, async (req
 exportRouter.get('/export.json', requireAuth, requireAdmin, async (req, res) => {
   const { db, tenantId } = tenantOf(req);
   const bundle = await exportAll(db, tenantId);
+  // The brand's conversations and bookings on the Network. Never fails the
+  // export: a Network outage comes back as `status: 'skipped'`.
+  const network = await exportNetwork(db, tenantId);
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', 'attachment; filename="openpartner-export.json"');
   res.json({
     exportedAt: new Date().toISOString(),
     schemaVersion: SCHEMA_VERSION,
     tables: bundle,
+    network,
   });
 });
 
@@ -126,7 +131,7 @@ function literalTenant(query: unknown): { tenantId?: string } | null {
 
 export const importSchema = z.object({
   schemaVersion: z.number().int(),
-  tables: z.record(z.array(z.record(z.unknown()))),
+  tables: z.record(z.string(), z.array(z.record(z.string(), z.unknown()))),
 });
 
 exportRouter.post('/import', requireAuth, requireAdmin, async (req, res) => {

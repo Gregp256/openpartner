@@ -124,12 +124,36 @@ async function platformRow(page: ReturnType<typeof render>, label: string) {
   return page.getByText(label).parentElement!;
 }
 
-describe('profile editor: verify buttons and badges', () => {
-  it('offers Verify on unverified YouTube and website rows only', async () => {
-    platforms = [row('youtube'), row('website', { handle: 'pat.dev' }), row('tiktok')];
+describe('profile editor: platforms', () => {
+  it('shows the platforms listed, and adds another from one picker row', async () => {
+    platforms = [row('youtube')];
     const page = renderWith(<CreatorMyProfilePage />, 'creator-my-profile');
-    await waitFor(() => expect(page.getAllByRole('button', { name: 'Verify' })).toHaveLength(2));
-    expect(within(await platformRow(page, 'TikTok')).queryByRole('button', { name: 'Verify' })).toBeNull();
+    const picker = (await waitFor(() => page.getByLabelText('Platform to add'))) as HTMLSelectElement;
+    // A row per listed platform only; the rest are in the picker.
+    expect(page.getByLabelText('YouTube followers')).toBeTruthy();
+    expect(page.queryByLabelText('TikTok followers')).toBeTruthy(); // the add row, on its first choice
+    expect(page.queryByLabelText('Bluesky followers')).toBeNull();
+    const options = [...picker.options].map((o) => o.value);
+    expect(options).not.toContain('youtube');
+    expect(options).toEqual(expect.arrayContaining(['newsletter', 'bluesky', 'threads', 'facebook', 'pinterest', 'reddit', 'discord', 'snapchat']));
+
+    fireEvent.change(picker, { target: { value: 'bluesky' } });
+    const add = page.getByLabelText('Platform to add').parentElement!;
+    expect((add.querySelector('input') as HTMLInputElement).placeholder).toBe('you.bsky.social');
+    fireEvent.change(add.querySelector('input')!, { target: { value: 'pat.dev' } });
+    fireEvent.click(within(add).getByRole('button', { name: 'Add' }));
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
+    expect(calls.find((c) => c.method === 'PUT')).toMatchObject({ url: expect.stringMatching(/\/platforms\/bluesky$/), body: { handle: 'pat.dev', followerCount: null } });
+  });
+});
+
+describe('profile editor: verify buttons and badges', () => {
+  it('offers Verify on unverified YouTube, website, Instagram and TikTok rows only', async () => {
+    platforms = [row('youtube'), row('website', { handle: 'pat.dev' }), row('tiktok'), row('instagram'), row('twitter')];
+    const page = renderWith(<CreatorMyProfilePage />, 'creator-my-profile');
+    await waitFor(() => expect(page.getAllByRole('button', { name: 'Verify' })).toHaveLength(4));
+    expect(within(await platformRow(page, 'TikTok')).getByRole('button', { name: 'Verify' })).toBeTruthy();
+    expect(within(await platformRow(page, 'X / Twitter')).queryByRole('button', { name: 'Verify' })).toBeNull();
   });
 
   it('shows a Verified badge instead of the button once verified', async () => {
@@ -257,6 +281,30 @@ describe('Verify YouTube account dialog', () => {
     expect(within(dialog).getByText('pat.dev')).toBeTruthy();
   });
 
+  it('asks for the code in the Instagram bio, and says when it’s verified', async () => {
+    platforms = [row('instagram')];
+    startAnswer = {
+      status: 200,
+      body: {
+        platform: 'instagram',
+        method: 'bio_code',
+        code: '048213',
+        expiresAt: START.expiresAt,
+        instructions: { kind: 'profile_bio', platform: 'instagram', editUrl: 'https://www.instagram.com/accounts/edit/', profileUrl: 'https://www.instagram.com/pat', text: '048213' },
+      },
+    };
+    checkAnswers = [{ status: 200, body: { ok: true, platform: row('instagram', { verified: true, followerCountSynced: true }) } }];
+    const page = renderWith(<CreatorMyProfilePage />, 'creator-my-profile');
+    fireEvent.click(await waitFor(() => page.getByRole('button', { name: 'Verify' })));
+    const dialog = await waitFor(() => page.getByRole('dialog', { name: 'Verify Instagram account' }));
+    await waitFor(() => expect(within(dialog).getByText('048213')).toBeTruthy());
+    expect(within(dialog).getByText('Add it to your bio')).toBeTruthy();
+    expect(within(dialog).getByRole('link', { name: /Open Instagram/ }).getAttribute('href')).toBe('https://www.instagram.com/accounts/edit/');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Verify' }));
+    await waitFor(() => expect(within(dialog).getByText(/Your Instagram account is verified\. You can remove the code from your bio now\./)).toBeTruthy());
+    expect(calls.some((c) => c.url === '/api/creator-api/creators/me/platforms/instagram/verify')).toBe(true);
+  });
+
   it('docks to the bottom of the screen on mobile', async () => {
     window.matchMedia = ((query: string) => ({
       matches: query.includes('max-width'),
@@ -301,6 +349,7 @@ describe('brand creator directory', () => {
     await waitFor(() => expect(page.getByText('@pat')).toBeTruthy());
     expect(page.getAllByRole('img', { name: 'Verified' })).toHaveLength(1);
 
+    fireEvent.click(page.getByRole('button', { name: /^Platforms/ }));
     fireEvent.click(page.getByLabelText(/Verified accounts only/));
     await waitFor(() =>
       expect(calls.some((c) => c.url.includes('/admin/network/discover/creators?') && c.url.includes('verified=true'))).toBe(true),

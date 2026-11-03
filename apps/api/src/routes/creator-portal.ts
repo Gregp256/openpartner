@@ -27,6 +27,8 @@
 
 import { createHmac } from 'node:crypto';
 import express, { Router, type Request, type Response } from 'express';
+import { realtimeSocketUrl } from '../network-client.js';
+import { CONVERSATION_IMAGE_MAX_BYTES, CONVERSATION_IMAGE_TYPES } from '../conversation-images.js';
 
 export const creatorPortalRouter = Router();
 
@@ -47,13 +49,35 @@ export function signClientIp(ip: string, key: string, nowMs = Date.now()): strin
 // Image-upload bodies arrive as raw binary, not JSON. The global
 // express.json() middleware ignores image content-types, so without this
 // raw parser req.body would be {} and the proxy would forward an empty
-// payload to the Network. Cap matches the Network-side limit.
-creatorPortalRouter.use(
-  express.raw({
-    type: ['image/jpeg', 'image/png', 'image/webp'],
-    limit: 2 * 1024 * 1024,
-  }),
-);
+// payload to the Network. Caps match the Network-side limits: 2 MB for
+// profile images, 5 MB (and GIFs too) for images sent in a conversation,
+// whose too-big answer is JSON for the composer to show. Only on
+// /creator-api: this router sits in front of the app's other routes, which
+// parse their own uploads with their own limits.
+const profileImageBody = express.raw({
+  type: ['image/jpeg', 'image/png', 'image/webp'],
+  limit: 2 * 1024 * 1024,
+});
+const conversationImageBody = express.raw({ type: CONVERSATION_IMAGE_TYPES, limit: CONVERSATION_IMAGE_MAX_BYTES });
+const ATTACHMENT_UPLOAD_PATH = /^\/creator-api\/creators\/me\/conversations\/[^/]+\/attachments$/;
+creatorPortalRouter.use((req, res, next) => {
+  if (!/^\/creator-api(\/|$)/.test(req.path)) return next();
+  if (!ATTACHMENT_UPLOAD_PATH.test(req.path)) return profileImageBody(req, res, next);
+  conversationImageBody(req, res, (err?: unknown) => {
+    if (!err) return next();
+    const e = err as { status?: number; type?: string };
+    const answer = () => {
+      if (res.headersSent) return;
+      if (e.status === 413 || e.type === 'entity.too.large') return res.status(413).json({ error: 'payload_too_large', maxBytes: CONVERSATION_IMAGE_MAX_BYTES });
+      res.status(400).json({ error: 'invalid_body' });
+    };
+    // Answer once the rest has been read (and thrown away), so the browser
+    // gets the answer rather than a reset connection.
+    if (req.complete) return answer();
+    req.once('end', answer);
+    req.resume();
+  });
+});
 
 // Whitelist: exact path match or prefix-with-glob. We only forward paths
 // the Network exposes for creator-side flows, never anything else.
@@ -61,6 +85,14 @@ const ALLOWED_EXACT = new Set([
   '/creators/signup',
   '/creators/signin',
   '/creators/verify',
+  // Passwords (the Network's docs/creator-auth.md): a correct password
+  // returns the token /creators/signin would mail, redeemed at
+  // /creators/verify; "forgot" mails a reset link to /creator/reset-password.
+  // /creators/me/password is GET (has one?) + PUT (set / change).
+  '/creators/signin/password',
+  '/creators/password/forgot',
+  '/creators/password/reset',
+  '/creators/me/password',
   '/creators/signout',
   '/creators/whoami',
   '/creators/me',
@@ -78,6 +110,9 @@ const ALLOWED_EXACT = new Set([
   '/creators/me/uploads/avatar',
   // The banner on the public profile and the marketplace storefront card.
   '/creators/me/uploads/cover',
+  // Use the verified YouTube channel's banner as the cover, kept in step
+  // with YouTube by the Network (its youtube-cover.ts).
+  '/creators/me/cover/youtube',
   // Where the creator is based: the one-time prompt (GET + PUT).
   '/creators/me/location',
   // Storefront (the Network's docs/creator-storefront.md): the bookings
@@ -86,13 +121,31 @@ const ALLOWED_EXACT = new Set([
   '/creators/me/packages',
   '/creators/me/packages/order',
   '/creators/me/bookings',
+  // Completed bookings shown on the storefront as verified work (GET the
+  // choices, PUT the ones shown in order; the Network's
+  // docs/campaign-reports.md §10).
+  '/creators/me/case-studies',
   // Import a storefront from Passionfroot: read and plan, then apply the
   // chosen items (the Network's docs/creator-storefront.md §7.3).
   '/creators/me/storefront/import/preview',
   '/creators/me/storefront/import/apply',
-  // A brand confirming a storefront request from the emailed link (no auth).
-  '/bookings/confirm',
+  // Conversations with brands, and the creator's own Stripe account that
+  // bookings are paid into (the Network's docs/creator-storefront.md §8).
+  '/creators/me/conversations',
+  '/creators/me/payments',
+  '/creators/me/payments/onboarding',
+  // Messages from OpenPartner's operators (the Network's creator-review.ts).
+  '/creators/me/messages',
   '/offerings',
+  // Claiming a profile the Network's creator index built (its
+  // docs/creator-index.md §5.3). The emailed token is the credential; the
+  // claim may sign the creator in, so its Set-Cookie comes back through here.
+  '/creator-index/claim/preview',
+  '/creator-index/claim',
+  // A shared booking report (the Network's docs/campaign-reports.md): the
+  // public page posts the token from its URL fragment, so it never sits in
+  // a path or a log line here.
+  '/reports/view',
 ]);
 
 const ALLOWED_PREFIX: Array<{ prefix: string; methods: Set<string> }> = [
@@ -100,6 +153,8 @@ const ALLOWED_PREFIX: Array<{ prefix: string; methods: Set<string> }> = [
   { prefix: '/vendors/', methods: new Set(['GET']) },                // /vendors/:id (public profile)
   { prefix: '/creators/me/affiliations/', methods: new Set(['GET']) },
   { prefix: '/creators/me/requests/', methods: new Set(['POST']) },
+  // Mark an operator message read: POST /creators/me/messages/:id/read.
+  { prefix: '/creators/me/messages/', methods: new Set(['POST']) },
   // Custom share-domain management — POST /verify, DELETE the domain.
   { prefix: '/creators/me/domains/', methods: new Set(['POST', 'DELETE']) },
   // Per-partnership operations: slug edit (PATCH), coupon
@@ -114,22 +169,48 @@ const ALLOWED_PREFIX: Array<{ prefix: string; methods: Set<string> }> = [
   // Public profile lookup — no creator session required, lets brands
   // and the open web hit /creators/by-handle/<handle> on the portal.
   // POST is the storefront request form: /creators/by-handle/<handle>/bookings
-  // (no auth; the Network confirms the requester's email before the creator
-  // sees it).
+  // (no auth; the requester continues from an emailed link as a brand before
+  // the creator sees it).
   { prefix: '/creators/by-handle/', methods: new Set(['GET', 'POST']) },
   // Storefront: edit/delete a package (PATCH/DELETE /creators/me/packages/:id),
-  // answer or delete a request (POST .../:id/accept|decline, DELETE .../:id).
+  // answer, withdraw, deliver, refund or delete a booking (POST
+  // .../:id/accept|decline|withdraw|deliver|refund, DELETE .../:id), and make
+  // or revoke a report's share link (POST .../:id/report/shares[/:shareId/revoke]).
   { prefix: '/creators/me/packages/', methods: new Set(['PATCH', 'DELETE']) },
   { prefix: '/creators/me/bookings/', methods: new Set(['POST', 'DELETE']) },
+  // A conversation: read it (GET .../:id), write, send an offer, block, or
+  // get a ticket for its live socket (POST .../:id/messages|offers|block|
+  // unblock|realtime).
+  { prefix: '/creators/me/conversations/', methods: new Set(['GET', 'POST']) },
   // Invitation deeplink resolver (no auth) + consume (creator auth).
   // GET /invitations/:token, POST /invitations/:token/consume
   { prefix: '/invitations/', methods: new Set(['GET', 'POST']) },
+];
+
+/** POST /creators/me/conversations/:id/realtime → { ticket, expiresAt } (+ url, added here). */
+const REALTIME_TICKET_PATH = /^\/creators\/me\/conversations\/[^/]+\/realtime$/;
+/** GET /creators/me/conversations/:id/attachments/:attachmentId → an image's
+ *  file: the one response relayed as bytes, and only as an image. */
+const ATTACHMENT_FILE_PATH = /^\/creators\/me\/conversations\/[^/]+\/attachments\/[^/]+$/;
+/** A booking report, public or the creator's own: never cached, so a
+ *  revoked link or a narrowed sharing choice takes effect at once. */
+const REPORT_PATH = /^(\/reports\/view|\/creators\/me\/bookings\/[^/]+\/report(\/.*)?)$/;
+
+/** Single paths under a prefix that otherwise keeps a method off. */
+const ALLOWED_PATTERN: Array<{ pattern: RegExp; methods: Set<string> }> = [
+  // A booking's report and the creator's own share links for it.
+  { pattern: /^\/creators\/me\/bookings\/[^/]+\/report(\/shares)?$/, methods: new Set(['GET']) },
+  // The creator's own numbers for a post we can't read.
+  { pattern: /^\/creators\/me\/bookings\/[^/]+\/reported-stats$/, methods: new Set(['PUT']) },
 ];
 
 function isAllowed(method: string, subpath: string): boolean {
   if (ALLOWED_EXACT.has(subpath)) return true;
   for (const { prefix, methods } of ALLOWED_PREFIX) {
     if (subpath.startsWith(prefix) && methods.has(method)) return true;
+  }
+  for (const { pattern, methods } of ALLOWED_PATTERN) {
+    if (pattern.test(subpath) && methods.has(method)) return true;
   }
   return false;
 }
@@ -218,6 +299,23 @@ creatorPortalRouter.all(/^\/creator-api(\/.*)?$/, async (req: Request, res: Resp
     if (disposition) res.setHeader('content-disposition', disposition);
 
     const upstreamCt = upstream.headers.get('content-type') ?? '';
+
+    // A conversation image: the bytes, as the image type the Network gave
+    // (one of the four it serves), and nothing that could render as a page.
+    // Never cached, so signing out or a takedown takes effect at once.
+    if (upstream.ok && req.method === 'GET' && ATTACHMENT_FILE_PATH.test(subpath)) {
+      const type = upstreamCt.split(';')[0]!.trim().toLowerCase();
+      if (!CONVERSATION_IMAGE_TYPES.includes(type)) {
+        return res.status(502).json({ error: 'proxy_error', detail: 'unexpected_content_type' });
+      }
+      res.status(200);
+      res.setHeader('Content-Type', type);
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+      res.setHeader('Content-Disposition', 'inline');
+      return res.send(Buffer.from(await upstream.arrayBuffer()));
+    }
+
     const body = await upstream.text();
 
     // Log non-2xx upstream responses with body so we can debug Network-side
@@ -232,7 +330,15 @@ creatorPortalRouter.all(/^\/creator-api(\/.*)?$/, async (req: Request, res: Resp
       });
     }
 
+    // A live-socket ticket (the Network's realtime.ts): add where to open the
+    // socket, which the portal can't know (it's the Network's own origin).
+    if (upstream.ok && REALTIME_TICKET_PATH.test(subpath) && upstreamCt.includes('application/json')) {
+      const ticket = JSON.parse(body) as Record<string, unknown>;
+      return res.status(upstream.status).json({ ...ticket, url: realtimeSocketUrl(networkUrl) });
+    }
+
     res.status(upstream.status);
+    if (REPORT_PATH.test(subpath)) res.setHeader('Cache-Control', 'no-store');
     // Force JSON content-type on the response. The upstream is the
     // Network — which we control — but pinning the type here means a
     // future Network change that returns html/plain (e.g. an error

@@ -3,15 +3,20 @@
  * The storefront editor (the Network's docs/creator-storefront.md §6, §7.2):
  * packages grouped under the creator's channels, templates per platform,
  * channel stats marked synced or self-reported, the live preview beside
- * the editor, and the guided setup creating packages from templates.
+ * the editor, and the guided setup creating packages from templates. Plus
+ * the brand's in-app view of a storefront (each package books a tracked
+ * deal) and the app's old public route forwarding to the public site.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { CreatorPublicProfilePage } from '../pages/creator/CreatorPublicProfile.js';
+import { NetworkCreatorStorefrontPage } from '../pages/admin/NetworkCreatorStorefront.js';
 import { CreatorStorefrontPage } from '../pages/creator/CreatorStorefront.js';
 import { CreatorStorefrontSetupPage } from '../pages/creator/CreatorStorefrontSetup.js';
+import { ChannelHeader } from '../pages/creator/StorefrontSection.js';
+import { PLATFORMS } from '../lib/NetworkProfileEditor.js';
 import {
   groupByChannel,
   parsePackagePrice,
@@ -31,6 +36,10 @@ const YOUTUBE: StorefrontChannel = {
   cadence: null,
   followerCountSynced: true,
   viewsPerVideo: 12400,
+  likesPerVideo: 610,
+  commentsPerVideo: 42,
+  engagementRate: 1.3527,
+  engagementPosts: 10,
   statsSyncedAt: '2026-10-20T00:00:00.000Z',
 };
 const SUBSTACK: StorefrontChannel = {
@@ -78,6 +87,24 @@ beforeEach(() => {
       return json(200, { id: 'crt_1', email: 'maya@example.test', name: 'Maya Chen', handle: 'mayabuilds', avatarUrl: null, pastBrands: [], profileComplete: true });
     }
     if (path === '/creators/me/packages' && method === 'POST') return json(201, { id: `pkg_${requests.length}`, ...body });
+    const putPlatform = /^\/creators\/me\/platforms\/(\w+)$/.exec(path);
+    if (putPlatform && method === 'PUT') {
+      const platforms = storefront.platforms as StorefrontChannel[];
+      if (!platforms.some((p) => p.platform === putPlatform[1])) {
+        const added: StorefrontChannel = {
+          ...SUBSTACK,
+          id: `cpf_${putPlatform[1]}`,
+          platform: putPlatform[1]!,
+          handle: String(body?.handle),
+          profileUrl: null,
+          followerCount: (body?.followerCount as number | null) ?? null,
+          description: null,
+          cadence: null,
+        };
+        storefront = { ...storefront, platforms: [...platforms, added] };
+      }
+      return json(200, { ok: true });
+    }
     if (path === '/creators/by-handle/mayabuilds') {
       return json(200, {
         id: 'crt_1',
@@ -138,7 +165,7 @@ describe('storefront helpers', () => {
   });
 
   it('has templates for every platform and for bundles, never with prices', () => {
-    for (const p of ['youtube', 'substack', 'linkedin', 'twitter', 'instagram', 'tiktok', 'podcast', 'twitch', 'website', null]) {
+    for (const p of [...PLATFORMS.map((x) => x.kind), null]) {
       const t = templatesFor(p);
       expect(t.length).toBeGreaterThan(1);
       for (const x of t) expect(Object.keys(x).sort()).toEqual(['description', 'title']);
@@ -146,17 +173,69 @@ describe('storefront helpers', () => {
   });
 });
 
-describe('public storefront', () => {
+describe('brand storefront', () => {
+  const at = () =>
+    renderAt('/admin/network/creators/mayabuilds', '/admin/network/creators/:handle', <NetworkCreatorStorefrontPage />);
+
   it('shows each channel with its stats and packages, and drops the separate Platforms card', async () => {
-    renderAt('/creators/mayabuilds', '/creators/:handle', <CreatorPublicProfilePage />);
+    at();
     await screen.findByText('Work with Maya');
     expect(screen.getByText('Synced from YouTube')).toBeTruthy();
     expect(screen.getByText('12.4K')).toBeTruthy();
+    // The rate, its figures on hover.
+    expect(screen.getByText('1.4%').parentElement!.getAttribute('title')).toBe(
+      '1.35% engagement over 10 videos: 610 likes and 42 comments per video',
+    );
     expect(screen.getByText('Self-reported')).toBeTruthy();
     expect(screen.getByText('Every Tuesday')).toBeTruthy();
     expect(screen.getByText('A weekly teardown of one developer tool.')).toBeTruthy();
     expect(screen.getByText('Across channels')).toBeTruthy();
     expect(screen.queryByText('Platforms')).toBeNull();
+    expect(screen.getByRole('link', { name: /Public page/ }).getAttribute('href')).toBe('https://openpartner.dev/creators/mayabuilds');
+  });
+
+  it('books a package as a tracked deal, starting on that package', async () => {
+    at();
+    await screen.findByText('Dedicated video');
+    expect(screen.queryByRole('button', { name: /Request/ })).toBeNull();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Book →' })[0]!);
+    const dialog = await screen.findByRole('dialog');
+    await waitFor(() => expect((within(dialog).getByDisplayValue(/Dedicated video/) as HTMLSelectElement).value).toBe('a'));
+  });
+});
+
+describe('a channel read from its public profile', () => {
+  it('says so on hover, where a typed count says Self-reported, with no Synced label', () => {
+    render(
+      <ChannelHeader
+        channel={{
+          id: 'cpf_ig',
+          platform: 'instagram',
+          handle: 'mayabuilds',
+          profileUrl: 'https://www.instagram.com/mayabuilds',
+          followerCount: 50_000,
+          verified: true,
+          followerCountSynced: true,
+          likesPerVideo: 100,
+          commentsPerVideo: 20,
+          engagementRate: 0.24,
+          engagementPosts: 6,
+          statsSyncedAt: '2026-10-31T00:00:00.000Z',
+        }}
+      />,
+    );
+    expect(screen.getByText('50K').parentElement!.getAttribute('title')).toBe('From their public profile');
+    expect(screen.queryByText('Self-reported')).toBeNull();
+    expect(screen.queryByText(/Synced from/)).toBeNull();
+    expect(screen.getByText('0.2%').parentElement!.getAttribute('title')).toBe('0.24% engagement over 6 posts: 100 likes and 20 comments per post');
+  });
+});
+
+describe("the app's old public route", () => {
+  it('forwards to the storefront on the public site', () => {
+    renderAt('/creators/mayabuilds', '/creators/:handle', <CreatorPublicProfilePage />);
+    expect(screen.getByRole('link', { name: /storefront/ }).getAttribute('href')).toBe('https://openpartner.dev/creators/mayabuilds');
+    expect(requests).toEqual([]);
   });
 });
 
@@ -195,6 +274,39 @@ describe('storefront editor', () => {
         cadence: 'Weekly',
       },
     });
+  });
+
+  it('adds a channel not listed yet, then opens its pitch', async () => {
+    renderAt('/creator/storefront', '/creator/storefront', <CreatorStorefrontPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Add a channel/ }));
+    // Only platforms the creator hasn't listed are offered.
+    const options = within(screen.getByLabelText('Channel')).getAllByRole('option').map((o) => (o as HTMLOptionElement).value);
+    expect(options).not.toContain('youtube');
+    expect(options).not.toContain('substack');
+    expect(options).toContain('tiktok');
+
+    fireEvent.change(screen.getByLabelText('Channel'), { target: { value: 'tiktok' } });
+    fireEvent.change(screen.getByLabelText('Handle'), { target: { value: '@mayabuilds' } });
+    fireEvent.change(screen.getByLabelText('Audience'), { target: { value: '15000' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add channel' }));
+
+    await waitFor(() => expect(requests.some((r) => r.method === 'PUT')).toBe(true));
+    expect(requests.find((r) => r.method === 'PUT')).toMatchObject({
+      path: '/creators/me/platforms/tiktok',
+      body: { handle: '@mayabuilds', followerCount: 15000 },
+    });
+    // Straight on to the new channel's pitch.
+    expect(await screen.findByLabelText('What your TikTok covers')).toBeTruthy();
+  });
+
+  it('hides Add a channel once every platform is listed', async () => {
+    storefront = {
+      ...storefront,
+      platforms: PLATFORMS.map((p) => ({ ...SUBSTACK, id: `cpf_${p.kind}`, platform: p.kind, description: null, cadence: null })),
+    };
+    renderAt('/creator/storefront', '/creator/storefront', <CreatorStorefrontPage />);
+    await screen.findAllByRole('button', { name: 'Add pitch' });
+    expect(screen.queryByRole('button', { name: /Add a channel/ })).toBeNull();
   });
 });
 

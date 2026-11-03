@@ -11,7 +11,7 @@
  * this catalogue matches what actually arrives.
  */
 
-import { z } from 'zod';
+import { z } from '../zod.js';
 import type { OpenAPIRegistry } from '@asteasolutions/zod-to-openapi';
 import { KNOWN_EVENTS } from '../routes/webhooks.js';
 import { ATTRIBUTION_MODELS, BONUS_SOURCES, PAYOUT_METHODS } from './enums.js';
@@ -46,6 +46,17 @@ const partnerSource = z.enum(PARTNER_SOURCES).openapi({
     'How the partner was added. `api`: `POST /partners` (the admin portal, an integration, or a Network approval, which also fires `partnership.approved`). `join_page`: they applied on the public join page. New values may be added.',
 });
 
+/** On a recruiter commission (two-tier, docs/two-tier-commissions.md). */
+const recruiterFields = {
+  sourceCommissionId: id.optional().openapi({
+    description:
+      "Set on a recruiter commission: the recruited partner's commission this one is a share of. `partnerId` is the recruiter; the attribution, click and event are the recruit's sale.",
+  }),
+  recruitedPartnerId: id.optional().openapi({
+    description: 'Set on a recruiter commission: the recruited partner whose sale it was.',
+  }),
+};
+
 const lifecycleBase = z.object({
   commissionId: id,
   partnerId: id,
@@ -53,6 +64,7 @@ const lifecycleBase = z.object({
   amount: Decimal,
   currency: z.string(),
   ...commissionOrigin,
+  ...recruiterFields,
 });
 
 /** Bonus fields that come from the Bonus row. On approved / paid /
@@ -116,13 +128,14 @@ export const WEBHOOK_PAYLOADS = {
       description:
         'Set when a partial refund reduced a commission: this one carries the amount the partner keeps, and replaces the commission named here (reversed in the `commission.reversed` sent just before).',
     }),
+    ...recruiterFields,
   }),
   'commission.approved': lifecycleBase,
   'commission.paid': lifecycleBase.extend({ payoutId: id }),
   'commission.reversed': lifecycleBase.extend({
     reason: z.enum(['manual', 'refund', 'chargeback']).openapi({
       description:
-        "`manual` = an admin reversed it; `refund` = a refund (`POST /attribution/refunds`, or Stripe's `charge.refunded` from the self-host Stripe webhook or, on OpenPartner Cloud, the OpenPartner Stripe App); `chargeback` = a chargeback reported to `POST /attribution/refunds`.",
+        "`manual` = an admin reversed it; `refund` = a refund (`POST /attribution/refunds`, or Stripe's `charge.refunded` from the self-host Stripe webhook or, on OpenPartner Cloud, the OpenPartner Stripe App, or a tracked PayPal app's refund); `chargeback` = a chargeback reported to `POST /attribution/refunds`, or a tracked PayPal app's payment PayPal reversed.",
     }),
     refundEventId: id.optional().openapi({ description: 'The refund or chargeback event behind a `refund` / `chargeback` reversal.' }),
     replacementCommissionId: id.optional().openapi({
@@ -159,6 +172,10 @@ export const WEBHOOK_PAYLOADS = {
     portalAccess: z.boolean().openapi({ description: 'The partner may sign in to the partner portal. See `portalAccess` on `POST /partners`.' }),
     programIds: z.array(id).openapi({ description: 'The programs the partner was granted. Join-page applicants start with none.' }),
     source: partnerSource,
+    recruitedByPartnerId: id.optional().openapi({
+      description:
+        "Set when a partner recruited them: the one whose recruit link (`?ref=`) they joined through, or the one `POST /partners` named. Programs with a recruiter commission pay that partner a share of this one's commissions. Absent when nobody did.",
+    }),
   }),
   'partner.activated': z.object({
     partnerId: id,
@@ -195,8 +212,12 @@ export const WEBHOOK_PAYLOADS = {
     clawbackAdjustmentIds: z.array(id).optional().openapi({
       description: 'The `refund_clawback` commission adjustments this payout deducted.',
     }),
+    statementUrl: z.string().url().optional().openapi({
+      description:
+        "The payout's statement: `GET /payouts/{id}/statement` on your API address. Fetch it with an admin key or a key holding `payouts:read`; add `?format=json` for its data. Absent on deliveries of payouts made before statements existed.",
+    }),
   }),
-} satisfies Record<Exclude<(typeof KNOWN_EVENTS)[number], '*'>, z.AnyZodObject>;
+} satisfies Record<Exclude<(typeof KNOWN_EVENTS)[number], '*'>, z.ZodObject>;
 
 export type WebhookEventName = keyof typeof WEBHOOK_PAYLOADS;
 
@@ -213,7 +234,7 @@ const WEBHOOK_DESCRIPTIONS: Record<WebhookEventName, string> = {
   'commission.paid':
     'A commission was included in a payout. For a `manual` payout this fires when the payout is planned, before you have sent the money; `POST /payouts/{id}/confirm` records that you did.',
   'commission.reversed':
-    "A commission was reversed: by an admin, or by a refund or chargeback, reported to `POST /attribution/refunds` or from Stripe's `charge.refunded`. A Stripe dispute reverses nothing until you report the chargeback.",
+    "A commission was reversed: by an admin, or by a refund or chargeback, reported to `POST /attribution/refunds`, from Stripe's `charge.refunded`, or from a tracked PayPal app. A Stripe dispute reverses nothing until you report the chargeback; a PayPal one, until it is resolved against you or PayPal reverses the payment.",
   'bonus.awarded':
     'A bonus was awarded to a partner: a reward not tied to a sale, paid by an admin or integration (`POST /bonuses`), a performance bounty, or an OpenPartner Network bounty. Bonuses never fire `commission.*` events.',
   'bonus.approved':
@@ -247,7 +268,7 @@ export const WEBHOOK_HEADERS = z.object({
 });
 
 export function registerWebhooks(registry: OpenAPIRegistry): void {
-  for (const [event, data] of Object.entries(WEBHOOK_PAYLOADS) as Array<[WebhookEventName, z.AnyZodObject]>) {
+  for (const [event, data] of Object.entries(WEBHOOK_PAYLOADS) as Array<[WebhookEventName, z.ZodObject]>) {
     registry.registerWebhook({
       method: 'post',
       path: event,

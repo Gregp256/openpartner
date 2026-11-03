@@ -220,6 +220,28 @@ code, pre {
   }
 }
 
+/* A scrolling box whose scrollbar shows only while the pointer is over it
+ * (Discover creators' list and side panel). The bar keeps its room either
+ * way, so nothing shifts when it appears. Chromium and Firefox use the
+ * standard properties; Safari the -webkit- ones. */
+.op-scroll-hover {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.op-scroll-hover:hover {
+  scrollbar-color: var(--op-text-dim, #808994) transparent;
+}
+.op-scroll-hover::-webkit-scrollbar {
+  width: 8px;
+}
+.op-scroll-hover::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 8px;
+}
+.op-scroll-hover:hover::-webkit-scrollbar-thumb {
+  background: var(--op-text-dim, #808994);
+}
+
 /* Remove default focus ring, add our own */
 *:focus {
   outline: none;
@@ -231,4 +253,40 @@ textarea:focus-visible,
 a:focus-visible {
   outline: 2px solid var(--op-accent, var(--op-accent-default));
   outline-offset: 1px;
+}
+
+/* A spinning icon (an image uploading in the message box). */
+@keyframes op-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.op-spin {
+  animation: op-spin 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .op-spin {
+    animation: none;
+  }
+}
+
+/* A conversation message's time: under the message, shown while it's
+   hovered, or tapped on a touch screen (the message takes focus). */
+.op-msg .op-msg-time {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.op-msg:hover .op-msg-time,
+.op-msg:focus-within .op-msg-time {
+  opacity: 1;
+}
+
+/* A view-only seat's forms (lib/viewOnly.tsx ViewOnlyFieldset): disabled,
+ * and looking it. !important beats the controls' inline styles. */
+.op-view-only button,
+.op-view-only input,
+.op-view-only select,
+.op-view-only textarea {
+  cursor: not-allowed !important;
+  opacity: 0.6 !important;
 }

@@ -9,6 +9,7 @@ import type { ReactNode } from 'react';
 import { ExternalLink } from 'lucide-react';
 import { Button, formatDate } from '../../ui.js';
 import { theme } from '../../theme.js';
+import { useViewOnly } from '../../lib/viewOnly.js';
 
 export interface DeliveryUrlCheck {
   url: string;
@@ -41,6 +42,11 @@ const PLATFORM_NAMES: Record<string, string> = {
   facebook: 'Facebook',
   threads: 'Threads',
   twitch: 'Twitch',
+  bluesky: 'Bluesky',
+  pinterest: 'Pinterest',
+  reddit: 'Reddit',
+  snapchat: 'Snapchat',
+  discord: 'Discord',
 };
 
 function Badge({ tone, children, title }: { tone: Tone; children: ReactNode; title?: string }) {
@@ -73,6 +79,11 @@ function Badge({ tone, children, title }: { tone: Tone; children: ReactNode; tit
 function errorText(error: string): string {
   if (error === 'youtube_not_configured') return 'YouTube checks aren’t set up';
   if (error === 'video_not_found') return 'Video not found or not public';
+  // YouTube's data goes when the creator asks to delete their account.
+  if (error === 'creator_deleting') return 'The creator is deleting their account';
+  // So does a video's, once it goes 28 days without being read again
+  // (YouTube allows 30).
+  if (error === 'youtube_expired') return 'YouTube data expired';
   if (error.startsWith('http_')) return `Page returned ${error.slice(5)}`;
   if (error.startsWith('blocked:')) return 'Page can’t be fetched safely';
   if (error.startsWith('youtube_api_error')) return 'YouTube didn’t answer';
@@ -130,6 +141,7 @@ export function DeliveryChecksPanel({
   onRecheck: () => void;
   rechecking: boolean;
 }) {
+  const viewOnly = useViewOnly();
   const byUrl = new Map((checks?.urls ?? []).map((c) => [c.url, c]));
   return (
     <div
@@ -148,9 +160,11 @@ export function DeliveryChecksPanel({
             <span style={{ fontSize: 12, color: theme.textDim }}>
               {checks ? `Checked ${formatDate(checks.checkedAt, { relative: true })}` : 'Checking the posts…'}
             </span>
-            <Button size="sm" variant="ghost" onClick={onRecheck} disabled={rechecking}>
-              {rechecking ? 'Checking…' : 'Re-check'}
-            </Button>
+            {!viewOnly && (
+              <Button size="sm" variant="ghost" onClick={onRecheck} disabled={rechecking}>
+                {rechecking ? 'Checking…' : 'Re-check'}
+              </Button>
+            )}
           </>
         )}
       </div>

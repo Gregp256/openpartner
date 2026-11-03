@@ -29,6 +29,11 @@ import type { Knex } from 'knex';
 import { TABLES, type AudienceSize, type NetworkOutboxRow } from '@openpartner/db';
 import { decryptSecret, encryptSecret } from './crypto.js';
 import { getWhiteLabelState } from './white-label.js';
+import { getTenancyMode } from './tenancy.js';
+import { bookingFeeBpsFor } from './booking-fee.js';
+import { resolveBrandName } from './brand-name.js';
+import { CLIENT_IP_HEADER, signClientIp } from './routes/creator-portal.js';
+import { CONVERSATION_IMAGE_TYPES } from './conversation-images.js';
 
 const CONFIG_KEY = 'network_membership';
 // Outbox / fire-and-forget pushes — short timeout, the scheduler retries.
@@ -68,6 +73,17 @@ interface PublicNetworkMembership {
   /** The Network's key may pay bonuses (`bonuses:write`). Keys issued
    *  before Network bounties lack it until the brand re-authorizes. */
   bonusesAuthorized: boolean;
+  /** What this instance registers as (networkTier). The portal shows
+   *  Network billing only to self_hosted. */
+  tier: NetworkTier;
+}
+
+export type NetworkTier = 'hosted' | 'self_hosted';
+
+/** The tier this deployment registers with the Network. Hosted plans
+ *  include Network access; a self-hosted instance subscribes to it. */
+export function networkTier(): NetworkTier {
+  return getTenancyMode() === 'multi' ? 'hosted' : 'self_hosted';
 }
 
 /** The scope POST /bonuses needs; part of NETWORK_FEDERATION_SCOPES. */
@@ -94,6 +110,7 @@ export async function getPublicNetworkMembership(
       scopedKeyId: null,
       autoEnroll: false,
       bonusesAuthorized: false,
+      tier: networkTier(),
     };
   }
   return {
@@ -103,6 +120,7 @@ export async function getPublicNetworkMembership(
     scopedKeyId: m.scopedKeyId,
     autoEnroll: m.autoEnroll,
     bonusesAuthorized: await federationKeyHasScope(db, tenantId, m.scopedKeyId, NETWORK_BONUS_SCOPE),
+    tier: networkTier(),
   };
 }
 
@@ -573,11 +591,13 @@ async function callNetwork<T>(
   path: string,
   body?: unknown,
   /** `rawContentType`: send a Buffer body as-is with this content-type
-   *  (image uploads) instead of JSON. */
-  opts?: { actingVendorPartnerId?: string; rawContentType?: string },
+   *  (image uploads) instead of JSON. `evenIfDisabled`: call with the stored
+   *  token when the membership is switched off, for reading back what the
+   *  Network already holds (the export); nothing that acts on the Network. */
+  opts?: { actingVendorPartnerId?: string; rawContentType?: string; evenIfDisabled?: boolean },
 ): Promise<T> {
   const m = await getNetworkMembership(db, tenantId);
-  if (!m || !m.enabled || !m.vendorTokenCiphertext) {
+  if (!m || (!m.enabled && !opts?.evenIfDisabled) || !m.vendorTokenCiphertext) {
     throw new NetworkProxyError(503, 'network_not_configured');
   }
   // Fall back to process.env.NETWORK_URL when the membership row has
@@ -648,6 +668,51 @@ export class NetworkProxyError extends Error {
   }
 }
 
+/**
+ * GET a file the Network serves this brand: a conversation image. The
+ * brand's token, as callNetwork uses it, but the body comes back as bytes,
+ * and only as one of CONVERSATION_IMAGE_TYPES. Anything else is an error, so
+ * it can never be relayed to a browser as a page.
+ */
+async function fetchNetworkFile(db: Knex, tenantId: string, path: string): Promise<{ contentType: string; body: Buffer }> {
+  const m = await getNetworkMembership(db, tenantId);
+  if (!m || !m.enabled || !m.vendorTokenCiphertext) throw new NetworkProxyError(503, 'network_not_configured');
+  const networkUrl = m.networkUrl || process.env.NETWORK_URL;
+  if (!networkUrl) throw new NetworkProxyError(503, 'network_url_unresolvable');
+  let token: string;
+  try {
+    token = decryptSecret(m.vendorTokenCiphertext);
+  } catch (err) {
+    throw new NetworkProxyError(500, `vendor_token_undecryptable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${networkUrl.replace(/\/$/, '')}${path}`, {
+      headers: { authorization: `Bearer ${token}`, 'user-agent': 'OpenPartner-Vendor/1' },
+      signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new NetworkProxyError(503, `network_unreachable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    throw new NetworkProxyError(res.status, text.slice(0, 500) || `http_${res.status}`);
+  }
+  const contentType = (res.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+  if (!CONVERSATION_IMAGE_TYPES.includes(contentType)) throw new NetworkProxyError(502, 'unexpected_content_type');
+  return { contentType, body: Buffer.from(await res.arrayBuffer()) };
+}
+
+/** GET /vendors/me/export (docs/network-protocol.md): Network rows keyed by
+ *  table name, minus what is the creator's, and the creators they name as
+ *  their public face. */
+export interface NetworkVendorExport {
+  exportedAt: string;
+  vendorId: string;
+  tables: Record<string, Array<Record<string, unknown>>>;
+  creators: Array<{ id: string; name: string | null; handle: string | null; avatarUrl: string | null }>;
+}
+
 // Thin wrappers — they're a 1:1 with Network endpoints. Kept here so
 // the route handlers stay declarative.
 export const networkProxy = {
@@ -686,9 +751,10 @@ export const networkProxy = {
       `/vendors/me/discover/creators${querystring ? `?${querystring}` : ''}`,
     ),
 
-  /** Tracked storefront bookings: book a creator's package for an agreed
-   *  amount, then approve the delivered work, which the Network pays as a
-   *  bonus through this instance's POST /bonuses. */
+  /** Storefront bookings (Network docs/creator-storefront.md §8): request a
+   *  creator's package, pay upfront through Checkout on the creator's own
+   *  Stripe account once they agree a price, approve the delivered work.
+   *  Each one lives in the (creator, brand) conversation below. */
   listBookings: (db: Knex, tenantId: string, status?: string) =>
     callNetwork<{ bookings: unknown[] }>(
       db,
@@ -697,9 +763,88 @@ export const networkProxy = {
       `/vendors/me/bookings${status ? `?status=${encodeURIComponent(status)}` : ''}`,
     ),
   createBooking: (db: Knex, tenantId: string, body: unknown) =>
-    callNetwork<{ booking: unknown }>(db, tenantId, 'POST', '/vendors/me/bookings', body),
-  bookingAction: (db: Knex, tenantId: string, id: string, action: 'cancel' | 'approve' | 'retry-payout' | 'recheck') =>
-    callNetwork<{ booking: unknown }>(db, tenantId, 'POST', `/vendors/me/bookings/${encodeURIComponent(id)}/${action}`),
+    callNetwork<{ booking: unknown; conversationId: string }>(db, tenantId, 'POST', '/vendors/me/bookings', body),
+  bookingAction: (
+    db: Knex,
+    tenantId: string,
+    id: string,
+    action: 'cancel' | 'approve' | 'recheck' | 'checkout' | 'sync' | 'track',
+    body?: unknown,
+  ) => callNetwork<{ booking?: unknown; url?: string }>(db, tenantId, 'POST', `/vendors/me/bookings/${encodeURIComponent(id)}/${action}`, body ?? {}),
+  /** Continue a public storefront request as this brand (§8.4). */
+  claimBooking: (db: Knex, tenantId: string, body: unknown) =>
+    callNetwork<{ booking: unknown; conversationId: string }>(db, tenantId, 'POST', '/vendors/me/bookings/claim', body),
+
+  /** A delivered booking's report, what the creator may share from it, and
+   *  the brand's share links (Network docs/campaign-reports.md). */
+  bookingReport: (db: Knex, tenantId: string, id: string) =>
+    callNetwork<{ report: unknown }>(db, tenantId, 'GET', `/vendors/me/bookings/${encodeURIComponent(id)}/report`),
+  refreshBookingReport: (db: Knex, tenantId: string, id: string) =>
+    callNetwork<{ report: unknown }>(db, tenantId, 'POST', `/vendors/me/bookings/${encodeURIComponent(id)}/report/refresh`, {}),
+  setBookingReportSharing: (db: Knex, tenantId: string, id: string, body: unknown) =>
+    callNetwork<{ creatorShare: string | null; effective: string }>(
+      db,
+      tenantId,
+      'PATCH',
+      `/vendors/me/bookings/${encodeURIComponent(id)}/report-sharing`,
+      body,
+    ),
+  listBookingReportShares: (db: Knex, tenantId: string, id: string) =>
+    callNetwork<{ shares: unknown[] }>(db, tenantId, 'GET', `/vendors/me/bookings/${encodeURIComponent(id)}/report/shares`),
+  createBookingReportShare: (db: Knex, tenantId: string, id: string, body: unknown) =>
+    callNetwork<{ share: unknown; url: string }>(db, tenantId, 'POST', `/vendors/me/bookings/${encodeURIComponent(id)}/report/shares`, body),
+  revokeBookingReportShare: (db: Knex, tenantId: string, id: string, shareId: string) =>
+    callNetwork<{ shares: unknown[] }>(
+      db,
+      tenantId,
+      'POST',
+      `/vendors/me/bookings/${encodeURIComponent(id)}/report/shares/${encodeURIComponent(shareId)}/revoke`,
+      {},
+    ),
+  setReportSharingDefault: (db: Knex, tenantId: string, body: unknown) =>
+    callNetwork<{ defaultCreatorShare: string }>(db, tenantId, 'PATCH', '/vendors/me/report-sharing', body),
+
+  /** Conversations with creators (§8.1). */
+  listConversations: (db: Knex, tenantId: string) =>
+    callNetwork<{ conversations: unknown[]; unreadTotal: number }>(db, tenantId, 'GET', '/vendors/me/conversations'),
+  startConversation: (db: Knex, tenantId: string, body: unknown) =>
+    callNetwork<{ conversationId: string; message: unknown }>(db, tenantId, 'POST', '/vendors/me/conversations', body),
+  getConversation: (db: Knex, tenantId: string, id: string, before?: string) =>
+    callNetwork<unknown>(
+      db,
+      tenantId,
+      'GET',
+      `/vendors/me/conversations/${encodeURIComponent(id)}${before ? `?before=${encodeURIComponent(before)}` : ''}`,
+    ),
+  postConversationMessage: (db: Knex, tenantId: string, id: string, body: unknown) =>
+    callNetwork<{ message: unknown }>(db, tenantId, 'POST', `/vendors/me/conversations/${encodeURIComponent(id)}/messages`, body),
+  /** A ticket for the conversation's live socket, plus the socket's URL on
+   *  this brand's Network (the browser opens it directly). */
+  conversationRealtime: async (db: Knex, tenantId: string, id: string, body: { authorName?: string }) => {
+    const ticket = await callNetwork<{ ticket: string; expiresAt: string }>(
+      db,
+      tenantId,
+      'POST',
+      `/vendors/me/conversations/${encodeURIComponent(id)}/realtime`,
+      body,
+    );
+    const m = await getNetworkMembership(db, tenantId);
+    return { ...ticket, url: realtimeSocketUrl(m?.networkUrl || process.env.NETWORK_URL || '') };
+  },
+  /** An image to send in the conversation (the raw file) → { attachment }. */
+  uploadConversationAttachment: (db: Knex, tenantId: string, id: string, image: Buffer, contentType: string) =>
+    callNetwork<{ attachment: unknown }>(db, tenantId, 'POST', `/vendors/me/conversations/${encodeURIComponent(id)}/attachments`, image, {
+      rawContentType: contentType,
+    }),
+  /** An image's file, for the brand's portal to show. */
+  conversationAttachmentFile: (db: Knex, tenantId: string, id: string, attachmentId: string) =>
+    fetchNetworkFile(db, tenantId, `/vendors/me/conversations/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}`),
+  /** All of the above the Network holds for this brand: its conversations,
+   *  their messages, and its bookings with their payment records, for the
+   *  workspace export (export.ts exportNetwork). Also while the membership
+   *  is switched off: the records are still there, and still the brand's. */
+  exportVendorData: (db: Knex, tenantId: string) =>
+    callNetwork<NetworkVendorExport>(db, tenantId, 'GET', '/vendors/me/export', undefined, { evenIfDisabled: true }),
 
   /** Invite a creator to apply to one of this vendor's offerings.
    *  Network mints an OfferingInvitation + emails the creator a
@@ -741,6 +886,26 @@ export const networkProxy = {
   // the admin endpoint because by that point the vendorToken is gone.
   deleteVendor: (db: Knex, tenantId: string) =>
     callNetwork<{ ok: boolean }>(db, tenantId, 'POST', '/vendors/me/delete'),
+
+  // The creator index (openpartner-network docs/creator-index.md §4, §5):
+  // creators not on OpenPartner yet. The caller adds `creatorIndex=1` (or
+  // `creatorIndex: true`) only for brands on Flex or Enterprise; the
+  // Network honours it from hosted instances only.
+  searchIndexedCreators: (db: Knex, tenantId: string, querystring: string) =>
+    callNetwork<{ creators: unknown[]; nextCursor: string | null; total: number }>(
+      db,
+      tenantId,
+      'GET',
+      `/vendors/me/discover/indexed-creators?${querystring}`,
+    ),
+  getIndexedCreator: (db: Knex, tenantId: string, id: string) =>
+    callNetwork<{ creator: unknown }>(db, tenantId, 'GET', `/vendors/me/discover/indexed-creators/${encodeURIComponent(id)}?creatorIndex=1`),
+  createCreatorInvite: (db: Knex, tenantId: string, body: unknown) =>
+    callNetwork<{ invite: unknown }>(db, tenantId, 'POST', '/vendors/me/creator-invites', body),
+  listCreatorInvites: (db: Knex, tenantId: string) =>
+    callNetwork<{ invites: unknown[] }>(db, tenantId, 'GET', '/vendors/me/creator-invites'),
+  withdrawCreatorInvite: (db: Knex, tenantId: string, id: string) =>
+    callNetwork<null>(db, tenantId, 'DELETE', `/vendors/me/creator-invites/${encodeURIComponent(id)}`),
 };
 
 /**
@@ -774,6 +939,8 @@ async function callNetworkAdmin<T = void>(
   method: 'GET' | 'POST' | 'PUT' | 'DELETE',
   path: string,
   body?: Record<string, unknown>,
+  extraHeaders: Record<string, string> = {},
+  timeoutMs = 10_000,
 ): Promise<T> {
   const adminKey = process.env.NETWORK_ADMIN_API_KEY;
   if (!adminKey) throw new Error('NETWORK_ADMIN_API_KEY not set — cannot moderate on the Network');
@@ -781,12 +948,13 @@ async function callNetworkAdmin<T = void>(
   const res = await fetch(url, {
     method,
     headers: {
+      ...extraHeaders,
       'content-type': 'application/json',
       authorization: `Bearer ${adminKey}`,
       'user-agent': 'OpenPartner-Vendor/1',
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await res.text();
   if (!res.ok) {
@@ -802,11 +970,109 @@ async function callNetworkAdmin<T = void>(
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+/** The public storefront request behind an emailed link (Network
+ *  docs/creator-storefront.md §8.4), including the address it was sent to.
+ *  Admin key: only this server reads it, for the booking-claim landing
+ *  page and to create a brand for that address. */
+export interface BookingClaimPreview {
+  creator: { id: string; name: string; handle: string | null; avatarUrl: string | null };
+  packageTitle: string | null;
+  contactName: string;
+  contactEmail: string;
+  company: string | null;
+  website: string | null;
+  brief: string;
+  budgetNote: string | null;
+  expiresAt: string;
+}
+
+export async function previewBookingClaim(networkUrl: string, token: string): Promise<BookingClaimPreview> {
+  return callNetworkAdmin<BookingClaimPreview>(networkUrl, 'POST', '/bookings/preview', { token });
+}
+
+/** Ops console: the booking fee self-hosted brands pay (hosted brands pay
+ *  their plan's rate, bookingFeeBpsFor). */
+export async function getNetworkBookingFee(networkUrl: string): Promise<{ settings: { defaultBps: number }; maxBps: number; defaultBps: number }> {
+  return callNetworkAdmin(networkUrl, 'GET', '/admin/booking-fee');
+}
+
+export async function setNetworkBookingFee(
+  networkUrl: string,
+  body: { defaultBps: number; updatedByEmail?: string },
+): Promise<{ settings: { defaultBps: number } }> {
+  return callNetworkAdmin(networkUrl, 'PUT', '/admin/booking-fee', body);
+}
+
 /** The platform-level Network origin. Creator moderation is cross-tenant, so
  *  it uses the env URL rather than any one brand's membership Config. */
 export function platformNetworkUrl(): string | null {
   const v = (process.env.NETWORK_URL ?? '').trim();
   return v.length > 0 ? v : null;
+}
+
+/** Where a browser opens a conversation's live socket on this Network:
+ *  https://network.openpartner.dev/api → wss://network.openpartner.dev/api/realtime. */
+export function realtimeSocketUrl(networkUrl: string): string | null {
+  const base = networkUrl.trim().replace(/\/$/, '');
+  if (!/^https?:\/\//i.test(base)) return null;
+  return `${base.replace(/^http/i, 'ws')}/realtime`;
+}
+
+// ---------- Creator "Continue with Google" (docs/creator-sign-in.md) ----------
+//
+// routes/google-auth.ts has verified the address with Google. The Network
+// hands back the token its sign-in email would have carried (the signup
+// confirmation's, for a new creator), and the browser redeems it at
+// /creators/verify through the creator-portal proxy — so the session, the
+// country check and takedowns stay the Network's. The browser's address
+// rides along, signed, for the Network's country checks, as on every
+// proxied creator request.
+
+function creatorClientIpHeader(clientIp: string | null | undefined): Record<string, string> {
+  const key = process.env.NETWORK_ADMIN_API_KEY;
+  return key && clientIp ? { [CLIENT_IP_HEADER]: signClientIp(clientIp, key) } : {};
+}
+
+/** A sign-in token for the creator with this verified address. Throws
+ *  NetworkAdminError: code 'no_creator' (404) when there's none — the
+ *  Network never creates one here — 'creator_not_active', or a country
+ *  refusal. */
+export async function adminCreatorSigninToken(networkUrl: string, email: string, clientIp: string | null | undefined): Promise<string> {
+  const r = await callNetworkAdmin<{ token: string }>(
+    networkUrl,
+    'POST',
+    '/admin/creators/signin-token',
+    { email },
+    creatorClientIpHeader(clientIp),
+  );
+  return r.token;
+}
+
+export interface AdminCreatorSignupInput {
+  /** Verified by Google — never taken from the browser. */
+  email: string;
+  name: string;
+  handle?: string;
+  country: string;
+  outsideOccupiedRegions?: boolean;
+}
+
+/** Create the creator for a Google-verified address (the Network accepts a
+ *  signup without its confirmation email only over this admin key) and
+ *  return the token to sign them in with. Throws NetworkAdminError code
+ *  'creator_exists' (409, no token) when the address already has one. */
+export async function adminCreatorSignup(
+  networkUrl: string,
+  input: AdminCreatorSignupInput,
+  clientIp: string | null | undefined,
+): Promise<{ token: string }> {
+  return callNetworkAdmin<{ token: string }>(
+    networkUrl,
+    'POST',
+    '/admin/creators/signup',
+    { ...input },
+    creatorClientIpHeader(clientIp),
+  );
 }
 
 /** Suspend the brand's Vendor on the Network — pulls every offering it has
@@ -965,6 +1231,42 @@ export interface NetworkCreatorSummary {
    *  (the Network's docs/creator-storefront.md §7.3). Absent on an older
    *  Network. */
   importConflicts?: NetworkImportConflict[];
+  // ---- Creator review (the Network's creator-review.ts). All absent on a
+  // Network that predates the review gate. ----
+  /** Shown to brands and the public only once 'approved' (and complete). */
+  reviewStatus?: CreatorReviewStatus;
+  reviewedAt?: string | null;
+  /** The operator's internal note on the last decision. */
+  reviewReason?: string | null;
+  reviewedByEmail?: string | null;
+  /** When the creator last changed their profile; compare with
+   *  lastMessageAt for "edited since your message". */
+  profileUpdatedAt?: string;
+  /** Their platforms, for the reviewer to read (text, never links). */
+  platforms?: Array<{
+    platform: string;
+    handle: string;
+    profileUrl: string | null;
+    followerCount: number | null;
+    verified: boolean;
+  }>;
+  messageCount?: number;
+  unreadMessageCount?: number;
+  lastMessageAt?: string | null;
+}
+
+export type CreatorReviewStatus = 'pending' | 'approved' | 'rejected';
+
+/** An operator's message to a creator, as the ops console sees it. */
+export interface NetworkCreatorMessage {
+  id: string;
+  body: string;
+  sentByEmail: string | null;
+  createdAt: string;
+  /** Null when it wasn't emailed (asked not to, or the send failed). */
+  emailedAt: string | null;
+  /** When the creator marked it read in their portal. */
+  readAt: string | null;
 }
 
 export interface NetworkImportConflict {
@@ -981,13 +1283,67 @@ export interface NetworkImportConflict {
   lastAttemptAt: string;
 }
 
-export async function adminListCreators(networkUrl: string): Promise<NetworkCreatorSummary[]> {
+/** `review` narrows to one review state; `complete` to complete profiles
+ *  (with review 'pending': the creators ready for review). A Network that
+ *  predates creator review ignores both. */
+export async function adminListCreators(
+  networkUrl: string,
+  opts: { review?: CreatorReviewStatus; complete?: boolean } = {},
+): Promise<NetworkCreatorSummary[]> {
   const body = await callNetworkAdmin<{ creators: NetworkCreatorSummary[] }>(
     networkUrl,
     'GET',
-    '/admin/creators?limit=500',
+    `/admin/creators?limit=500${opts.review ? `&review=${opts.review}` : ''}${opts.complete ? '&complete=true' : ''}`,
   );
   return body.creators ?? [];
+}
+
+/** Record an operator decision on a creator. Idempotent on the Network;
+ *  `notifyCreator` emails the outcome (approved/rejected, on a change). */
+export async function adminSetCreatorReview(
+  networkUrl: string,
+  creatorId: string,
+  decision: {
+    status: CreatorReviewStatus;
+    reason: string | null;
+    reviewedByEmail: string;
+    notifyCreator: boolean;
+    replyTo: string | null;
+  },
+): Promise<{ reviewStatus: CreatorReviewStatus; changed: boolean; notified: boolean }> {
+  return callNetworkAdmin(networkUrl, 'POST', `/admin/creators/${encodeURIComponent(creatorId)}/review`, {
+    status: decision.status,
+    ...(decision.reason ? { reason: decision.reason } : {}),
+    reviewedByEmail: decision.reviewedByEmail,
+    notifyCreator: decision.notifyCreator,
+    ...(decision.replyTo ? { replyTo: decision.replyTo } : {}),
+  });
+}
+
+/** Send a creator a message: shown in their portal, emailed when `email`.
+ *  A retry with the same `idempotencyKey` returns the first send
+ *  (`replayed`) instead of messaging the creator twice. */
+export async function adminSendCreatorMessage(
+  networkUrl: string,
+  creatorId: string,
+  msg: { body: string; sentByEmail: string; email: boolean; replyTo: string | null; idempotencyKey: string | null },
+): Promise<{ message: NetworkCreatorMessage; emailed: boolean; replayed?: boolean }> {
+  return callNetworkAdmin(networkUrl, 'POST', `/admin/creators/${encodeURIComponent(creatorId)}/messages`, {
+    body: msg.body,
+    sentByEmail: msg.sentByEmail,
+    email: msg.email,
+    ...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
+    ...(msg.idempotencyKey ? { idempotencyKey: msg.idempotencyKey } : {}),
+  });
+}
+
+export async function adminListCreatorMessages(networkUrl: string, creatorId: string): Promise<NetworkCreatorMessage[]> {
+  const body = await callNetworkAdmin<{ messages: NetworkCreatorMessage[] }>(
+    networkUrl,
+    'GET',
+    `/admin/creators/${encodeURIComponent(creatorId)}/messages`,
+  );
+  return body.messages ?? [];
 }
 
 export async function adminBlockCreator(
@@ -1093,6 +1449,366 @@ export async function adminRunCreatorReminders(
   });
 }
 
+// The storefront nudge: one email to creators a week in with no open
+// storefront. Same split as the profile reminders. See the Network's
+// src/storefront-nudge.ts.
+
+export interface StorefrontNudgePreview {
+  creatorId: string;
+  email: string;
+  name: string;
+  handle: string | null;
+  /** Their biggest channel, when it has 1,000 or more followers. */
+  audience: { platform: string; count: number } | null;
+  /** Packages saved, drafts included, and how many are published. */
+  packages: number;
+  publishedPackages: number;
+  bookingsOpen: boolean;
+  paymentsReady: boolean;
+}
+
+export interface StorefrontNudgeRunResult {
+  dryRun: boolean;
+  eligible: StorefrontNudgePreview[];
+  sent: number;
+  failed: number;
+}
+
+/** Creators per run. The Network sends one at a time, so this keeps a run
+ *  well inside the timeout below; the rest go out the next day. */
+const STOREFRONT_NUDGE_RUN_LIMIT = 100;
+
+export async function adminRunStorefrontNudge(
+  networkUrl: string,
+  opts: { dryRun: boolean },
+): Promise<StorefrontNudgeRunResult> {
+  return callNetworkAdmin<StorefrontNudgeRunResult>(
+    networkUrl,
+    'POST',
+    '/admin/storefront-nudge/run',
+    { dryRun: opts.dryRun, limit: STOREFRONT_NUDGE_RUN_LIMIT, publicUrl: networkUrl },
+    {},
+    // A run's sends happen before the Network answers.
+    90_000,
+  );
+}
+
+// ---------- Creator index ops (openpartner-network docs/creator-index.md §6) ----------
+
+export interface CreatorIndexSettings {
+  enabled: boolean;
+  invitesEnabled: boolean;
+  /** Ops can send the "claim your profile" outreach email. Optional: a
+   *  Network that predates it doesn't send it. */
+  outreachEnabled?: boolean;
+  /** How batches send it. Optional: an older Network doesn't send it. */
+  outreachStyle?: OutreachStyle;
+  monthlyBudgetUsd: number;
+  /** Members' Instagram and TikTok reads. Optional: an older Network
+   *  doesn't send it. */
+  memberStatsBudgetUsd?: number;
+  minFollowers: number;
+  /** Too big to need OpenPartner: not listed or emailed. Null: no cap.
+   *  Optional: an older Network doesn't send it. */
+  maxFollowers?: number | null;
+  /** Kept in the index but hidden over it: not shown to brands or emailed.
+   *  Null: none. Optional: an older Network doesn't send it. */
+  hideOverFollowers?: number | null;
+  minPostsPer30d: number;
+  refreshDays: number;
+  excludedCountries: string[];
+  hiddenRegions: string[];
+  seedQueries: string[];
+  /** Where each seed query is searched. Optional so an older Network's
+   *  answer still reads. */
+  discoverySources?: { storefronts: boolean; sponsorPages: boolean; mediaKits?: boolean; people: boolean; creatorDatabase?: boolean };
+  /** Creators the creator database source takes per Discover run. */
+  creatorDatabasePerRun?: number;
+  /** Keep only creators who already take partnerships. */
+  requirePartnershipSignal?: boolean;
+  /** Profiles read at the same time (1–20). */
+  readConcurrency?: number;
+  /** Paid address lookups when a creator published none. */
+  contactEnrichment?: { creatorData: boolean; ownDomain: boolean };
+  classifierModel: string;
+}
+
+export interface StoredCreatorIndexSettings {
+  settings: CreatorIndexSettings;
+  defaults: CreatorIndexSettings;
+  classifierModels: string[];
+  updatedAt: string | null;
+  updatedByEmail: string | null;
+  /** Which of the Network's data sources have credentials, by its own names. */
+  configured: Record<string, boolean>;
+  /** The mailbox the outreach email goes from, if the Network has one. */
+  outreachMailer?: NetworkMailbox;
+  /** The mailbox brands' invites go from: never the outreach one. */
+  inviteMailer?: NetworkMailbox;
+  /** Whether a mailbox can be connected by Microsoft sign-in. */
+  mailboxOAuth?: boolean;
+}
+
+/** One of the creator index's mailboxes on the Network. `via` and
+ *  `connection` are missing from a Network that predates connections. */
+export interface NetworkMailbox {
+  configured: boolean;
+  from: string | null;
+  via?: 'microsoft_account' | 'graph_app' | 'smtp' | 'console' | null;
+  connection?: NetworkMailboxConnection | null;
+}
+
+export interface NetworkMailboxConnection {
+  /** 'lost': Microsoft refused the refresh token; nothing is sent from the
+   *  mailbox until it's reconnected or disconnected. */
+  status: 'connected' | 'lost';
+  account: string;
+  accountName: string | null;
+  sendAs: string | null;
+  sendAsName: string | null;
+  connectedAt: string;
+  connectedByEmail: string;
+  lastRefreshedAt: string | null;
+  lostAt: string | null;
+  lostReason: string | null;
+}
+
+export type NetworkMailboxKind = 'outreach' | 'invite';
+
+/** Both mailboxes, for the lost-connection alert. */
+export async function adminGetMailboxes(
+  networkUrl: string,
+): Promise<{ oauthAvailable: boolean; outreach: NetworkMailbox; invite: NetworkMailbox }> {
+  return callNetworkAdmin(networkUrl, 'GET', '/admin/mailboxes');
+}
+
+/** Start a Microsoft sign-in for one mailbox. The Network keeps the state
+ *  and the PKCE verifier; Microsoft sends the browser back to redirectUri. */
+export async function adminStartMailboxConnect(
+  networkUrl: string,
+  kind: NetworkMailboxKind,
+  body: { redirectUri: string; startedByEmail: string; sendAs?: string | null },
+): Promise<{ authorizeUrl: string; expiresAt: string }> {
+  return callNetworkAdmin(networkUrl, 'POST', `/admin/mailboxes/${kind}/connect`, body);
+}
+
+/** Hand the Network the code Microsoft redirected with; it exchanges it and
+ *  keeps the tokens. */
+export async function adminCompleteMailboxConnect(
+  networkUrl: string,
+  body: { state: string; code: string; completedByEmail: string },
+): Promise<{ kind: NetworkMailboxKind; mailbox: NetworkMailbox }> {
+  return callNetworkAdmin(networkUrl, 'POST', '/admin/mailboxes/connect/complete', body, {}, 20_000);
+}
+
+export async function adminSetMailboxSendAs(
+  networkUrl: string,
+  kind: NetworkMailboxKind,
+  sendAs: string | null,
+): Promise<{ kind: NetworkMailboxKind; mailbox: NetworkMailbox }> {
+  return callNetworkAdmin(networkUrl, 'PUT', `/admin/mailboxes/${kind}/send-as`, { sendAs });
+}
+
+export async function adminDisconnectMailbox(
+  networkUrl: string,
+  kind: NetworkMailboxKind,
+): Promise<{ kind: NetworkMailboxKind; removed: boolean; mailbox: NetworkMailbox }> {
+  return callNetworkAdmin(networkUrl, 'DELETE', `/admin/mailboxes/${kind}`);
+}
+
+export async function adminGetCreatorIndexSettings(networkUrl: string): Promise<StoredCreatorIndexSettings> {
+  return callNetworkAdmin<StoredCreatorIndexSettings>(networkUrl, 'GET', '/admin/creator-index/settings');
+}
+
+export async function adminSetCreatorIndexSettings(
+  networkUrl: string,
+  settings: CreatorIndexSettings & { updatedByEmail?: string },
+): Promise<{ settings: CreatorIndexSettings; updatedAt: string | null; updatedByEmail: string | null; visibilityChanged: number }> {
+  return callNetworkAdmin(networkUrl, 'PUT', '/admin/creator-index/settings', { ...settings });
+}
+
+export async function adminCreatorIndexStats(networkUrl: string): Promise<Record<string, unknown>> {
+  return callNetworkAdmin<Record<string, unknown>>(networkUrl, 'GET', '/admin/creator-index/stats');
+}
+
+export async function adminSearchIndexedCreators(networkUrl: string, querystring: string): Promise<{ creators: unknown[]; total?: number; nextCursor?: string | null }> {
+  return callNetworkAdmin<{ creators: unknown[]; total?: number; nextCursor?: string | null }>(networkUrl, 'GET', `/admin/creator-index/creators${querystring ? `?${querystring}` : ''}`);
+}
+
+export async function adminGetIndexedCreator(networkUrl: string, id: string): Promise<{ creator: unknown; invites: Record<string, number> }> {
+  return callNetworkAdmin(networkUrl, 'GET', `/admin/creator-index/creators/${encodeURIComponent(id)}`);
+}
+
+export async function adminRemoveIndexedCreator(networkUrl: string, id: string): Promise<void> {
+  return callNetworkAdmin<void>(networkUrl, 'DELETE', `/admin/creator-index/creators/${encodeURIComponent(id)}`);
+}
+
+/** Hide or unhide the creators ticked, or everyone the list's filters match. */
+export async function adminHideIndexedCreators(
+  networkUrl: string,
+  body: { hidden: boolean; ids?: string[]; match?: Record<string, unknown> },
+): Promise<{ changed: number }> {
+  return callNetworkAdmin(networkUrl, 'POST', '/admin/creator-index/creators/hidden', body);
+}
+
+/** Block a domain: no index email to anyone there, and their listings go
+ *  (the Network's creator-index/blocked-domains.ts). It reads every stored
+ *  address to find them, so it gets longer than most calls. */
+export async function adminBlockIndexDomain(networkUrl: string, domain: string): Promise<{ domain: string; alreadyBlocked: boolean; removed: number }> {
+  return callNetworkAdmin(networkUrl, 'POST', '/admin/creator-index/blocked-domains', { domain }, {}, 30_000);
+}
+
+export async function adminUnblockIndexDomain(networkUrl: string, domain: string): Promise<void> {
+  return callNetworkAdmin<void>(networkUrl, 'DELETE', `/admin/creator-index/blocked-domains/${encodeURIComponent(domain)}`);
+}
+
+export interface IndexedCreatorContact {
+  address: string;
+  foundOn: string | null;
+  verified: boolean;
+}
+
+/** One indexed creator's address in full (the list shows it masked). */
+export async function adminGetIndexedCreatorContact(networkUrl: string, id: string): Promise<{ contact: IndexedCreatorContact }> {
+  return callNetworkAdmin(networkUrl, 'GET', `/admin/creator-index/creators/${encodeURIComponent(id)}/contact`);
+}
+
+/** Set an address ops found published on `sourceUrl`; the Network takes ops'
+ *  word for the page and verifies the address first. */
+export async function adminSetIndexedCreatorContact(
+  networkUrl: string,
+  id: string,
+  body: { email: string; sourceUrl: string },
+): Promise<{ creator: unknown }> {
+  return callNetworkAdmin(networkUrl, 'PUT', `/admin/creator-index/creators/${encodeURIComponent(id)}/contact`, body);
+}
+
+/** A US creator's state ops found (`US-TX`), with the page that shows it. */
+export async function adminSetIndexedCreatorState(
+  networkUrl: string,
+  id: string,
+  body: { region: string; sourceUrl: string },
+): Promise<{ creator: unknown }> {
+  return callNetworkAdmin(networkUrl, 'PUT', `/admin/creator-index/creators/${encodeURIComponent(id)}/location`, body);
+}
+
+export async function adminQueueIndexSeeds(networkUrl: string, urls: string[]): Promise<Record<string, number>> {
+  return callNetworkAdmin<Record<string, number>>(networkUrl, 'POST', '/admin/creator-index/seeds', { urls });
+}
+
+/** Run one of the index jobs now. Reads take most of a minute each. */
+/** Starts the job on the Network, which answers at once ({ started: true })
+ *  and runs it in the background; 409 already_running if it's going. */
+export async function adminRunCreatorIndexJob(networkUrl: string, job: 'discover' | 'read' | 'refresh'): Promise<Record<string, unknown>> {
+  return callNetworkAdmin<Record<string, unknown>>(networkUrl, 'POST', `/admin/creator-index/run/${job}`, {}, {}, 30_000);
+}
+
+export interface CreatorIndexInviteRunResult {
+  ran: boolean;
+  dryRun: boolean;
+  candidates: number;
+  sent: number;
+  skipped: number;
+  failed: number;
+  expired: number;
+  unreachable: number;
+  targets?: string[];
+}
+
+/** The weekly invite email (§5.2). The Network decides who is due and
+ *  whether invites are on at all; the mute and remove links point at
+ *  `networkUrl`. */
+export async function adminRunCreatorIndexInvites(networkUrl: string, opts: { dryRun: boolean }): Promise<CreatorIndexInviteRunResult> {
+  return callNetworkAdmin<CreatorIndexInviteRunResult>(
+    networkUrl,
+    'POST',
+    '/admin/creator-index/invites/run',
+    { dryRun: opts.dryRun, publicUrl: networkUrl },
+    {},
+    // A run's sends happen before the Network answers.
+    90_000,
+  );
+}
+
+export interface CreatorIndexOutreachTarget {
+  id: string;
+  name: string | null;
+  country: string | null;
+  region: string | null;
+  shownToBrands: boolean;
+  totalReach: number;
+  /** Masked by the Network. */
+  address: string;
+  addressFoundOn: string | null;
+  /** How the email would open. */
+  opening: string;
+  skip?: string;
+}
+
+export interface CreatorIndexOutreachPreview {
+  dryRun: true;
+  enabled: boolean;
+  mailerConfigured: boolean;
+  sender: string | null;
+  due: number;
+  candidates: number;
+  excluded: Record<string, number>;
+  countriesNotCleared: Record<string, number>;
+  targets: CreatorIndexOutreachTarget[];
+}
+
+/** The outreach email (§5.5): a dry run answers with the batch; a send
+ *  starts on the Network in the background ({ started: true }), or 409s
+ *  with outreach_off, mailer_not_configured or already_running. The mute
+ *  and remove links point at `networkUrl`. */
+export async function adminRunCreatorIndexOutreach(
+  networkUrl: string,
+  opts: { dryRun: boolean; limit: number },
+): Promise<CreatorIndexOutreachPreview | { started: true }> {
+  return callNetworkAdmin(
+    networkUrl,
+    'POST',
+    '/admin/creator-index/outreach/run',
+    { dryRun: opts.dryRun, limit: opts.limit, publicUrl: networkUrl },
+    {},
+    // A dry run reads every listed creator, and the page each address in
+    // the batch came from.
+    90_000,
+  );
+}
+
+/** How the outreach email looks: the shared layout with a button and a
+ *  screenshot, or a person's plain mail. */
+export const OUTREACH_STYLES = ['designed', 'plain'] as const;
+export type OutreachStyle = (typeof OUTREACH_STYLES)[number];
+
+export interface CreatorIndexOutreachSample {
+  sender: string | null;
+  senderName: string | null;
+  /** Absent from a Network that predates the styles. */
+  style?: OutreachStyle;
+  subject: string;
+  sent: string[];
+  /** maybeSent: the mailbox may have taken it, so it may still arrive. */
+  failed: Array<{ to: string; error: string; maybeSent: boolean }>;
+}
+
+/** The outreach email (§5.5) to each of `to`, one message apiece, for a
+ *  seed test: about a made-up creator, with links that open nothing, and
+ *  counted nowhere. In `style`, else the one batches send. 409s with
+ *  mailer_not_configured or already_running, 429 with rate_limited. */
+export async function adminSendCreatorIndexOutreachSample(networkUrl: string, to: string[], style?: OutreachStyle): Promise<CreatorIndexOutreachSample> {
+  return callNetworkAdmin(
+    networkUrl,
+    'POST',
+    '/admin/creator-index/outreach/sample',
+    { to, ...(style ? { style } : {}), publicUrl: networkUrl },
+    {},
+    // Up to 20 messages, which the outreach mailer spaces a few seconds apart.
+    120_000,
+  );
+}
+
 /** Send one creator their next reminder now. Throws NetworkAdminError with
  *  `code` profile_complete | opted_out | not_eligible | email_unverified |
  *  max_reminders_sent | not_found when it can't. */
@@ -1128,8 +1844,19 @@ export async function adminRestoreVendor(networkUrl: string, vendorId: string): 
 // Used by openpartner partner-role routes (/api/network/partner/*) to
 // forward calls to Network's existing /creators/me/* + /offerings + /vendors/:id
 // endpoints. Auth is the vendor bearer plus an x-act-as-vendor-partner
-// header carrying the partner's vendor-local id; Network's requireCreator
-// resolves the creator from VendorAffiliation(vendorId, vendorPartnerId).
+// header carrying the partner's vendor-local id; the Network's
+// requireCreatorOrActingVendor resolves the creator from
+// VendorAffiliation(vendorId, vendorPartnerId). It accepts the header only
+// on the acting-as-creator routes below (its ACTING_VENDOR_ROUTES), so one
+// added here needs a matching entry on the Network side.
+//
+// The Network scopes what it returns to this brand (openpartner-network#28):
+// affiliations, their earnings, requests and cancel only see this brand's
+// own rows, and another brand's affiliation or request id is 404. Apply
+// takes any brand's offering, so Discover still works, but a 409
+// request_already_exists on another brand's offering carries no requestId
+// or status. The partner sees everything across brands in their own
+// Network portal (the hosted app's /creator/* pages).
 
 export const partnerProxy = {
   // Discovery (public on Network — no acting header needed)
@@ -1214,6 +1941,16 @@ export const partnerProxy = {
       actingVendorPartnerId: vendorPartnerId,
       rawContentType: contentType,
     }),
+  // The cover from the partner's verified YouTube banner, kept in step by the Network.
+  useMyYouTubeBanner: (db: Knex, tenantId: string, vendorPartnerId: string) =>
+    callNetwork<{ coverImageUrl: string; coverSource: { platform: 'youtube'; url: string } | null }>(
+      db,
+      tenantId,
+      'POST',
+      '/creators/me/cover/youtube',
+      {},
+      { actingVendorPartnerId: vendorPartnerId },
+    ),
 };
 
 // ---------- Network-originated payouts reporting ----------
@@ -1346,7 +2083,8 @@ export async function reportNetworkPayoutsToNetwork(
 // count feels live to brand admins, infrequent enough to be polite to
 // the Network. Also opportunistically fired by `/admin/network/me` so a
 // brand admin who just landed on the page after a partner was added
-// sees fresh data on the next request.
+// sees fresh data on the next request, and after a logo upload or a
+// Brand info save so the listing picks up the new logo or name.
 //
 // Counting: non-revoked Partners. lastEventAt is the most recent Event
 // timestamp (any kind), giving the Network signal even from tenants
@@ -1357,6 +2095,11 @@ export interface HeartbeatResult {
   partnerCount: number;
   reason?: string;
 }
+
+/** The Network's cap on Vendor.displayName (signup and heartbeat alike). */
+const NETWORK_DISPLAY_NAME_MAX = 120;
+/** Tenant.displayName of the self-host seed row (migration 20260507000000). */
+const SEEDED_TENANT_NAME = 'Default tenant';
 
 export async function sendHeartbeat(db: Knex, tenantId: string): Promise<HeartbeatResult> {
   // White-label tenants are isolated — suppress the liveness heartbeat so
@@ -1425,6 +2168,44 @@ export async function sendHeartbeat(db: Knex, tenantId: string): Promise<Heartbe
     console.warn('[network-client] tenant logoUrl read failed; skipping logo propagation', err);
   }
 
+  // The brand name the portal shows (brand-name.ts), so a rename under
+  // Brand info reaches the listing. Left out when there's nothing worth
+  // sending: the self-host seed row's placeholder would overwrite the name
+  // the admin gave at connect, and a name over the Network's cap would fail
+  // the whole heartbeat. Best-effort, like the logo.
+  let displayName: string | null = null;
+  try {
+    const name = (await resolveBrandName(db, tenantId))?.trim();
+    if (name && name !== SEEDED_TENANT_NAME && name.length <= NETWORK_DISPLAY_NAME_MAX) displayName = name;
+  } catch (err) {
+    console.warn('[network-client] brand name read failed; skipping it', err);
+  }
+
+  // The booking fee rate the brand's plan gives it (booking-fee.ts), so the
+  // Network can show it before the brand pays. Best-effort, like the logo.
+  let bookingFeeBps: number | null = null;
+  try {
+    bookingFeeBps = await bookingFeeBpsFor(db, tenantId);
+  } catch (err) {
+    console.warn('[network-client] booking fee rate read failed; skipping it', err);
+  }
+
+  // A self-hosted router can run on its own origin (Settings → Router URL),
+  // which the Network can't derive from instanceUrl. Sent so the share
+  // URLs it hands creators point there; null clears one the brand removed.
+  // Hosted brands use the platform's router and send nothing. Best-effort,
+  // like the logo.
+  const selfHosted = getTenancyMode() === 'single';
+  let routerUrl: string | null | undefined;
+  if (selfHosted) {
+    try {
+      const row = (await db(TABLES.Config).where({ tenantId, key: 'program_settings' }).first('value')) as { value: unknown } | undefined;
+      routerUrl = ((row?.value ?? {}) as { routerUrl?: string | null }).routerUrl ?? null;
+    } catch (err) {
+      console.warn('[network-client] router URL read failed; skipping it', err);
+    }
+  }
+
   const url = `${m.networkUrl.replace(/\/$/, '')}/vendors/me/heartbeat`;
   try {
     const res = await fetch(url, {
@@ -1438,6 +2219,9 @@ export async function sendHeartbeat(db: Knex, tenantId: string): Promise<Heartbe
         partnerCount,
         ...(lastEventAt ? { lastEventAt } : {}),
         logoUrl,
+        ...(displayName ? { displayName } : {}),
+        ...(bookingFeeBps != null ? { bookingFeeBps } : {}),
+        ...(routerUrl !== undefined ? { routerUrl } : {}),
       }),
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
     });

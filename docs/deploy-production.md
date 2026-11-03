@@ -9,7 +9,7 @@ plus matching Stripe live-mode setup. Reading time ~10 min, end-to-end execution
 
 ## What you'll provision
 
-- 1 DO App Platform app with three components: api (Express), router (Hono), portal (static SPA)
+- 1 DO App Platform app with three components: api (Express), router (Hono), portal (SPA on nginx)
 - 1 DO Managed Postgres (production tier, daily backups)
 - 1 set of live-mode Stripe products + prices + meters
 - 2 Stripe webhook destinations (platform + connect events)
@@ -110,6 +110,11 @@ For the **router** component, set:
 | Variable | Value |
 | --- | --- |
 | `COOKIE_DOMAIN` | `.openpartner.dev` (leading dot — covers subdomains) |
+
+Both the api and the router also need `TRUST_PROXY=cloudflare` (plain, not
+encrypted; `.do/app.yaml` has it). App Platform puts Cloudflare in front of
+its ingress, so without it every visitor's IP is a Cloudflare edge address:
+rate limits, country checks and click velocity all key on the edge.
 
 Click **Save** and let DO redeploy.
 
@@ -229,9 +234,9 @@ self-host mode to hosted multi-tenant mode:
 
 - **URL routing.** Tenant-scoped routes live under `/t/<slug>/...`.
   Set `app.openpartner.dev` to the api component and the portal SPA
-  reads the slug from `location.pathname`. The catch-all rewrite in
-  `static_sites.catchall_document` keeps SPA routing working under any
-  `/t/<slug>/...` path.
+  reads the slug from `location.pathname`. The portal's nginx falls back
+  to `index.html` for any path that isn't a file, which keeps SPA routing
+  working under any `/t/<slug>/...` path.
 - **Tenant provisioning.** Public `POST /signup` creates a tenant +
   first admin and emails the magic link. No payment gate at v1; add
   one downstream of `/signup` if you want to require a card on file
@@ -302,6 +307,44 @@ Single-tenant self-host (`OPENPARTNER_TENANCY=single`, the default) skips
 the check. With one tenant there is nothing to isolate, so it can run
 entirely as the migration role.
 
+### Portal frame protection
+
+No site may frame the portal. A framed sign-in or magic-link page can be
+hidden under a decoy and clicked through (clickjacking). Nothing embeds the
+portal: the Stripe App links to it in a new tab, and the portal's own
+iframes are outbound video players.
+
+- **Docker (self-host).** The portal's nginx sends
+  `Content-Security-Policy: frame-ancestors 'none'` and
+  `X-Frame-Options: DENY` on every HTML response
+  (`apps/portal/nginx.conf.template`), and Caddy passes them through. CI
+  checks this with `node scripts/test-portal-proxy.mjs`. On a running
+  deploy:
+
+  ```bash
+  curl -sI https://partners.example.com/t/default/login | grep -iE 'content-security-policy|x-frame-options'
+  ```
+
+- **App Platform (hosted).** `.do/app.yaml` runs the portal as a service
+  built from `apps/portal/Dockerfile`, so the same nginx sends the headers
+  on `app.openpartner.dev` and on every white-label domain, which all reach
+  the portal through the same ingress rule. Run the `curl` above against
+  each.
+
+  An app created before October 2026 has the portal as a **static site**,
+  which can't send response headers. The app spec has no field for them,
+  and the Cloudflare edge in front of the app belongs to DigitalOcean, so
+  there is no zone to add a transform rule to. A `<meta>` tag doesn't help
+  either: browsers ignore `frame-ancestors` and `X-Frame-Options` there.
+  Move it to a service with
+  [`docs/portal-service-runbook.md`](portal-service-runbook.md), which
+  adds a basic-xxs instance (about $5 a month).
+
+Behind the headers, the SPA checks for itself: inside a frame it mounts
+nothing and shows a "can't be shown inside another website" notice
+(`apps/portal/src/lib/frame-guard.ts`). That is what protects a static-site
+portal, and it covers any other host that drops the headers.
+
 ### Scheduled jobs
 
 The api process runs an in-process scheduler (`OPENPARTNER_ENABLE_SCHEDULER=1`):
@@ -355,9 +398,9 @@ deploy rollback is not configured.
 | --- | --- | --- |
 | api (basic-xs) | 1 instance | ~$12 |
 | router (basic-xxs) | 1 instance | ~$5 |
-| portal (static site) | included | $0 |
+| portal (basic-xxs) | 1 instance | ~$5 |
 | Postgres (production tier) | basic 1GB | ~$15 |
-| **Total** | | **~$32** |
+| **Total** | | **~$37** |
 
 Scales to ~3-5x at meaningful traffic.
 

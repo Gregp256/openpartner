@@ -6,6 +6,8 @@ import { Button, Card, ErrorBanner, Input, Label, Select, Textarea } from '../ui
 import { alpha, theme } from '../theme.js';
 import { useIsMobile } from './useMediaQuery.js';
 import { VerifiedBadge } from './VerifiedBadge.js';
+import { CoverSourceLink, type CoverSource } from './PlatformMark.js';
+import { useUnsavedChanges } from './useUnsavedChanges.js';
 
 /**
  * The Network profile editor: completeness checklist, basics, audience,
@@ -25,6 +27,9 @@ export interface NetworkProfileAdapter {
   /** The banner on the public profile and the marketplace storefront card.
    *  Absent → no cover field, and saves never send coverImageUrl. */
   uploadCover?: (file: File) => Promise<{ coverImageUrl: string }>;
+  /** Make the cover a copy of the verified YouTube channel's banner, which
+   *  the Network keeps in step with YouTube. Absent → no button. */
+  copyYouTubeBanner?: () => Promise<{ coverImageUrl: string; coverSource: CoverSource | null }>;
   listPlatforms: () => Promise<{ platforms: PlatformRow[] }>;
   putPlatform: (
     platform: Platform,
@@ -47,6 +52,9 @@ export interface NetworkProfile {
   avatarUrl: string | null;
   /** Absent on a Network that predates covers. */
   coverImageUrl?: string | null;
+  /** Set while the cover is a copy of their YouTube banner. Absent on a
+   *  Network that predates it. */
+  coverSource?: CoverSource | null;
   bio: string | null;
   profile: Record<string, unknown> | null;
   categories: string[];
@@ -67,7 +75,24 @@ export interface NetworkProfile {
 /** Minimum bio length the Network's discovery bar requires. */
 const MIN_BIO_LENGTH = 40;
 
-export type Platform = 'tiktok' | 'instagram' | 'youtube' | 'twitter' | 'linkedin' | 'substack' | 'twitch' | 'podcast' | 'website';
+export type Platform =
+  | 'tiktok'
+  | 'instagram'
+  | 'youtube'
+  | 'twitter'
+  | 'threads'
+  | 'bluesky'
+  | 'linkedin'
+  | 'facebook'
+  | 'pinterest'
+  | 'snapchat'
+  | 'substack'
+  | 'newsletter'
+  | 'podcast'
+  | 'twitch'
+  | 'reddit'
+  | 'discord'
+  | 'website';
 
 export interface PlatformRow {
   id: string;
@@ -92,11 +117,13 @@ export interface VerificationStart {
   expiresAt: string;
   instructions:
     | { kind: 'youtube_description'; editUrl: string; channelUrl: string | null; text: string }
-    | { kind: 'dns_txt'; host: string; type: 'TXT'; value: string };
+    | { kind: 'dns_txt'; host: string; type: 'TXT'; value: string }
+    | { kind: 'profile_bio'; platform: 'instagram' | 'tiktok'; editUrl: string; profileUrl: string; text: string };
 }
 
-/** Platforms the Network can verify today. TikTok and Instagram follow via OAuth. */
-const VERIFIABLE: ReadonlySet<Platform> = new Set<Platform>(['youtube', 'website']);
+/** Platforms the Network can verify today: a code in the YouTube channel
+ *  description or the Instagram or TikTok bio, or a DNS record. */
+export const VERIFIABLE: ReadonlySet<Platform> = new Set<Platform>(['youtube', 'website', 'instagram', 'tiktok']);
 
 // Curated category list — covers the most-searched niches across
 // existing creator marketplaces. Brands filter on these in Tier 3.
@@ -109,15 +136,24 @@ const CATEGORIES = [
 
 const AGE_RANGES: AgeRange[] = ['13-17', '18-24', '25-34', '35-44', '45-54', '55+'];
 
-const PLATFORMS: { kind: Platform; label: string; placeholder: string }[] = [
+/** Every platform a creator can list, in the order the editors show them. */
+export const PLATFORMS: { kind: Platform; label: string; placeholder: string }[] = [
   { kind: 'tiktok', label: 'TikTok', placeholder: 'your-handle' },
   { kind: 'instagram', label: 'Instagram', placeholder: 'your-handle' },
   { kind: 'youtube', label: 'YouTube', placeholder: 'your-handle' },
   { kind: 'twitter', label: 'X / Twitter', placeholder: 'your-handle' },
+  { kind: 'threads', label: 'Threads', placeholder: 'your-handle' },
+  { kind: 'bluesky', label: 'Bluesky', placeholder: 'you.bsky.social' },
   { kind: 'linkedin', label: 'LinkedIn', placeholder: 'your-handle' },
+  { kind: 'facebook', label: 'Facebook', placeholder: 'your-page' },
+  { kind: 'pinterest', label: 'Pinterest', placeholder: 'your-handle' },
+  { kind: 'snapchat', label: 'Snapchat', placeholder: 'your-username' },
   { kind: 'substack', label: 'Substack', placeholder: 'subdomain' },
-  { kind: 'twitch', label: 'Twitch', placeholder: 'your-handle' },
+  { kind: 'newsletter', label: 'Newsletter', placeholder: 'yourname.beehiiv.com' },
   { kind: 'podcast', label: 'Podcast', placeholder: 'https://feeds…' },
+  { kind: 'twitch', label: 'Twitch', placeholder: 'your-handle' },
+  { kind: 'reddit', label: 'Reddit', placeholder: 'r/community or u/username' },
+  { kind: 'discord', label: 'Discord', placeholder: 'https://discord.gg/…' },
   { kind: 'website', label: 'Website', placeholder: 'https://…' },
 ];
 
@@ -136,6 +172,8 @@ export function NetworkProfileEditor({
   const [handle, setHandle] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
   const [coverImageUrl, setCoverImageUrl] = useState('');
+  const [coverSource, setCoverSource] = useState<CoverSource | null>(null);
+  const [coverBusy, setCoverBusy] = useState(false);
   const [bio, setBio] = useState('');
   const [categories, setCategories] = useState<string[]>([]);
   // Audience locations is kept as a raw text string while the user is
@@ -150,22 +188,38 @@ export function NetworkProfileEditor({
 
   useEffect(() => {
     if (data) {
-      setName(data.name ?? '');
-      setHandle(data.handle ?? '');
-      setAvatarUrl(data.avatarUrl ?? '');
-      setCoverImageUrl(data.coverImageUrl ?? '');
-      setBio(data.bio ?? '');
-      setCategories(data.categories ?? []);
-      setAudienceLocationsRaw((data.audienceLocations ?? []).join(', '));
-      setAudienceAgeRange((data.audienceAgeRange ?? '') as AgeRange | '');
-      setAudienceSize((data.audienceSize ?? '') as AudienceSize | '');
-      setPortfolioLinks(data.portfolioLinks ?? []);
-      setPastBrandsRaw((data.pastBrands ?? []).join(', '));
+      const saved = formFromProfile(data);
+      setName(saved.name);
+      setHandle(saved.handle);
+      setAvatarUrl(saved.avatarUrl);
+      setCoverImageUrl(saved.coverImageUrl);
+      setCoverSource(data.coverSource ?? null);
+      setBio(saved.bio);
+      setCategories(saved.categories);
+      setAudienceLocationsRaw(saved.audienceLocationsRaw);
+      setAudienceAgeRange(saved.audienceAgeRange);
+      setAudienceSize(saved.audienceSize);
+      setPortfolioLinks(saved.portfolioLinks);
+      setPastBrandsRaw(saved.pastBrandsRaw);
     }
   }, [data]);
 
+  const dirty =
+    formKey({ name, handle, avatarUrl, coverImageUrl, bio, categories, audienceLocationsRaw, audienceAgeRange, audienceSize, portfolioLinks, pastBrandsRaw }) !==
+    formKey(formFromProfile(data));
+  useUnsavedChanges(dirty);
+
   // Covers need the adapter's upload and a Network that knows the field.
   const coverUpload = data && 'coverImageUrl' in data ? adapter.uploadCover : undefined;
+  // The YouTube banner needs a verified channel (the platforms card's list).
+  const platforms = useQuery({
+    queryKey: adapter.platformsKey,
+    queryFn: () => adapter.listPlatforms(),
+    retry: false,
+    enabled: !!adapter.copyYouTubeBanner,
+  });
+  const youtubeVerified = !!platforms.data?.platforms.some((p) => p.platform === 'youtube' && p.verified);
+  const copyYouTubeBanner = youtubeVerified && data && 'coverSource' in data ? adapter.copyYouTubeBanner : undefined;
 
   const save = useMutation({
     mutationFn: () => {
@@ -224,7 +278,19 @@ export function NetworkProfileEditor({
               label="Cover image (optional)"
               hint="A wide banner across the top of your public profile and your marketplace storefront card. 1500×500 (3:1) works best. Without one, the banner is made from your photo."
             >
-              <CoverUploader value={coverImageUrl} onChange={setCoverImageUrl} avatarUrl={avatarUrl} upload={coverUpload} />
+              <CoverUploader
+                value={coverImageUrl}
+                source={coverSource}
+                onChange={(url, source = null) => {
+                  setCoverImageUrl(url);
+                  setCoverSource(source);
+                }}
+                avatarUrl={avatarUrl}
+                upload={coverUpload}
+                fromYouTube={copyYouTubeBanner}
+                saving={save.isPending}
+                onBusyChange={setCoverBusy}
+              />
             </Field>
           )}
           <Field
@@ -309,8 +375,8 @@ export function NetworkProfileEditor({
 
       <Card>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <Button onClick={() => save.mutate()} disabled={save.isPending}>
-            {save.isPending ? 'Saving…' : save.isSuccess ? 'Saved' : 'Save profile'}
+          <Button onClick={() => save.mutate()} disabled={save.isPending || coverBusy}>
+            {save.isPending ? 'Saving…' : save.isSuccess && !dirty ? 'Saved' : 'Save profile'}
           </Button>
           {publicProfileHref && (
             <a
@@ -326,6 +392,34 @@ export function NetworkProfileEditor({
       </Card>
     </>
   );
+}
+
+type ProfileForm = ReturnType<typeof formFromProfile>;
+
+/** The editor's fields as the saved profile fills them. */
+function formFromProfile(p: NetworkProfile) {
+  return {
+    name: p.name ?? '',
+    handle: p.handle ?? '',
+    avatarUrl: p.avatarUrl ?? '',
+    coverImageUrl: p.coverImageUrl ?? '',
+    bio: p.bio ?? '',
+    categories: p.categories ?? [],
+    audienceLocationsRaw: (p.audienceLocations ?? []).join(', '),
+    audienceAgeRange: (p.audienceAgeRange ?? '') as AgeRange | '',
+    audienceSize: (p.audienceSize ?? '') as AudienceSize | '',
+    portfolioLinks: p.portfolioLinks ?? [],
+    pastBrandsRaw: (p.pastBrands ?? []).join(', '),
+  };
+}
+
+/** Equal keys, nothing to save: category order and blank link rows don't count. */
+function formKey(f: ProfileForm): string {
+  return JSON.stringify({
+    ...f,
+    categories: [...f.categories].sort(),
+    portfolioLinks: f.portfolioLinks.filter((u) => u.trim()),
+  });
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -436,14 +530,28 @@ function AvatarUploader({
 
 function CoverUploader({
   value,
+  source,
   onChange,
   avatarUrl,
   upload: uploadCover,
+  fromYouTube,
+  saving,
+  onBusyChange,
 }: {
   value: string;
-  onChange: (v: string) => void;
+  /** Set while the cover is a copy of their YouTube banner. */
+  source: CoverSource | null;
+  onChange: (v: string, source?: CoverSource | null) => void;
   avatarUrl: string;
   upload: NonNullable<NetworkProfileAdapter['uploadCover']>;
+  /** Present when they can use their verified YouTube channel's banner. */
+  fromYouTube?: NetworkProfileAdapter['copyYouTubeBanner'];
+  /** The page is saving: the cover waits, so a save can't remove a cover
+   *  that arrives meanwhile. */
+  saving: boolean;
+  /** An upload or the YouTube banner is on its way: the page holds Save,
+   *  so the answer can't land after a later change. */
+  onBusyChange: (busy: boolean) => void;
 }) {
   const [error, setError] = useState<string | null>(null);
   const upload = useMutation({
@@ -454,6 +562,20 @@ function CoverUploader({
     },
     onError: (err) => setError(err instanceof Error ? err.message : 'upload failed'),
   });
+  const youtube = useMutation({
+    mutationFn: () => fromYouTube!(),
+    onSuccess: (r) => {
+      setError(null);
+      onChange(r.coverImageUrl, r.coverSource);
+    },
+    onError: (err) => {
+      const detail = networkErrorBody(err)?.detail;
+      setError(typeof detail === 'string' ? detail : err instanceof Error ? err.message : 'Couldn’t use your YouTube banner.');
+    },
+  });
+  const pending = upload.isPending || youtube.isPending;
+  useEffect(() => onBusyChange(pending), [pending, onBusyChange]);
+  const busy = pending || saving;
 
   const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -470,7 +592,6 @@ function CoverUploader({
     <div>
       {/* Preview: the cover, else the wash the marketplace makes from the photo. */}
       <div
-        aria-hidden
         style={{
           position: 'relative',
           maxWidth: 480,
@@ -500,6 +621,7 @@ function CoverUploader({
             }}
           />
         ) : null}
+        {value && source && <CoverSourceLink source={source} />}
       </div>
       <label>
         <input
@@ -507,28 +629,22 @@ function CoverUploader({
           accept="image/jpeg,image/png,image/webp"
           onChange={onPick}
           style={{ display: 'none' }}
-          disabled={upload.isPending}
+          disabled={busy}
         />
-        <span
-          style={{
-            display: 'inline-block',
-            padding: '6px 12px',
-            background: theme.surface,
-            border: `1px solid ${theme.border}`,
-            borderRadius: theme.radiusSm,
-            fontSize: 13,
-            color: theme.text,
-            cursor: upload.isPending ? 'wait' : 'pointer',
-            opacity: upload.isPending ? 0.6 : 1,
-          }}
-        >
-          {upload.isPending ? 'Uploading…' : value ? 'Replace' : 'Upload'}
-        </span>
+        <span style={pickerStyle(busy)}>{upload.isPending ? 'Uploading…' : value ? 'Replace' : 'Upload'}</span>
       </label>
+      {fromYouTube && !source && (
+        <button type="button" onClick={() => youtube.mutate()} disabled={busy} style={{ ...pickerStyle(busy), marginLeft: 8 }}>
+          {youtube.isPending ? 'Getting banner…' : 'Use my YouTube banner'}
+        </button>
+      )}
       {value && (
         <button
           onClick={() => onChange('')}
-          style={{ marginLeft: 8, background: 'transparent', border: 'none', color: theme.textMuted, fontSize: 12, cursor: 'pointer' }}
+          disabled={busy}
+          // YouTube's policies: removing our copy must say it leaves theirs.
+          title={source ? 'Removes it here. Your YouTube banner stays.' : undefined}
+          style={{ marginLeft: 8, background: 'transparent', border: 'none', color: theme.textMuted, fontSize: 12, cursor: busy ? 'wait' : 'pointer' }}
         >
           Remove
         </button>
@@ -537,6 +653,22 @@ function CoverUploader({
       {error && <p style={{ fontSize: 12, color: theme.danger, margin: '4px 0 0' }}>{error}</p>}
     </div>
   );
+}
+
+/** The cover's Upload / Replace and YouTube banner controls. */
+function pickerStyle(busy: boolean): React.CSSProperties {
+  return {
+    display: 'inline-block',
+    padding: '6px 12px',
+    background: theme.surface,
+    border: `1px solid ${theme.border}`,
+    borderRadius: theme.radiusSm,
+    fontSize: 13,
+    fontFamily: 'inherit',
+    color: theme.text,
+    cursor: busy ? 'wait' : 'pointer',
+    opacity: busy ? 0.6 : 1,
+  };
 }
 
 function CategoryChips({ selected, onChange }: { selected: string[]; onChange: (v: string[]) => void }) {
@@ -701,6 +833,14 @@ export function PlatformsCard({ adapter }: { adapter: NetworkProfileAdapter }) {
     queryFn: () => adapter.listPlatforms(),
     retry: false,
   });
+  const rows = list.data?.platforms ?? [];
+  const added = PLATFORMS.filter((p) => rows.some((r) => r.platform === p.kind));
+  const remaining = PLATFORMS.filter((p) => !rows.some((r) => r.platform === p.kind));
+  const onChanged = () => {
+    void qc.invalidateQueries({ queryKey: adapter.platformsKey });
+    // Platforms count toward the discovery checklist.
+    void qc.invalidateQueries({ queryKey: adapter.profileKey });
+  };
 
   return (
     <Card>
@@ -715,27 +855,55 @@ export function PlatformsCard({ adapter }: { adapter: NetworkProfileAdapter }) {
         <p style={{ color: theme.textMuted, fontSize: 13 }}>Loading…</p>
       ) : (
         <div style={{ display: 'grid', gap: 10 }}>
-          {PLATFORMS.map((p) => {
-            const existing = list.data?.platforms.find((r) => r.platform === p.kind);
-            return (
-              <PlatformRowEditor
-                key={p.kind}
-                adapter={adapter}
-                platform={p.kind}
-                label={p.label}
-                placeholder={p.placeholder}
-                existing={existing}
-                onChanged={() => {
-                  void qc.invalidateQueries({ queryKey: adapter.platformsKey });
-                  // Platforms count toward the discovery checklist.
-                  void qc.invalidateQueries({ queryKey: adapter.profileKey });
-                }}
-              />
-            );
-          })}
+          {added.map((p) => (
+            <PlatformRowEditor
+              key={p.kind}
+              adapter={adapter}
+              platform={p.kind}
+              label={p.label}
+              placeholder={p.placeholder}
+              existing={rows.find((r) => r.platform === p.kind)}
+              onChanged={onChanged}
+            />
+          ))}
+          {remaining.length > 0 && <AddPlatformRow adapter={adapter} remaining={remaining} onChanged={onChanged} />}
         </div>
       )}
     </Card>
+  );
+}
+
+/** One row for a platform not listed yet: pick it, then the same fields.
+ *  Once added, the platform moves up into a row of its own. */
+function AddPlatformRow({
+  adapter,
+  remaining,
+  onChanged,
+}: {
+  adapter: NetworkProfileAdapter;
+  remaining: typeof PLATFORMS;
+  onChanged: () => void;
+}) {
+  const [kind, setKind] = useState<Platform>(remaining[0]!.kind);
+  const current = remaining.find((p) => p.kind === kind) ?? remaining[0]!;
+  return (
+    <PlatformRowEditor
+      key={current.kind}
+      adapter={adapter}
+      platform={current.kind}
+      label={current.label}
+      placeholder={current.placeholder}
+      onChanged={onChanged}
+      picker={
+        <Select aria-label="Platform to add" value={current.kind} onChange={(e) => setKind(e.target.value as Platform)}>
+          {remaining.map((p) => (
+            <option key={p.kind} value={p.kind}>
+              {p.label}
+            </option>
+          ))}
+        </Select>
+      }
+    />
   );
 }
 
@@ -746,6 +914,7 @@ function PlatformRowEditor({
   placeholder,
   existing,
   onChanged,
+  picker,
 }: {
   adapter: NetworkProfileAdapter;
   platform: Platform;
@@ -753,6 +922,8 @@ function PlatformRowEditor({
   placeholder: string;
   existing?: PlatformRow;
   onChanged: () => void;
+  /** In place of the label: the add row's platform picker. */
+  picker?: ReactNode;
 }) {
   const [handle, setHandle] = useState(existing?.handle ?? '');
   const [followerCount, setFollowerCount] = useState<number | ''>(existing?.followerCount ?? '');
@@ -775,7 +946,12 @@ function PlatformRowEditor({
         ...(existing?.profileUrl && nextHandle === existing.handle ? { profileUrl: existing.profileUrl } : {}),
       });
     },
-    onSuccess: onChanged,
+    onSuccess: (saved) => {
+      // A pasted profile link is saved as its handle.
+      const savedHandle = (saved as Partial<PlatformRow> | null)?.handle;
+      if (typeof savedHandle === 'string') setHandle(savedHandle);
+      onChanged();
+    },
   });
   const remove = useMutation({
     mutationFn: () => adapter.deletePlatform(platform),
@@ -783,11 +959,12 @@ function PlatformRowEditor({
   });
 
   const dirty = handle.trim() !== (existing?.handle ?? '') || (followerCount === '' ? null : Number(followerCount)) !== (existing?.followerCount ?? null);
+  useUnsavedChanges(dirty);
   const canVerify = !!existing && !existing.verified && VERIFIABLE.has(platform) && !!adapter.startVerification && !!adapter.checkVerification;
 
   return (
-    <div className="op-grid-collapse" style={{ display: 'grid', gridTemplateColumns: '110px 1fr 140px auto', gap: 8, alignItems: 'center' }}>
-      <div style={{ fontSize: 13, color: theme.text }}>{label}</div>
+    <div className="op-grid-collapse" style={{ display: 'grid', gridTemplateColumns: '140px 1fr 140px auto', gap: 8, alignItems: 'center' }}>
+      {picker ?? <div style={{ fontSize: 13, color: theme.text }}>{label}</div>}
       <Input value={handle} onChange={(e) => setHandle(e.target.value)} placeholder={placeholder} style={{ fontFamily: theme.fontMono, fontSize: 13 }} />
       <Input
         type="number"
@@ -797,7 +974,13 @@ function PlatformRowEditor({
         placeholder="followers"
         // Synced from the platform: the Network ignores typed counts.
         disabled={!!existing?.followerCountSynced}
-        title={existing?.followerCountSynced ? `Synced from ${label}` : undefined}
+        title={
+          existing?.followerCountSynced
+            ? platform === 'instagram' || platform === 'tiktok'
+              ? 'From your public profile'
+              : `Synced from ${label}`
+            : undefined
+        }
         style={{ fontSize: 13 }}
       />
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -829,6 +1012,11 @@ function PlatformRowEditor({
           </Button>
         )}
       </div>
+      {save.error && (
+        <p role="alert" style={{ gridColumn: '1 / -1', fontSize: 12, color: theme.danger, margin: 0 }}>
+          {platformSaveError(save.error, label)}
+        </p>
+      )}
       {verifying && existing && (
         <VerifyAccountDialog
           adapter={adapter}
@@ -851,7 +1039,7 @@ function PlatformRowEditor({
  * to check. The Network does the lookup; the code stays valid for 24h and
  * reopening the dialog shows the same one.
  */
-function VerifyAccountDialog({
+export function VerifyAccountDialog({
   adapter,
   platform,
   label,
@@ -889,9 +1077,13 @@ function VerifyAccountDialog({
   const data = start.data;
   const youtube = data?.instructions.kind === 'youtube_description' ? data.instructions : null;
   const dns = data?.instructions.kind === 'dns_txt' ? data.instructions : null;
+  const bio = data?.instructions.kind === 'profile_bio' ? data.instructions : null;
+  // A code to paste somewhere visible, rather than a DNS record.
+  const pasted = !!(youtube || bio);
+  const social = platform === 'instagram' || platform === 'tiktok';
   const checkError = check.error ? verificationError(check.error) : null;
   const startError = start.error ? verificationError(start.error) : null;
-  const title = platform === 'youtube' ? 'Verify YouTube account' : `Verify ${label.toLowerCase()}`;
+  const title = platform === 'youtube' || social ? `Verify ${label} account` : `Verify ${label.toLowerCase()}`;
 
   return (
     <div
@@ -940,7 +1132,9 @@ function VerifyAccountDialog({
             <div style={{ background: theme.successSoft, border: `1px solid ${alpha(theme.success, 0.333)}`, borderRadius: theme.radiusSm, padding: 12, fontSize: 13, color: theme.success, marginBottom: 14 }}>
               {platform === 'youtube'
                 ? 'Your YouTube account is verified. You can remove the code from your channel description now.'
-                : 'Your website is verified. You can remove the TXT record now.'}
+                : social
+                  ? `Your ${label} account is verified. You can remove the code from your bio now.`
+                  : 'Your website is verified. You can remove the TXT record now.'}
             </div>
             <Button onClick={onClose}>Done</Button>
           </>
@@ -953,8 +1147,8 @@ function VerifyAccountDialog({
           </>
         ) : data ? (
           <div style={{ display: 'grid', gap: 16 }}>
-            <VerifyStep n={1} title={youtube ? 'Copy your code' : 'Copy the TXT record value'}>
-              <CopyBox value={youtube ? data.code : dns!.value} large={!!youtube} />
+            <VerifyStep n={1} title={pasted ? 'Copy your code' : 'Copy the TXT record value'}>
+              <CopyBox value={pasted ? data.code : dns!.value} large={pasted} />
               <div style={{ fontSize: 12, color: theme.textDim, marginTop: 6 }}>
                 Valid until {new Date(data.expiresAt).toLocaleString()}.
               </div>
@@ -971,6 +1165,13 @@ function VerifyAccountDialog({
                   {youtube.channelUrl && <ExternalButton href={youtube.channelUrl}>View channel</ExternalButton>}
                 </div>
               </VerifyStep>
+            ) : bio ? (
+              <VerifyStep n={2} title="Add it to your bio">
+                <p style={{ fontSize: 13, color: theme.textMuted, margin: '0 0 10px', lineHeight: 1.5 }}>
+                  Paste the code anywhere in your {label} bio and save.
+                </p>
+                <ExternalButton href={bio.editUrl}>Open {label}</ExternalButton>
+              </VerifyStep>
             ) : (
               <VerifyStep n={2} title="Add a TXT record at your DNS provider">
                 <p style={{ fontSize: 13, color: theme.textMuted, margin: 0, lineHeight: 1.5 }}>
@@ -985,7 +1186,9 @@ function VerifyAccountDialog({
               <p style={{ fontSize: 13, color: theme.textMuted, margin: '0 0 10px', lineHeight: 1.5 }}>
                 {youtube
                   ? 'Once the description is published, check it here. YouTube can take a minute to show the change.'
-                  : 'Once the record is saved, check it here. DNS changes can take a few minutes to appear.'}
+                  : bio
+                    ? `Once your bio is saved, check it here. ${label} can take a minute to show the change.`
+                    : 'Once the record is saved, check it here. DNS changes can take a few minutes to appear.'}
               </p>
               {checkError && <ErrorBanner error={checkError.message} />}
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -1114,11 +1317,11 @@ function ExternalButton({ href, children }: { href: string; children: ReactNode 
 }
 
 /**
- * The Network's error code and a sentence for the creator. The creator
- * portal relays the Network body as-is; the brand partner proxy wraps it
- * as `{ error: 'network_call_failed', detail: '<Network JSON>' }`.
+ * The Network's answer behind an error. The creator portal relays the
+ * Network body as-is; the brand partner proxy wraps it as
+ * `{ error: 'network_call_failed', detail: '<Network JSON>' }`.
  */
-function verificationError(err: unknown): { code: string; message: string } {
+function networkErrorBody(err: unknown): Record<string, unknown> | null {
   let body = (err as { detail?: unknown } | null)?.detail as Record<string, unknown> | null | undefined;
   if (body?.error === 'network_call_failed' && typeof body.detail === 'string') {
     try {
@@ -1127,6 +1330,23 @@ function verificationError(err: unknown): { code: string; message: string } {
       /* not JSON: keep the wrapper */
     }
   }
+  return body ?? null;
+}
+
+/** Why the Network refused a platform's handle, for the creator. */
+function platformSaveError(err: unknown, label: string): string {
+  const body = networkErrorBody(err);
+  if (body?.error === 'handle_wrong_platform') {
+    const other = PLATFORMS.find((p) => p.kind === body.platform)?.label;
+    return other ? `That’s a ${other} link, not ${label}.` : `That link isn’t a ${label} profile.`;
+  }
+  if (body?.error === 'invalid_handle') return `Enter your ${label} handle or profile link.`;
+  return err instanceof Error ? err.message : 'Couldn’t save.';
+}
+
+/** The Network's error code and a sentence for the creator. */
+function verificationError(err: unknown): { code: string; message: string } {
+  const body = networkErrorBody(err);
   const code = typeof body?.error === 'string' ? body.error : 'unknown';
   const detail = typeof body?.detail === 'string' ? body.detail : null;
   switch (code) {

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { z } from 'zod';
+import { utcDateTime, z } from '../zod.js';
 import { ulid } from 'ulid';
 import {
   PROGRAM_CATEGORY_SLUGS,
@@ -25,6 +25,8 @@ import { customerRewardDelivery } from '../customer-rewards.js';
 import { getStorage } from '../storage.js';
 import { commissionSlabFields, currencyCodeSchema, refineCommissionSubRule } from '../commission-rule-schema.js';
 import { destinationUrlSchema, destinationWarnings } from '../destination-url.js';
+import { tenantDefaultCurrency } from '../currency.js';
+import { programStats } from '../reporting.js';
 
 /**
  * Commission rule schema. The wire format is an array of triggered sub-rules.
@@ -65,11 +67,33 @@ const legacyRuleSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
+const ruleArraySchema = z.array(subRuleSchema).min(1).max(10);
+const legacyAsArraySchema = legacyRuleSchema.transform((legacy) => [{
+  trigger: 'every' as const,
+  type: legacy.type,
+  value: legacy.value,
+  ...('currency' in legacy && legacy.currency ? { currency: legacy.currency } : {}),
+  ...(legacy.recurring ? { recurring: legacy.recurring } : {}),
+}]);
+
+/** Would zod 3 have abandoned the array form over this issue? It gave up
+ *  on a value of the wrong type or option, and carried on past failed
+ *  checks (a non-integer, a size limit, a refinement). */
+function zod3Abandons(issue: z.core.$ZodIssue): boolean {
+  if (issue.code === 'invalid_type') return issue.expected !== 'int';
+  return issue.code === 'invalid_value' || issue.code === 'invalid_union' || issue.code === 'invalid_key';
+}
+
 // The legacy object shape predates slabs and its schema strips unknown
 // keys, so `{type, value, bands}` used to save as a flat rule — the brand
 // asked for slabs and silently got none. Refuse it and point at the array
-// form instead. (Checked before the union: inside it the strip has already
-// happened.)
+// form instead. (Checked before parsing either form: by then the strip has
+// already happened.)
+//
+// The input's shape picks the form. This was a zod 3 union, which said
+// "Invalid input" for any bad legacy object and for an array it abandoned,
+// and gave an array's own errors otherwise. zod 4's union abandons more (a
+// non-integer, an over-long slab table), so the choice is made here.
 const commissionRuleSchema = z
   .unknown()
   .superRefine((raw, ctx) => {
@@ -80,18 +104,16 @@ const commissionRuleSchema = z
       });
     }
   })
-  .pipe(
-    z.union([
-      z.array(subRuleSchema).min(1).max(10),
-      legacyRuleSchema.transform((legacy) => [{
-        trigger: 'every' as const,
-        type: legacy.type,
-        value: legacy.value,
-        ...('currency' in legacy && legacy.currency ? { currency: legacy.currency } : {}),
-        ...(legacy.recurring ? { recurring: legacy.recurring } : {}),
-      }]),
-    ]),
-  );
+  .transform((raw, ctx) => {
+    const form = Array.isArray(raw) ? ruleArraySchema.safeParse(raw) : legacyAsArraySchema.safeParse(raw);
+    if (form.success) return form.data;
+    if (!Array.isArray(raw) || form.error.issues.some(zod3Abandons)) {
+      ctx.addIssue({ code: 'custom', message: 'Invalid input' });
+    } else {
+      for (const issue of form.error.issues) ctx.addIssue(issue as z.core.$ZodRawIssue);
+    }
+    return z.NEVER;
+  });
 
 /**
  * Customer-side reward (dual-sided). Validated by reward type:
@@ -179,6 +201,19 @@ const revenueEventTypesSchema = z
   )
   .max(20);
 
+/** Two-tier commissions (recruiter-commissions.ts): the share of a
+ *  recruit's commission their recruiter earns, as a percent (10 = 10%).
+ *  Above 0, at most 50, two decimal places. Null = off. */
+const recruiterCommissionPercentSchema = z
+  .number()
+  .gt(0)
+  .max(50)
+  .refine((v) => Math.abs(v * 100 - Math.round(v * 100)) < 1e-9, { message: 'at most two decimal places' });
+
+/** How many months after the recruitment the recruiter keeps earning.
+ *  Null = for as long as the recruit earns. */
+const recruiterCommissionMonthsSchema = z.number().int().min(1).max(120);
+
 /** Stored form: unique, without the two types that are always revenue. */
 function normalizeRevenueEventTypes(types: string[]): string[] {
   return [...new Set(types)].filter((t) => t !== 'invoice_paid' && t !== 'subscription_created');
@@ -198,6 +233,8 @@ export const createSchema = z.object({
    *  recurring sub-rules pay on it, up to recurringMonths. False: every
    *  event is attributed on its own within the window. */
   renewalsStayWithPartner: z.boolean().optional(),
+  /** Link clicks beat this program's coupon codes. Default false. */
+  couponsYieldToLinks: z.boolean().optional(),
   /** Where partner links send visitors. May carry the {click_id} macro
    *  (e.g. a Stripe Payment Link's ?client_reference_id={click_id}); the
    *  router substitutes the click id there instead of appending cref. */
@@ -208,8 +245,8 @@ export const createSchema = z.object({
   /** Holdback before commissions become approvable. Used to align
    *  payouts with refund / trial windows. 0 / omitted = no holdback. */
   holdbackDays: z.number().int().min(0).max(365).optional(),
-  startsAt: z.string().datetime().nullable().optional(),
-  endsAt: z.string().datetime().nullable().optional(),
+  startsAt: utcDateTime().nullable().optional(),
+  endsAt: utcDateTime().nullable().optional(),
   /** Customer-side reward provisioned as a Stripe Coupon + PromotionCode
    *  on every auto-minted Coupon for this campaign. Null/omitted = no
    *  customer-side reward (partner-only program). */
@@ -244,6 +281,12 @@ export const createSchema = z.object({
    *  Their value counts as partner-attributed revenue for the hosted
    *  platform fee. Omitted = none. */
   revenueEventTypes: revenueEventTypesSchema.optional(),
+  /** Two-tier: a partner's recruiter earns this percent of each commission
+   *  the partner earns in this program. Omitted/null = off. */
+  recruiterCommissionPercent: recruiterCommissionPercentSchema.nullable().optional(),
+  /** Months after the recruitment the recruiter keeps earning it. Omitted/
+   *  null = no limit. */
+  recruiterCommissionMonths: recruiterCommissionMonthsSchema.nullable().optional(),
   /** When true, after creating the campaign, also grant every existing
    *  non-revoked partner access to it (source='admin'). Defaults to
    *  false so VIP / scoped campaigns stay private unless the brand opts
@@ -259,11 +302,13 @@ export const updateSchema = z.object({
   attributionModel: z.enum(['last_click', 'first_click', 'linear', 'position']).optional(),
   /** Not retroactive: decides events attributed from now on. */
   renewalsStayWithPartner: z.boolean().optional(),
+  /** Link clicks beat this program's coupon codes. Default false. */
+  couponsYieldToLinks: z.boolean().optional(),
   destinationUrl: destinationUrlSchema.optional(),
   deepLinkAllowedDomains: z.string().max(1000).nullable().optional(),
   holdbackDays: z.number().int().min(0).max(365).nullable().optional(),
-  startsAt: z.string().datetime().nullable().optional(),
-  endsAt: z.string().datetime().nullable().optional(),
+  startsAt: utcDateTime().nullable().optional(),
+  endsAt: utcDateTime().nullable().optional(),
   customerReward: customerRewardSchema.nullable().optional(),
   shareOnNetwork: z.boolean().optional(),
   marketplaceDescription: z.string().max(4000).nullable().optional(),
@@ -275,6 +320,9 @@ export const updateSchema = z.object({
     .optional(),
   partnersMayCustomizeCode: z.boolean().optional(),
   revenueEventTypes: revenueEventTypesSchema.optional(),
+  /** Not retroactive: pays on commissions accrued from now on. */
+  recruiterCommissionPercent: recruiterCommissionPercentSchema.nullable().optional(),
+  recruiterCommissionMonths: recruiterCommissionMonthsSchema.nullable().optional(),
 });
 
 export const programsRouter = Router();
@@ -286,6 +334,32 @@ programsRouter.get('/programs', requireAuth, requireAdmin, async (req, res) => {
   // editor is the only reader and it already loads this list — saves the
   // portal a round trip.
   res.json({ programs: campaigns, customerRewardDelivery: await customerRewardDelivery(tenantId) });
+});
+
+export const programStatsQuerySchema = z.object({
+  since: utcDateTime().optional(),
+  until: utcDateTime().optional(),
+});
+
+/**
+ * Each program's clicks, partners, conversions, attributed revenue and
+ * commission by status over [since, until), default the last 30 days.
+ * The same numbers GET /admin/overview?programId= reports (reporting.ts),
+ * amounts per currency and never converted.
+ */
+programsRouter.get('/programs/stats', requireAuth, requireAdmin, async (req, res) => {
+  const q = programStatsQuerySchema.safeParse(req.query);
+  if (!q.success) return res.status(400).json({ error: 'invalid_query', detail: q.error.flatten() });
+  const until = q.data.until ? new Date(q.data.until) : new Date();
+  const since = q.data.since ? new Date(q.data.since) : new Date(until.getTime() - 30 * 24 * 60 * 60 * 1000);
+  if (since >= until) return res.status(400).json({ error: 'invalid_window', detail: 'since must be before until' });
+  const { db, tenantId } = tenantOf(req);
+  res.json({
+    since: since.toISOString(),
+    until: until.toISOString(),
+    currency: await tenantDefaultCurrency(db, tenantId),
+    programs: await programStats(db, { tenantId, since, until }),
+  });
 });
 
 /**
@@ -393,6 +467,7 @@ programsRouter.post('/programs', requireAuth, requireAdmin, async (req, res) => 
       attributionWindowDays: body.data.attributionWindowDays ?? 60,
       attributionModel: body.data.attributionModel ?? 'last_click',
       renewalsStayWithPartner: body.data.renewalsStayWithPartner ?? true,
+      couponsYieldToLinks: body.data.couponsYieldToLinks ?? false,
       destinationUrl: body.data.destinationUrl,
       deepLinkAllowedDomains: body.data.deepLinkAllowedDomains ?? null,
       holdbackDays: body.data.holdbackDays ?? null,
@@ -408,6 +483,8 @@ programsRouter.post('/programs', requireAuth, requireAdmin, async (req, res) => 
       categories: body.data.categories ?? [],
       partnersMayCustomizeCode: body.data.partnersMayCustomizeCode ?? false,
       revenueEventTypes: normalizeRevenueEventTypes(body.data.revenueEventTypes ?? []),
+      recruiterCommissionPercent: body.data.recruiterCommissionPercent?.toFixed(2) ?? null,
+      recruiterCommissionMonths: body.data.recruiterCommissionMonths ?? null,
     })
     .returning('*');
 
@@ -443,6 +520,7 @@ programsRouter.post('/programs', requireAuth, requireAdmin, async (req, res) => 
   const summary = renderCommissionSummary(
     body.data.commissionRule as CommissionSubRuleLike[],
     (body.data.customerReward ?? null) as CustomerRewardLike | null,
+    await tenantDefaultCurrency(db, tenantId),
   );
   const offeringId = await syncCampaignToMarketplace(db, tenantId, campaign as ProgramRow, summary);
   if (offeringId && offeringId !== (campaign as ProgramRow).networkOfferingId) {
@@ -470,6 +548,9 @@ programsRouter.patch('/programs/:id', requireAuth, requireAdmin, async (req, res
   if (body.data.attributionModel !== undefined) patch.attributionModel = body.data.attributionModel;
   if (body.data.renewalsStayWithPartner !== undefined) {
     patch.renewalsStayWithPartner = body.data.renewalsStayWithPartner;
+  }
+  if (body.data.couponsYieldToLinks !== undefined) {
+    patch.couponsYieldToLinks = body.data.couponsYieldToLinks;
   }
   if (body.data.destinationUrl !== undefined) patch.destinationUrl = body.data.destinationUrl;
   if (body.data.deepLinkAllowedDomains !== undefined) patch.deepLinkAllowedDomains = body.data.deepLinkAllowedDomains;
@@ -503,6 +584,12 @@ programsRouter.patch('/programs/:id', requireAuth, requireAdmin, async (req, res
   if (body.data.revenueEventTypes !== undefined) {
     patch.revenueEventTypes = normalizeRevenueEventTypes(body.data.revenueEventTypes);
   }
+  if (body.data.recruiterCommissionPercent !== undefined) {
+    patch.recruiterCommissionPercent = body.data.recruiterCommissionPercent?.toFixed(2) ?? null;
+  }
+  if (body.data.recruiterCommissionMonths !== undefined) {
+    patch.recruiterCommissionMonths = body.data.recruiterCommissionMonths;
+  }
 
   // White-label tenants are isolated from the marketplace — pin the flag
   // false on every edit (also normalizes pre-white-label rows still
@@ -535,6 +622,7 @@ programsRouter.patch('/programs/:id', requireAuth, requireAdmin, async (req, res
   const summary = renderCommissionSummary(
     updated.commissionRule as unknown as CommissionSubRuleLike[],
     updated.customerReward as CustomerRewardLike | null,
+    await tenantDefaultCurrency(db, tenantId),
   );
   const offeringId = await syncCampaignToMarketplace(db, tenantId, updated, summary);
   if (offeringId && offeringId !== updated.networkOfferingId) {

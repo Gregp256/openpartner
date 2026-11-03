@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router';
+import { createBrowserRouter, Link, Navigate, Route, RouterProvider, Routes, useLocation, useNavigate, useRouteError } from 'react-router';
 import {
   LayoutDashboard,
   Link2,
@@ -30,6 +30,12 @@ import {
   KeyRound,
   Landmark,
   CalendarCheck,
+  MessagesSquare,
+  UserCheck,
+  UserPlus,
+  Activity,
+  Route as RouteIcon,
+  Lock,
 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { clearApiKey, api, type Principal } from './api.js';
@@ -41,6 +47,8 @@ import { AffiliateLinkGate, isAffiliateLinkEntry } from './pages/auth/AffiliateL
 import { Dashboard } from './pages/Dashboard.js';
 import { LinksPage } from './pages/Links.js';
 import { CommissionsPage } from './pages/Commissions.js';
+import { AdminPartnerReferrals, ReferralsPage } from './pages/Referrals.js';
+import { RecruitPage, useShowRecruiting } from './pages/PartnerRecruiting.js';
 import { PayoutsPage } from './pages/Payouts.js';
 import { ConnectPage } from './pages/Connect.js';
 import { PayoutDetailsPage } from './pages/PayoutDetails.js';
@@ -55,6 +63,8 @@ import { LoginPage } from './pages/auth/Login.js';
 import { MagicLandingPage } from './pages/auth/MagicLanding.js';
 import { WebhooksPage } from './pages/admin/Webhooks.js';
 import { AdminIntegrations } from './pages/admin/Integrations.js';
+import { AdminTrackingHealth } from './pages/admin/TrackingHealth.js';
+import { AdminJourney } from './pages/admin/Journey.js';
 import { AdminSettings } from './pages/admin/Settings.js';
 import { AdminBilling } from './pages/admin/Billing.js';
 import { AdminWhiteLabel } from './pages/admin/WhiteLabel.js';
@@ -63,7 +73,12 @@ import { AdminNetwork } from './pages/admin/Network.js';
 import { AdminNetworkComplete } from './pages/admin/NetworkComplete.js';
 import { AdminNetworkRequests } from './pages/admin/NetworkRequests.js';
 import { AdminNetworkCreators } from './pages/admin/NetworkCreators.js';
+import { NetworkCreatorStorefrontPage } from './pages/admin/NetworkCreatorStorefront.js';
+import { IndexedCreatorPage } from './pages/admin/NetworkIndexedCreators.js';
 import { AdminNetworkBookings } from './pages/admin/NetworkBookings.js';
+import { AdminNetworkBookingReport } from './pages/admin/NetworkBookingReport.js';
+import { AdminNetworkClaim, AdminNetworkMessages, AdminNetworkThread, useBrandUnreadMessages } from './pages/admin/NetworkMessages.js';
+import { UnreadDot } from './pages/creator/conversation-shared.js';
 import { AdminNetworkBilling } from './pages/admin/NetworkBilling.js';
 import { BrandLocationPrompt, useBrandLocationMissing } from './pages/admin/BrandLocation.js';
 import { DiscoverPage } from './pages/partner/Discover.js';
@@ -73,6 +88,7 @@ import { MyAffiliationsPage } from './pages/partner/MyAffiliations.js';
 import { MyRequestsPage } from './pages/partner/MyRequests.js';
 import { MyProfilePage } from './pages/partner/MyProfile.js';
 import { NetworkProfileBanner } from './pages/partner/NetworkProfileBanner.js';
+import { NetworkListingNotice } from './pages/admin/NetworkListingNotice.js';
 import { NetworkConsentPrompt, usePartnerNetworkAccess } from './pages/partner/NetworkConsent.js';
 import { PartnerPostbacksPage } from './pages/partner/Postbacks.js';
 import { PartnerBountiesPage } from './pages/partner/Bounties.js';
@@ -82,9 +98,12 @@ import { LandingPage } from './pages/Landing.js';
 import { SignupPage } from './pages/Signup.js';
 import { SigninPage } from './pages/Signin.js';
 import { WorkspacesPage } from './pages/Workspaces.js';
+import { GoCreatorPage } from './pages/GoLinks.js';
 import { AddBrandPage } from './pages/AddBrand.js';
 import { PartnerJoinPage } from './pages/PartnerJoin.js';
 import { BrandDocument } from './lib/BrandDocument.js';
+import { UnsavedChangesGuard } from './lib/useUnsavedChanges.js';
+import { isViewOnly, ViewOnlyBadge, ViewOnlyProvider } from './lib/viewOnly.js';
 import { ThemeToggle } from './lib/ThemeToggle.js';
 import { CookieSettingsButton } from './lib/ConsentBanner.js';
 import { PlatformMagicLandingPage } from './pages/auth/PlatformMagicLanding.js';
@@ -94,9 +113,13 @@ import { PlatformConsole } from './pages/platform/PlatformConsole.js';
 import { CreatorSignupPage } from './pages/creator/CreatorSignup.js';
 import { CreatorSigninPage } from './pages/creator/CreatorSignin.js';
 import { CreatorMagicLandingPage } from './pages/creator/CreatorMagicLanding.js';
+import { CreatorResetPasswordPage } from './pages/creator/CreatorResetPassword.js';
 import { CreatorShell } from './pages/creator/CreatorShell.js';
 import { CreatorPublicProfilePage } from './pages/creator/CreatorPublicProfile.js';
+import { PublicReportPage } from './pages/PublicReport.js';
 import { BookingConfirmPage } from './pages/creator/BookingConfirm.js';
+import { CreatorIndexClaimPage } from './pages/creator/CreatorIndexClaim.js';
+import { clearAttachmentCache } from './pages/creator/conversation-media.js';
 import { FraudReviewPage } from './pages/FraudReview.js';
 import { ResetPasswordPage, TenantResetPasswordPage } from './pages/auth/ResetPassword.js';
 import { AccountPage, TenantAccountPage } from './pages/Account.js';
@@ -111,7 +134,26 @@ interface InstallStatus {
   reason?: 'multi_tenant';
 }
 
+/**
+ * A data router at the root, so useBlocker works (UnsavedChangesGuard asks
+ * before Back leaves unsaved edits). The routes stay descendant <Routes>.
+ */
 export function App() {
+  const [router] = useState(() =>
+    createBrowserRouter([{ path: '*', element: <AppRoutes />, errorElement: <RethrowRouteError /> }]),
+  );
+  return <RouterProvider router={router} />;
+}
+
+/**
+ * Leaves a render error uncaught, as it was under BrowserRouter: React
+ * Router's default error page would show the stack trace.
+ */
+function RethrowRouteError(): never {
+  throw useRouteError();
+}
+
+function AppRoutes() {
   // First-run gate. Three modes the probe can return:
   //   { needsSetup: true }                     — single-tenant, no admin yet
   //   { needsSetup: false }                    — single-tenant, ready
@@ -153,8 +195,9 @@ export function App() {
   const hostTenantSlug = isMultiTenant ? (hostBrand.data?.tenantSlug ?? null) : null;
 
   return (
-    <BrowserRouter>
+    <>
       <BrandDocument />
+      <UnsavedChangesGuard />
       <Routes>
         {isMultiTenant && hostTenantSlug ? (
           <>
@@ -163,6 +206,7 @@ export function App() {
             <Route path="/join" element={<PartnerJoinPage />} />
             <Route path="/auth/magic" element={<MagicLandingPage />} />
             <Route path="/reset-password" element={<ResetPasswordPage loginPath="/login" />} />
+            <Route path="/go/creators/:handle" element={<GoCreatorPage multiTenant={false} />} />
             <Route path="/*" element={<Shell />} />
           </>
         ) : isMultiTenant ? (
@@ -186,11 +230,20 @@ export function App() {
             <Route path="/creator/signup" element={<CreatorSignupPage />} />
             <Route path="/creator/login" element={<CreatorSigninPage />} />
             <Route path="/creator/auth/magic" element={<CreatorMagicLandingPage />} />
+            {/* The Network's "forgot password" link. */}
+            <Route path="/creator/reset-password" element={<CreatorResetPasswordPage />} />
+            {/* The creator index's invite email (claim works signed out). */}
+            <Route path="/creator/claim" element={<CreatorIndexClaimPage />} />
             <Route path="/creator/*" element={<CreatorShell />} />
             {/* Public creator profiles — no auth, browsable from anywhere. */}
             <Route path="/creators/:handle" element={<CreatorPublicProfilePage />} />
+            {/* A shared booking report; the token is in the URL fragment. */}
+            <Route path="/reports" element={<PublicReportPage />} />
             {/* A brand confirming a booking request sent from a creator's storefront. */}
             <Route path="/booking/confirm" element={<BookingConfirmPage />} />
+            {/* A creator's in-app storefront in whichever workspace the brand
+                signs in to — the public storefront links here. */}
+            <Route path="/go/creators/:handle" element={<GoCreatorPage multiTenant />} />
             <Route path="/t/:slug/login" element={<LoginPage />} />
             <Route path="/t/:slug/join" element={<PartnerJoinPage />} />
             <Route path="/t/:slug/auth/magic" element={<MagicLandingPage />} />
@@ -211,11 +264,12 @@ export function App() {
             <Route path="/join" element={<PartnerJoinPage />} />
             <Route path="/auth/magic" element={<MagicLandingPage />} />
             <Route path="/reset-password" element={<ResetPasswordPage loginPath="/login" />} />
+            <Route path="/go/creators/:handle" element={<GoCreatorPage multiTenant={false} />} />
             <Route path="/*" element={<Shell />} />
           </>
         )}
       </Routes>
-    </BrowserRouter>
+    </>
   );
 }
 
@@ -278,8 +332,16 @@ function Shell() {
     showNetwork &&
     shellPath.startsWith('/network/') &&
     !shellPath.startsWith('/network/profile');
+  // A brand whose marketplace listing is still in review (or turned down)
+  // hears it on its Network pages. A brand still in signup review already
+  // has the banner above, which covers the listing.
+  const showNetworkListingNotice =
+    auth.principal.role === 'admin' &&
+    showNetwork &&
+    approvalStatus !== 'pending' &&
+    shellPath.startsWith('/admin/network/');
 
-  return (
+  const shell = (
     <div style={{ display: 'flex', minHeight: '100vh', background: theme.bg }}>
       {isMobile ? (
         <MobileDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)}>
@@ -288,14 +350,21 @@ function Shell() {
       ) : (
         <Sidebar principal={auth.principal} />
       )}
-      <main style={{ flex: 1, minWidth: 0, overflow: 'auto' }}>
+      {/* The window scrolls, not main. overflow-x: clip (unlike auto) keeps
+          main from being a scroll container, so position: sticky inside it
+          (the mobile top bar, the Settings section menu) sticks to the
+          viewport. Wide content scrolls in its own wrapper. */}
+      <main style={{ flex: 1, minWidth: 0, overflowX: 'clip' }}>
         {isMobile && <MobileTopBar onMenu={() => setDrawerOpen(true)} />}
         {auth.principal.role === 'admin' && approvalStatus === 'pending' && !reviewBannerDismissed && (
           <PendingReviewBanner isMobile={isMobile} onDismiss={() => setReviewBannerDismissed(true)} />
         )}
-        {auth.principal.role === 'admin' && brandLocationMissing && <BrandLocationPrompt isMobile={isMobile} />}
+        {auth.principal.role === 'admin' && brandLocationMissing && !isViewOnly(auth.principal) && (
+          <BrandLocationPrompt isMobile={isMobile} />
+        )}
         {showNetworkConsentPrompt && <NetworkConsentPrompt isMobile={isMobile} />}
         {showNetworkProfileBanner && <NetworkProfileBanner isMobile={isMobile} />}
+        {showNetworkListingNotice && <NetworkListingNotice isMobile={isMobile} />}
         <Routes>
           <Route
             index
@@ -335,6 +404,8 @@ function Shell() {
                   <Route path="network/profile" element={<MyProfilePage />} />
                 </>
               )}
+              <Route path="referrals" element={<ReferralsPage principal={auth.principal} />} />
+              <Route path="recruit" element={<RecruitPage principal={auth.principal} />} />
               <Route path="coupons" element={<AdminPartnerCoupons ownPartnerId={auth.principal.partnerId!} />} />
               <Route path="postbacks" element={<PartnerPostbacksPage principal={auth.principal} />} />
               <Route path="bounties" element={<PartnerBountiesPage />} />
@@ -346,14 +417,18 @@ function Shell() {
               <Route path="admin/partners" element={<AdminPartners />} />
               <Route path="admin/partners/:id/programs" element={<AdminPartnerPrograms />} />
               <Route path="admin/partners/:id/coupons" element={<AdminPartnerCoupons />} />
+              <Route path="admin/partners/:id/referrals" element={<AdminPartnerReferrals />} />
               <Route path="admin/partners/:id/commission" element={<AdminPartnerCommission />} />
               <Route path="admin/programs" element={<AdminPrograms />} />
               <Route path="admin/programs/:id/bounties" element={<AdminProgramBounties />} />
               <Route path="admin/review" element={<AdminReview />} />
-              <Route path="admin/export" element={<AdminExport />} />
+              {/* The export is every customer and partner at once: not a view-only seat's. */}
+              <Route path="admin/export" element={isViewOnly(auth.principal) ? <Navigate to="/" replace /> : <AdminExport />} />
               <Route path="admin/fraud-review" element={<FraudReviewPage />} />
               <Route path="admin/webhooks" element={<WebhooksPage />} />
               <Route path="admin/integrations" element={<AdminIntegrations />} />
+              <Route path="admin/tracking-health" element={<AdminTrackingHealth />} />
+              <Route path="admin/journey" element={<AdminJourney />} />
               <Route path="admin/admins" element={<AdminAdmins />} />
               <Route path="admin/settings" element={<AdminSettings />} />
               <Route path="admin/billing" element={<AdminBilling />} />
@@ -365,7 +440,13 @@ function Shell() {
                   <Route path="admin/network/complete" element={<AdminNetworkComplete />} />
                   <Route path="admin/network/requests" element={<AdminNetworkRequests />} />
                   <Route path="admin/network/creators" element={<AdminNetworkCreators />} />
+                  <Route path="admin/network/creators/:handle" element={<NetworkCreatorStorefrontPage />} />
+                  <Route path="admin/network/indexed-creators/:id" element={<IndexedCreatorPage />} />
                   <Route path="admin/network/bookings" element={<AdminNetworkBookings />} />
+                  <Route path="admin/network/bookings/:id/report" element={<AdminNetworkBookingReport />} />
+                  <Route path="admin/network/messages" element={<AdminNetworkMessages />} />
+                  <Route path="admin/network/messages/:id" element={<AdminNetworkThread />} />
+                  <Route path="admin/network/claim" element={<AdminNetworkClaim />} />
                   <Route path="admin/network/billing" element={<AdminNetworkBilling />} />
                 </>
               )}
@@ -377,6 +458,7 @@ function Shell() {
       </main>
     </div>
   );
+  return <ViewOnlyProvider principal={auth.principal}>{shell}</ViewOnlyProvider>;
 }
 
 /** Mobile-only top bar: hamburger + brand. Sticky so it stays reachable
@@ -467,6 +549,10 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
   const { programName, supportEmail, logoUrl, whiteLabel } = useBrand();
   const connectPayouts = useConnectPayouts();
   const partnerNetwork = usePartnerNetworkAccess(principal.role === 'partner');
+  // Only once a program pays for recruiting (or there are recruits to see).
+  const showRecruiting = useShowRecruiting(principal);
+  // Pages that need partners stay locked until the brand can take them.
+  const locked = useSetupLock(principal.role === 'admin');
   const isDrawer = variant === 'drawer';
 
   return (
@@ -503,11 +589,15 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
         {/* Top-level nav — no header, always visible. */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
           <NavItem to="/" icon={<LayoutDashboard size={16} />}>Dashboard</NavItem>
-          <NavItem to="/links" icon={<Link2 size={16} />}>Links</NavItem>
+          <NavItem to="/links" icon={<Link2 size={16} />} locked={locked}>Links</NavItem>
+          {principal.role === 'partner' && <NavItem to="/referrals" icon={<UserCheck size={16} />}>Referrals</NavItem>}
           {principal.role === 'partner' && <NavItem to="/coupons" icon={<Tag size={16} />}>Coupons</NavItem>}
           {principal.role === 'partner' && <NavItem to="/bounties" icon={<Trophy size={16} />}>Bounties</NavItem>}
-          <NavItem to="/commissions" icon={<Receipt size={16} />}>Commissions</NavItem>
-          <NavItem to="/payouts" icon={<Banknote size={16} />}>Payouts</NavItem>
+          {principal.role === 'partner' && showRecruiting && (
+            <NavItem to="/recruit" icon={<UserPlus size={16} />}>Recruit partners</NavItem>
+          )}
+          <NavItem to="/commissions" icon={<Receipt size={16} />} locked={locked}>Commissions</NavItem>
+          <NavItem to="/payouts" icon={<Banknote size={16} />} locked={locked}>Payouts</NavItem>
           {principal.role === 'partner' && <NavItem to="/payout-details" icon={<Landmark size={16} />}>Payout details</NavItem>}
           {/* Only where the brand pays through Connect; /connect itself
               still answers a bookmark (pages/Connect.tsx). */}
@@ -521,23 +611,25 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
         {principal.role === 'partner' && partnerNetwork.show && (
           <NavSection title="Network" collapsible storageKey="partner-network">
             <NavItem to="/network/discover" icon={<Globe size={16} />}>Discover programs</NavItem>
-            <NavItem to="/network/affiliations" icon={<Megaphone size={16} />}>My partnerships</NavItem>
+            <NavItem to="/network/affiliations" icon={<Megaphone size={16} />}>My partnership</NavItem>
             <NavItem to="/network/requests" icon={<Inbox size={16} />}>My applications</NavItem>
             <NavItem to="/network/profile" icon={<UserCog size={16} />}>Network profile</NavItem>
           </NavSection>
         )}
 
-        {principal.role === 'admin' && !whiteLabel && <NetworkNav />}
+        {principal.role === 'admin' && !whiteLabel && <NetworkNav locked={locked} />}
 
         {principal.role === 'admin' && (
           <NavSection title="Admin" collapsible storageKey="admin-admin">
-            <NavItem to="/admin/partners" icon={<Users size={16} />}>Partners</NavItem>
+            <NavItem to="/admin/partners" icon={<Users size={16} />} locked={locked}>Partners</NavItem>
             <NavItem to="/admin/programs" icon={<Tag size={16} />}>Programs</NavItem>
-            <NavItem to="/admin/review" icon={<ShieldCheck size={16} />}>Review queue</NavItem>
-            <NavItem to="/admin/export" icon={<Download size={16} />}>Export / import</NavItem>
-            <NavItem to="/admin/fraud-review" icon={<ShieldCheck size={16} />}>Fraud review</NavItem>
+            <NavItem to="/admin/review" icon={<ShieldCheck size={16} />} locked={locked}>Review queue</NavItem>
+            {!isViewOnly(principal) && <NavItem to="/admin/export" icon={<Download size={16} />}>Export / import</NavItem>}
+            <NavItem to="/admin/fraud-review" icon={<ShieldCheck size={16} />} locked={locked}>Fraud review</NavItem>
             <NavItem to="/admin/webhooks" icon={<Webhook size={16} />}>Webhooks</NavItem>
             <NavItem to="/admin/integrations" icon={<Link2 size={16} />}>Integrations</NavItem>
+            <NavItem to="/admin/tracking-health" icon={<Activity size={16} />}>Tracking health</NavItem>
+            <NavItem to="/admin/journey" icon={<RouteIcon size={16} />} locked={locked}>Customer journey</NavItem>
             <NavItem to="/admin/admins" icon={<UserCog size={16} />}>Admins</NavItem>
             <NavItem to="/admin/settings" icon={<Settings size={16} />}>Settings</NavItem>
             <NavItem to="/admin/billing" icon={<CreditCard size={16} />}>Billing</NavItem>
@@ -570,6 +662,8 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
           } catch {
             /* ignore */
           }
+          // Conversation images are kept in memory; nobody else gets them.
+          clearAttachmentCache();
           nav(`${tenantBase}/login`);
         }}
         style={{
@@ -649,6 +743,7 @@ interface WorkspaceRow {
   tenantDisplayName: string;
   adminId: string;
   activated: boolean;
+  role?: 'admin' | 'viewer';
 }
 
 interface PlatformMe {
@@ -869,11 +964,14 @@ function IdentitySwitcher({ principal }: { principal: Principal }) {
               textOverflow: 'ellipsis',
             }}
           >
-            {activeIdentity?.email ?? workspaces.data?.email ?? (principal.role === 'admin' ? 'Admin' : '')}
+            {activeIdentity?.email ??
+              workspaces.data?.email ??
+              (isViewOnly(principal) ? principal.admin?.email : principal.role === 'admin' ? 'Admin' : '')}
           </div>
         </div>
         <ChevronsUpDown size={14} style={{ color: theme.textMuted }} />
       </button>
+      {isViewOnly(principal) && <ViewOnlyBadge style={{ marginTop: 8 }} />}
 
       {open && (
         <>
@@ -922,7 +1020,7 @@ function IdentitySwitcher({ principal }: { principal: Principal }) {
                   disabled={busyAction !== null}
                   onClick={() => enter(w.tenantSlug)}
                   title={w.tenantDisplayName}
-                  subtitle={`/t/${w.tenantSlug}/`}
+                  subtitle={w.role === 'viewer' ? `/t/${w.tenantSlug}/ · View only` : `/t/${w.tenantSlug}/`}
                   right={busy ? <Spinner /> : active ? <Check size={14} style={{ color: theme.accentText }} /> : null}
                 />
               );
@@ -1308,29 +1406,58 @@ function NavSection({
   );
 }
 
-/** Network sidebar section. We only surface Offerings / Requests /
- *  Billing once the brand is connected — those pages all error out if
- *  there's no vendorToken, and showing dead nav entries is just noise.
- *  Connection itself stays visible so the admin can come back to wire
- *  it up. */
-function NetworkNav() {
+/** Network sidebar section. Before the brand connects it holds just "Get
+ *  connected": the other pages all error out without a vendorToken. Once
+ *  connected, the connection's settings live on Admin → Settings, so the
+ *  section is only the pages brands work in. Billing is for self-hosted
+ *  instances; hosted plans include the Network. */
+/**
+ * Why the pages that need partners are locked (API GET /admin/setup-lock):
+ * the brand has no partner yet and isn't both approved and tracking-verified.
+ * Null when nothing is locked, for partners, and until the answer arrives,
+ * so a slow call never hides a page.
+ */
+function useSetupLock(enabled: boolean): string | null {
+  const { data } = useQuery({
+    queryKey: ['admin-setup-lock'],
+    queryFn: () => api<{ locked: boolean; reason: 'review' | 'tracking' | null }>('/admin/setup-lock'),
+    enabled,
+    staleTime: 60_000,
+    retry: false,
+  });
+  if (!data?.locked) return null;
+  return data.reason === 'review'
+    ? 'Unlocks once your brand is approved and your tracking is verified'
+    : 'Unlocks once your tracking is verified: send a test click from Tracking health';
+}
+
+function NetworkNav({ locked }: { locked: string | null }) {
   const { data } = useQuery({
     queryKey: ['network-membership'],
-    queryFn: () => api<{ enabled: boolean; hasVendorToken: boolean }>('/config/network'),
+    queryFn: () => api<{ enabled: boolean; hasVendorToken: boolean; tier?: 'hosted' | 'self_hosted' }>('/config/network'),
     staleTime: 60_000,
     retry: false,
   });
   const connected = !!(data?.enabled && data.hasVendorToken);
+  const unread = useBrandUnreadMessages(connected);
   return (
     <NavSection title="Network" collapsible storageKey="admin-network">
-      <NavItem to="/admin/network" icon={<Globe size={16} />} exact>{connected ? 'Connection' : 'Get connected'}</NavItem>
-      {connected && (
+      {connected ? (
         <>
-          <NavItem to="/admin/network/requests" icon={<Inbox size={16} />}>Requests</NavItem>
-          <NavItem to="/admin/network/creators" icon={<Users size={16} />}>Discover creators</NavItem>
-          <NavItem to="/admin/network/bookings" icon={<CalendarCheck size={16} />}>Bookings</NavItem>
-          <NavItem to="/admin/network/billing" icon={<CreditCard size={16} />}>Billing</NavItem>
+          <NavItem to="/admin/network/requests" icon={<Inbox size={16} />} locked={locked}>Requests</NavItem>
+          <NavItem to="/admin/network/creators" icon={<Users size={16} />} locked={locked}>Discover creators</NavItem>
+          <NavItem to="/admin/network/messages" icon={<MessagesSquare size={16} />} locked={locked}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              Messages <UnreadDot count={unread} />
+            </span>
+          </NavItem>
+          <NavItem to="/admin/network/bookings" icon={<CalendarCheck size={16} />} locked={locked}>Bookings</NavItem>
+          {data?.tier !== 'hosted' && (
+            <NavItem to="/admin/network/billing" icon={<CreditCard size={16} />}>Billing</NavItem>
+          )}
         </>
+      ) : (
+        <NavItem to="/admin/network" icon={<Globe size={16} />} exact>Get connected</NavItem>
       )}
     </NavSection>
   );
@@ -1341,6 +1468,7 @@ function NavItem({
   icon,
   children,
   exact,
+  locked,
 }: {
   to: string;
   icon: ReactNode;
@@ -1350,10 +1478,35 @@ function NavItem({
    *  own nav items — otherwise prefix-matching makes the parent stay
    *  highlighted alongside the active child. */
   exact?: boolean;
+  /** Shown greyed out with a lock, not a link; the text says what unlocks it. */
+  locked?: string | null;
 }) {
   const location = useLocation();
   const tenantBase = useTenantBase();
   const href = to.startsWith('/') ? `${tenantBase}${to === '/' ? '' : to}` || '/' : to;
+  if (locked) {
+    return (
+      <span
+        title={locked}
+        aria-disabled="true"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          padding: '8px 10px',
+          borderRadius: 6,
+          color: theme.textMuted,
+          opacity: 0.55,
+          fontSize: 13.5,
+          cursor: 'not-allowed',
+        }}
+      >
+        <span style={{ display: 'inline-flex' }}>{icon}</span>
+        <span style={{ flex: 1 }}>{children}</span>
+        <Lock size={12} aria-label="Locked" />
+      </span>
+    );
+  }
   // Default prefix-match requires the next char to be '/' so that
   // '/admin/network' doesn't accidentally match '/admin/network-foo'
   // or '/admin/network-archive'. `exact` opts out of prefix matching

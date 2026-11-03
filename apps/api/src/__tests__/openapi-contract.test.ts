@@ -48,6 +48,10 @@ const { getDocumentedOperations, getOpenApiDocument } = await import('../openapi
 const { ErrorResponse, accessExtension } = await import('../openapi/registry.js');
 const { WEBHOOK_PAYLOADS, envelopeSchema } = await import('../openapi/webhook-events.js');
 const { issueMagicLink } = await import('../auth-sessions.js');
+const { __setPaypalFetchForTests } = await import('../paypal-api.js');
+const { parsePayoutDetails, savePayoutProfile } = await import('../payout-profile.js');
+const { FakePaypal } = await import('./fake-paypal.js');
+const { stubEcbFetch } = await import('./ecb-fixture.js');
 
 const skipIntegration = !process.env.DATABASE_URL || process.env.INTEGRATION === 'skip';
 const app = createApp({ enableLogger: false });
@@ -55,6 +59,8 @@ const operations = new Map(getDocumentedOperations().map((op) => [op.operationId
 const exercised = new Set<string>();
 
 const TABLES_TO_CLEAN = [
+  TABLES.PaypalPayoutBatch,
+  TABLES.PaypalConnection,
   TABLES.WebhookDelivery,
   TABLES.WebhookEndpoint,
   TABLES.Commission,
@@ -63,6 +69,7 @@ const TABLES_TO_CLEAN = [
   TABLES.Attribution,
   TABLES.Event,
   TABLES.Identity,
+  TABLES.ClickLanding,
   TABLES.Click,
   TABLES.Coupon,
   TABLES.Link,
@@ -70,6 +77,8 @@ const TABLES_TO_CLEAN = [
   TABLES.PartnerCommission,
   TABLES.ApiKey,
   TABLES.ConversionPostbackToken,
+  TABLES.PartnerSigninLinkLog,
+  TABLES.TrackingIssue,
   TABLES.Session,
   TABLES.MagicLinkToken,
   TABLES.Program,
@@ -235,7 +244,7 @@ beforeAll(async () => {
   if (skipIntegration) return;
   await db.raw('select 1');
   for (const t of TABLES_TO_CLEAN) await db(t).del();
-  await db(TABLES.Config).where({ tenantId: DEFAULT_TENANT_ID }).whereIn('key', ['network_membership', 'partner_access']).del();
+  await db(TABLES.Config).where({ tenantId: DEFAULT_TENANT_ID }).whereIn('key', ['network_membership', 'partner_access', 'payout_statements', 'partner_referrals']).del();
   savedTenant = await db(TABLES.Tenant)
     .where({ id: DEFAULT_TENANT_ID })
     .first('payoutThresholdCents', 'couponIntegrationVerifiedAt');
@@ -260,7 +269,7 @@ beforeAll(async () => {
 afterAll(async () => {
   if (!skipIntegration) {
     for (const t of TABLES_TO_CLEAN) await db(t).del();
-    await db(TABLES.Config).where({ tenantId: DEFAULT_TENANT_ID }).whereIn('key', ['network_membership', 'partner_access']).del();
+    await db(TABLES.Config).where({ tenantId: DEFAULT_TENANT_ID }).whereIn('key', ['network_membership', 'partner_access', 'payout_statements', 'partner_referrals']).del();
     await db(TABLES.Tenant)
       .where({ id: DEFAULT_TENANT_ID })
       .update({
@@ -348,7 +357,25 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
     check('updatePartner', await admin.patch(`/partners/${partner.id}`, { name: 'Renamed' }));
     check('updatePartner', await admin.patch('/partners/missing', { portalAccess: true }));
 
-    const link = check<{ linkKey: string }>(
+    // --- "Refer & earn" opens the hosted portal instead: the backend mints
+    // a sign-in link and redirects the customer to it.
+    check('createPartnerSigninLink', await admin.post(`/partners/${partner.id}/signin-link`)); // 409 portal_access_disabled
+    check('updatePartner', await admin.patch(`/partners/${partner.id}`, { portalAccess: true }));
+    const signinKey = as(
+      check<{ plaintext: string }>('createScopedKey', await admin.post('/api-keys/scoped', { label: 'portal sso', scopes: ['partners:signin'] }))
+        .plaintext,
+    );
+    check('createPartnerSigninLink', await signinKey.post(`/partners/${partner.id}/signin-link`, { returnTo: '/links' }));
+    check('createPartnerSigninLink', await signinKey.post(`/partners/${partner.id}/signin-link`, { returnTo: 'https://evil.example' }));
+    check('createPartnerSigninLink', await signinKey.post('/partners/missing/signin-link'));
+    check('createPartnerSigninLink', await integration.post(`/partners/${partner.id}/signin-link`)); // 403 forbidden_scope
+    check('lookupPartnerSigninLink', await signinKey.post('/partners/signin-link', { metadata: { appUserId: 'u_123' } }));
+    check('lookupPartnerSigninLink', await signinKey.post('/partners/signin-link', { email: 'customer@example.com' }));
+    check('lookupPartnerSigninLink', await signinKey.post('/partners/signin-link', {}));
+    check('lookupPartnerSigninLink', await signinKey.post('/partners/signin-link', { email: 'nobody@example.com' }));
+    check('updatePartner', await admin.patch(`/partners/${partner.id}`, { portalAccess: false }));
+
+    const link = check<{ id: string; linkKey: string }>(
       'createPartnerLink',
       await integration.post(`/partners/${partner.id}/links`, { linkKey: 'ada-refers', programId: program.id }),
     );
@@ -373,6 +400,11 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
     const stitched = check<{ firstStitch: boolean }>('identify', await anon.post('/attribution/identify', { cref: clickId, userId: 'friend_1' }));
     expect(stitched.firstStitch).toBe(true);
     check('identify', await anon.post('/attribution/identify', { cref: 'missing', userId: 'friend_1' }));
+    const landed = check<{ firstLanding: boolean }>('reportLanding', await anon.post('/attribution/landing', { cref: clickId }));
+    expect(landed.firstLanding).toBe(true);
+    check('reportLanding', await anon.post('/attribution/landing', { cref: 'missing' }));
+    // No IP database in tests: an unknown country, so the rule is opt-in.
+    expect(check<{ rule: string }>('getConsentRegion', await anon.get('/consent-region')).rule).toBe('opt_in');
 
     check('recordEvent', await integration.post('/attribution/events', { userId: 'friend_1', type: 'signup', externalEventId: 'signup:friend_1' }));
     const paid = { userId: 'friend_1', type: 'invoice_paid', value: 300, currency: 'USD', externalEventId: 'inv_1' };
@@ -399,8 +431,72 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
     const offsetQuery = await integration.get(`/partners/${partner.id}/timeseries?since=2026-01-01T00:00:00%2B00:00`);
     expect(offsetQuery.status).toBe(400);
     check('getPartnerTimeseries', offsetQuery);
+    const resultsWindow = `clickSince=${new Date(Date.now() - 86_400_000).toISOString()}&clickUntil=${new Date(Date.now() + 60_000).toISOString()}`;
+    const linkStats = check<{ clicks: number }>(
+      'getLinkResults',
+      await integration.get(`/partners/${partner.id}/links/${link.id}/results?${resultsWindow}`),
+    );
+    expect(linkStats.clicks).toBe(dash.clicks);
+    check('getLinkResults', await integration.get(`/partners/${partner.id}/links/${ulid()}/results?${resultsWindow}`));
+    check('getLinkResults', await integration.get(`/partners/${partner.id}/links/${link.id}/results`));
+    const stats = check<{ programs: Array<{ programId: string; clicks: number }> }>('getProgramStats', await admin.get('/programs/stats'));
+    expect(stats.programs.find((p) => p.programId === program.id)?.clicks).toBe(dash.clicks);
+    check('getProgramStats', await admin.get('/programs/stats?since=2026-10-01T00:00:00Z&until=2026-09-01T00:00:00Z'));
+    check('getProgramStats', await integration.get('/programs/stats'));
     check('listPartnerEvents', await integration.get(`/partners/${partner.id}/events?limit=10`));
-    check('listPartnerCustomers', await integration.get(`/partners/${partner.id}/customers`));
+    const customers = check<{ customers: Array<{ userId: string | null; referralId: string }> }>(
+      'listPartnerCustomers',
+      await integration.get(`/partners/${partner.id}/customers`),
+    );
+    expect(customers.customers[0]).toMatchObject({ userId: 'friend_1' });
+
+    // --- Each referred customer's journey, through the stages the brand shows.
+    check('getReferralSettings', await admin.get('/config/referrals'));
+    const stagesSet = check<{ stages: Array<{ eventType: string }> }>(
+      'updateReferralSettings',
+      await admin.post('/config/referrals', {
+        stages: [
+          { eventType: 'demo_booked', label: 'Demo booked' },
+          { eventType: 'invoice_paid', label: 'Paid' },
+        ],
+      }),
+    );
+    expect(stagesSet.stages.map((s) => s.eventType)).toEqual(['demo_booked', 'invoice_paid']);
+    check('updateReferralSettings', await admin.post('/config/referrals', { stages: [{ eventType: 'refund', label: 'Refunded' }] }));
+    check('updateReferralSettings', await admin.post('/config/referrals', { stages: [{ eventType: '', label: 'Empty' }] }));
+    const referrals = check<{
+      referrals: Array<{ referralId: string; userId?: string; stages: Array<{ eventType: string; count: number }>; commission: number }>;
+      total: number;
+    }>('listPartnerReferrals', await integration.get(`/partners/${partner.id}/referrals`));
+    expect(referrals.total).toBe(1);
+    expect(referrals.referrals[0]).toMatchObject({ userId: 'friend_1', referralId: customers.customers[0]!.referralId, commission: 42 });
+    expect(referrals.referrals[0]!.stages.map((s) => [s.eventType, s.count])).toEqual([
+      ['demo_booked', 1],
+      ['invoice_paid', 2],
+    ]);
+    check('listPartnerReferrals', await integration.get(`/partners/${partner.id}/referrals?cursor=nope`));
+    check('listPartnerReferrals', await integration.get('/partners/missing/referrals'));
+
+    // --- Who got credit for that customer's conversions, and why.
+    const journey = check<{ userId: string; touches: Array<{ partner: { id: string } }>; events: Array<{ id: string; type: string }>; selected: { status: string } | null }>(
+      'getCustomerJourney',
+      await admin.get('/customers/friend_1/journey'),
+    );
+    expect(journey.userId).toBe('friend_1');
+    expect(journey.touches.map((t) => t.partner.id)).toContain(partner.id);
+    expect(journey.selected?.status).toBe('credited');
+    const paidEvent = journey.events.find((e) => e.type === 'invoice_paid')!;
+    check('getEventJourney', await admin.get(`/events/${paidEvent.id}/journey`));
+    check('getEventJourney', await admin.get('/events/missing/journey'));
+    check('getCustomerJourney', await admin.get(`/customers/friend_1/journey?eventId=${paidEvent.id}`));
+    check('getCustomerJourney', await admin.get('/customers/nobody/journey'));
+    // Two-tier recruiting: no program pays a share here, so no link.
+    const recruits = check<{ recruitUrl: string | null; recruits: unknown[]; total: number }>(
+      'getPartnerRecruits',
+      await integration.get(`/partners/${partner.id}/recruits`),
+    );
+    expect(recruits).toMatchObject({ recruitUrl: null, recruits: [], total: 0 });
+    check('getPartnerRecruits', await integration.get('/partners/missing/recruits'));
     check('getPartnerBreakdown', await integration.get(`/partners/${partner.id}/breakdowns?dimension=referer`));
     check('getPartnerBreakdown', await integration.get(`/partners/${partner.id}/breakdowns?dimension=browser`));
     // Funnel has no scope (documented): admin key from the server.
@@ -484,8 +580,37 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
     check('listPayouts', await admin.get('/payouts?cursor=bm9wZQ'));
     const afterRun = check<{ commissions: Array<{ id: string; status: string }> }>('listPartnerCommissions', await integration.get(`/partners/${partner.id}/commissions`));
     expect(afterRun.commissions.find((c) => c.id === toApprove!.id)?.status).toBe('paid');
+    // A payment reference is one printable line of up to 100 characters;
+    // the published schema must refuse what the route refuses.
+    check('confirmManualPayout', await admin.post(`/payouts/${run.payouts[0]!.payoutId}/confirm`, { reference: `UTR${'9'.repeat(98)}` }));
+    check('confirmManualPayout', await admin.post(`/payouts/${run.payouts[0]!.payoutId}/confirm`, { reference: 'UTR 1\nUTR 2' }));
+    const confirmed = check<{ payout: { status: string; metadata: Record<string, unknown> } }>(
+      'confirmManualPayout',
+      await admin.post(`/payouts/${run.payouts[0]!.payoutId}/confirm`, { reference: 'NEFT UTR HDFCN52026102312345678' }),
+    );
+    expect(confirmed.payout).toMatchObject({ status: 'paid', metadata: { externalReference: 'NEFT UTR HDFCN52026102312345678' } });
     check('confirmManualPayout', await admin.post(`/payouts/${run.payouts[0]!.payoutId}/confirm`));
-    check('confirmManualPayout', await admin.post(`/payouts/${run.payouts[0]!.payoutId}/confirm`));
+    check('confirmManualPayout', await admin.post('/payouts/missing/confirm', { reference: 'UTR123' }));
+
+    // Its statement: a printable page for the brand, its data for the integration.
+    check('getPayoutStatementSettings', await admin.get('/config/payout-statements'));
+    const statementSettings = check<{ numberPrefix: string | null }>(
+      'updatePayoutStatementSettings',
+      await admin.post('/config/payout-statements', { legalName: 'Referral Co Pvt Ltd', numberPrefix: 'PS-', footer: '' }),
+    );
+    expect(statementSettings.numberPrefix).toBe('PS-');
+    check('updatePayoutStatementSettings', await admin.post('/config/payout-statements', { numberPrefix: 'no spaces' }));
+    const statementPage = await admin.get(`/payouts/${run.payouts[0]!.payoutId}/statement`);
+    check('getPayoutStatement', statementPage);
+    expect(statementPage.type).toBe('text/html');
+    expect(statementPage.text).toContain(`PS-${run.payouts[0]!.payoutId}`);
+    const statement = check<{ statement: { payout: { status: string } } }>(
+      'getPayoutStatement',
+      await integration.get(`/payouts/${run.payouts[0]!.payoutId}/statement?format=json`),
+    );
+    expect(statement.statement.payout.status).toBe('paid');
+    check('getPayoutStatement', await admin.get(`/payouts/${run.payouts[0]!.payoutId}/statement?format=pdf`));
+    check('getPayoutStatement', await admin.get('/payouts/missing/statement'));
 
     // --- A bonus for the referrer: a reward with no sale behind it.
     const bonusKey = check<{ plaintext: string }>(
@@ -556,7 +681,7 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
       'bonus.reversed',
       'bonus.paid',
     ]);
-  });
+  }, 30_000);
 
   it('serves the rest of the documented surface as documented', async () => {
     const program = check<{ id: string }>(
@@ -727,6 +852,126 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
     check('deleteWebhookEndpoint', await admin.delete(`/webhooks/${hookId}`));
     check('testWebhookEndpoint', await admin.post(`/webhooks/${hookId}/test`));
 
+    // Pay with PayPal, against a fake PayPal.
+    const fake = new FakePaypal();
+    fake.addApp({ env: 'live', clientId: 'ContractClientId0123456789', secret: 'ContractSecret0123456789' });
+    __setPaypalFetchForTests(fake.fetch);
+    try {
+      check('listPaypalConnections', await admin.get('/config/paypal'));
+      check('connectPaypal', await admin.post('/config/paypal', { environment: 'live', clientId: 'x' }));
+      check('connectPaypal', await admin.post('/config/paypal', { environment: 'live', clientId: 'ContractClientId0123456789', clientSecret: 'WrongSecret0123456789' }));
+      check('connectPaypal', await admin.post('/config/paypal', { environment: 'live', clientId: 'ContractClientId0123456789', clientSecret: 'ContractSecret0123456789' }));
+      check('verifyPaypalConnection', await admin.post('/config/paypal/live/verify'));
+      check('verifyPaypalConnection', await admin.post('/config/paypal/sandbox/verify'));
+      check('activatePaypalEnvironment', await admin.post('/config/paypal/live/activate'));
+      check('activatePaypalEnvironment', await admin.post('/config/paypal/sandbox/activate'));
+
+      const ppRun = ulid();
+      const ppPartner = ulid();
+      await db(TABLES.Partner).insert({ id: ppPartner, tenantId: DEFAULT_TENANT_ID, name: 'PayPal partner', email: 'pp@example.com', activatedAt: new Date() });
+      const details = parsePayoutDetails({ method: 'paypal', email: 'pp@pay.example.com' });
+      if (!details.ok) throw new Error('bad fixture');
+      await savePayoutProfile(db, DEFAULT_TENANT_ID, ppPartner, details.details, 'admin');
+      const ppPayout = ulid();
+      await db(TABLES.Payout).insert({
+        id: ppPayout,
+        tenantId: DEFAULT_TENANT_ID,
+        partnerId: ppPartner,
+        amount: '12.00',
+        currency: 'USD',
+        method: 'manual',
+        status: 'pending',
+        metadata: { runId: ppRun, commissionCount: 1 },
+      });
+      check('sendRunWithPaypal', await admin.post(`/payouts/runs/${ppRun}/paypal-batches`, { currency: 'nope' }));
+      check('sendRunWithPaypal', await admin.post(`/payouts/runs/${ppRun}/paypal-batches`, { currency: 'INR' }));
+      check('sendRunWithPaypal', await admin.post('/payouts/runs/missing/paypal-batches', { currency: 'USD' }));
+      const ppSent = check<{ batch: { batchId: string } }>('sendRunWithPaypal', await admin.post(`/payouts/runs/${ppRun}/paypal-batches`, { currency: 'USD' }));
+      const ppBatch = ppSent.batch.batchId;
+      check('listRunPaypalBatches', await admin.get(`/payouts/runs/${ppRun}/paypal-batches`));
+      check('getPaypalBatch', await admin.get(`/payouts/paypal-batches/${ppBatch}`));
+      check('getPaypalBatch', await admin.get('/payouts/paypal-batches/missing'));
+      check('disconnectPaypal', await admin.delete('/config/paypal/live')); // 409: in flight
+      fake.setItem(ppBatch, ppPayout, 'UNCLAIMED', 'RECEIVER_UNREGISTERED');
+      check('syncPaypalBatch', await admin.post(`/payouts/paypal-batches/${ppBatch}/sync`));
+      check('syncPaypalBatch', await admin.post('/payouts/paypal-batches/missing/sync'));
+      check('getManualPayoutRun', await admin.get(`/payouts/runs/${ppRun}`));
+      check('listManualPayoutRunPayouts', await admin.get(`/payouts/runs/${ppRun}/payouts`));
+      check('resolvePaypalBatch', await admin.post(`/payouts/paypal-batches/${ppBatch}/resolve`, { action: 'release' })); // 409: PayPal has it
+      check('resolvePaypalBatch', await admin.post(`/payouts/paypal-batches/${ppBatch}/resolve`, { action: 'nope' }));
+      check('resolvePaypalBatch', await admin.post('/payouts/paypal-batches/missing/resolve', { action: 'release' }));
+      check('cancelUnclaimedPaypalPayout', await admin.post(`/payouts/${ppPayout}/paypal-cancel`));
+      check('cancelUnclaimedPaypalPayout', await admin.post(`/payouts/${ppPayout}/paypal-cancel`));
+
+      // INR through Pay with PayPal in USD, at a quoted ECB rate.
+      const ecb = stubEcbFetch('ok');
+      const inrRun = ulid();
+      const inrPayout = ulid();
+      try {
+        check('getPaypalPayoutSettings', await admin.get('/config/paypal-payouts'));
+        check('updatePaypalPayoutSettings', await admin.post('/config/paypal-payouts', { sendUnsupportedAs: 'EUR' }));
+        await db(TABLES.Payout).insert({
+          id: inrPayout,
+          tenantId: DEFAULT_TENANT_ID,
+          partnerId: ppPartner,
+          amount: '1500.00',
+          currency: 'INR',
+          method: 'manual',
+          status: 'pending',
+          metadata: { runId: inrRun, commissionCount: 1 },
+        });
+        check('quotePaypalConversion', await admin.post(`/payouts/runs/${inrRun}/paypal-batches/quote`, { currency: 'INR', sendAs: 'USD' })); // 409: off
+        check('updatePaypalPayoutSettings', await admin.post('/config/paypal-payouts', { sendUnsupportedAs: 'USD' }));
+        check('getManualPayoutRun', await admin.get(`/payouts/runs/${inrRun}`));
+        check('listManualPayoutRunPayouts', await admin.get(`/payouts/runs/${inrRun}/payouts`));
+        check('quotePaypalConversion', await admin.post(`/payouts/runs/${inrRun}/paypal-batches/quote`, { currency: 'INR' }));
+        check('quotePaypalConversion', await admin.post(`/payouts/runs/${inrRun}/paypal-batches/quote`, { currency: 'USD', sendAs: 'USD' }));
+        check('quotePaypalConversion', await admin.post(`/payouts/runs/${ulid()}/paypal-batches/quote`, { currency: 'INR', sendAs: 'USD' }));
+        const quoted = check<{ quote: { quoteId: string } }>(
+          'quotePaypalConversion',
+          await admin.post(`/payouts/runs/${inrRun}/paypal-batches/quote`, { currency: 'INR', sendAs: 'USD' }),
+        );
+        check('sendRunWithPaypal', await admin.post(`/payouts/runs/${inrRun}/paypal-batches`, { currency: 'INR', sendAs: 'USD' }));
+        check('sendRunWithPaypal', await admin.post(`/payouts/runs/${inrRun}/paypal-batches`, { currency: 'USD', sendAs: 'USD', quoteId: quoted.quote.quoteId }));
+        const inrSent = check<{ batch: { batchId: string } }>(
+          'sendRunWithPaypal',
+          await admin.post(`/payouts/runs/${inrRun}/paypal-batches`, { currency: 'INR', sendAs: 'USD', quoteId: quoted.quote.quoteId }),
+        );
+        check('sendRunWithPaypal', await admin.post(`/payouts/runs/${inrRun}/paypal-batches`, { currency: 'INR', sendAs: 'USD', quoteId: quoted.quote.quoteId })); // 409: spent
+        check('getPaypalBatch', await admin.get(`/payouts/paypal-batches/${inrSent.batch.batchId}`));
+        check('listManualPayoutRunPayouts', await admin.get(`/payouts/runs/${inrRun}/payouts`));
+        check('listPartnerPayouts', await admin.get(`/partners/${ppPartner}/payouts`));
+        check('listPayouts', await admin.get('/payouts'));
+        ecb.serve('down');
+        check('quotePaypalConversion', await admin.post(`/payouts/runs/${inrRun}/paypal-batches/quote`, { currency: 'INR', sendAs: 'USD' })); // 503
+        check('updatePaypalPayoutSettings', await admin.post('/config/paypal-payouts', { sendUnsupportedAs: null }));
+      } finally {
+        ecb.restore();
+        // The batch is in flight at the fake PayPal; leave nothing pinning the app.
+        await db(TABLES.Payout).where({ id: inrPayout }).del();
+        await db(TABLES.PaypalPayoutBatch).where({ runId: inrRun }).del();
+        await db(TABLES.Config).where({ tenantId: DEFAULT_TENANT_ID, key: 'paypal_payouts' }).del();
+      }
+
+      // PayPal payments as conversions.
+      fake.addApp({ env: 'live', clientId: 'ContractCheckoutId0123456789', secret: 'ContractCheckoutSecret0123456' });
+      check('listPaypalPaymentApps', await admin.get('/config/paypal-payments'));
+      check('setPaypalPaymentTracking', await admin.post('/config/paypal/live/payments', { tracking: true }));
+      check('setPaypalPaymentTracking', await admin.post('/config/paypal/sandbox/payments', { tracking: true }));
+      check('setPaypalPaymentTracking', await admin.post('/config/paypal/live/payments', { tracking: false }));
+      check('connectPaypalCheckoutApp', await admin.post('/config/paypal-payments', { environment: 'live', clientId: 'ContractClientId0123456789', clientSecret: 'ContractSecret0123456789' }));
+      check('connectPaypalCheckoutApp', await admin.post('/config/paypal-payments', { environment: 'live', clientId: 'ContractCheckoutId0123456789', clientSecret: 'ContractCheckoutSecret0123456' }));
+      check('listPaypalPaymentApps', await admin.get('/config/paypal-payments'));
+      check('disconnectPaypalCheckoutApp', await admin.delete('/config/paypal-payments/live'));
+      check('disconnectPaypalCheckoutApp', await admin.delete('/config/paypal-payments/live'));
+
+      check('disconnectPaypal', await admin.delete('/config/paypal/live'));
+      check('disconnectPaypal', await admin.delete('/config/paypal/live'));
+      await db(TABLES.Payout).where({ id: ppPayout }).del();
+    } finally {
+      __setPaypalFetchForTests(null);
+    }
+
     // Export round trip.
     const bundle = check<Record<string, unknown>>('exportAllJson', await admin.get('/export.json'));
     check('exportTable', await admin.get('/export/Partner.json'));
@@ -735,7 +980,7 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
     check('exportAllSql', await admin.get('/export.sql'));
     check('importBundle', await admin.post('/import', bundle));
     check('importBundle', await admin.post('/import', { ...bundle, schemaVersion: 999 }));
-  });
+  }, 30_000);
 
   it("enforces every operation's documented access, credential by credential", async () => {
     // Its own app instance: this sweep makes a few hundred calls and must
@@ -836,6 +1081,26 @@ describe.skipIf(skipIntegration)('documented API contract', () => {
     status('deactivatePartnerCoupon', await writer.delete(`/partners/${own.id}/coupons/${viaScope.id}`), 200);
     status('deactivatePartnerCoupon', await ownPartner.delete(`/partners/${own.id}/coupons/${viaPartner.id}`), 200);
     status('deactivatePartnerCoupon', await scopedOnly.delete(`/partners/${own.id}/coupons/${viaPartner.id}`), 403);
+
+    // A payout statement: any payout for an admin or a payouts:read key, a partner's own only.
+    const ownPayout = ulid();
+    await db(TABLES.Payout).insert({
+      id: ownPayout,
+      tenantId: DEFAULT_TENANT_ID,
+      partnerId: own.id,
+      amount: '10.00',
+      currency: 'USD',
+      method: 'manual',
+      status: 'pending',
+      metadata: {},
+    });
+    const statementOf = `/payouts/${ownPayout}/statement?format=json`;
+    status('getPayoutStatement', await ownPartner.get(statementOf), 200);
+    status('getPayoutStatement', await as(scopeKey['payouts:read']!, target).get(statementOf), 200);
+    const otherPartner = as((await adm.post(`/partners/${other.id}/api-keys`)).body.plaintext as string, target);
+    status('getPayoutStatement', await otherPartner.get(statementOf), 404);
+    status('getPayoutStatement', await scopedOnly.get(statementOf), 403);
+    status('getPayoutStatement', await as(null, target).get(statementOf), 401);
 
     const othersKey = (await adm.post(`/partners/${other.id}/api-keys`)).body as { id: string };
     const ownSpare = (await adm.post(`/partners/${own.id}/api-keys`)).body as { id: string };

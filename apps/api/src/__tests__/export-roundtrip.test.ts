@@ -119,6 +119,8 @@ async function seedEverything(): Promise<Seeded> {
     attributionModel: 'last_click',
     // Not the column default, so a restore that dropped it would show.
     renewalsStayWithPartner: false,
+    // Nor this (schemaVersion 13).
+    couponsYieldToLinks: true,
   });
   await db(TABLES.PartnerProgram).insert({
     id: ulid(),
@@ -153,6 +155,8 @@ async function seedEverything(): Promise<Seeded> {
     partnerId,
     programId,
     code: 'CREATOR15',
+    // The brand's admin typed it (schemaVersion 10).
+    brandChosen: true,
   });
   await db(TABLES.Link).insert({
     id: linkId,
@@ -173,6 +177,8 @@ async function seedEverything(): Promise<Seeded> {
     subId: 'wct_9f2a-17',
     ts: new Date(),
   });
+  // The SDK saw it land (schemaVersion 12).
+  await db(TABLES.ClickLanding).insert({ clickId, tenantId: TENANT, host: 'www.x.test' });
   await db(TABLES.Identity).insert({
     id: identityId,
     tenantId: TENANT,
@@ -457,6 +463,7 @@ describe.skipIf(skipIntegration)('export coverage', () => {
     expect(at(TABLES.Program)).toBeLessThan(at(TABLES.Coupon));
     expect(at(TABLES.Link)).toBeLessThan(at(TABLES.Click));
     expect(at(TABLES.Click)).toBeLessThan(at(TABLES.Identity));
+    expect(at(TABLES.Click)).toBeLessThan(at(TABLES.ClickLanding));
     expect(at(TABLES.Event)).toBeLessThan(at(TABLES.Attribution));
     expect(at(TABLES.Attribution)).toBeLessThan(at(TABLES.Commission));
     expect(at(TABLES.Partner)).toBeLessThan(at(TABLES.Bonus));
@@ -496,6 +503,8 @@ describe.skipIf(skipIntegration)('JSON round-trip', () => {
     expect(terms.holdbackDays).toBe(30);
     const coupon = await db(TABLES.Coupon).where({ id: seeded.couponId }).first();
     expect(coupon.code).toBe('CREATOR15');
+    // Who chose the code travels with it (schemaVersion 10).
+    expect(coupon.brandChosen).toBe(true);
     // The publisher's sub-ID stays on its click (schemaVersion 8).
     expect((await db(TABLES.Click).where({ id: seeded.clickId }).first()).subId).toBe('wct_9f2a-17');
     // The Network consent record keeps how and when, not just the status.
@@ -518,6 +527,7 @@ describe.skipIf(skipIntegration)('JSON round-trip', () => {
     expect(program.commissionRule).toEqual([{ trigger: 'every', type: 'percent', value: 20 }]);
     expect(program.categories).toEqual(['saas', 'devtools']);
     expect(program.renewalsStayWithPartner).toBe(false);
+    expect(program.couponsYieldToLinks).toBe(true);
     // …and that the money ledger survived with its shape intact.
     const commission = await db(TABLES.Commission).where({ id: seeded.commissionId }).first();
     expect(commission.amount).toBe('40.00');
@@ -646,6 +656,32 @@ describe.skipIf(skipIntegration)('JSON round-trip', () => {
       value: { uninvitedPortalAccess: false },
       updatedAt: new Date(),
     });
+    // So does a brand's "Not now" to the Network listing.
+    await db(TABLES.Config).insert({
+      tenantId: TENANT,
+      key: 'onboarding',
+      value: { networkListingSkipped: true },
+      updatedAt: new Date(),
+    });
+    // And what its payout statements print.
+    await db(TABLES.Config).insert({
+      tenantId: TENANT,
+      key: 'payout_statements',
+      value: { legalName: 'Volza Technologies Pvt Ltd', numberPrefix: 'VZ-', taxLines: { enabled: false, labels: ['Tax withheld'] } },
+      updatedAt: new Date(),
+    });
+    // And its choice to pay INR balances through PayPal in USD.
+    await db(TABLES.Config).insert({
+      tenantId: TENANT,
+      key: 'paypal_payouts',
+      value: { sendUnsupportedAs: 'USD' },
+      updatedAt: new Date(),
+    });
+    // And which stages partners see on their referrals.
+    const referralStages = { stages: [{ eventType: 'demo_booked', label: 'Demo booked' }], showCustomerLabels: true };
+    await db(TABLES.Config).insert({ tenantId: TENANT, key: 'partner_referrals', value: referralStages, updatedAt: new Date() });
+    // And whether new Tracking health flags are emailed.
+    await db(TABLES.Config).insert({ tenantId: TENANT, key: 'tracking_alerts', value: { email: false }, updatedAt: new Date() });
 
     const bundle = await exportAll(db, TENANT);
     const keys = (bundle[TABLES.Config] as Array<{ key: string }>).map((r) => r.key).sort();
@@ -659,8 +695,13 @@ describe.skipIf(skipIntegration)('JSON round-trip', () => {
       [TABLES.Config]: [...bundle[TABLES.Config]!, { tenantId: 'x', key: 'network_membership', value: others.network_membership }],
     };
     const report = await importBundle(db, TENANT, smuggled);
-    expect(report.inserted[TABLES.Config]).toBe(3);
+    expect(report.inserted[TABLES.Config]).toBe(PORTABLE_CONFIG_KEYS.length);
     expect((await db(TABLES.Config).where({ key: 'partner_access' }).first()).value).toEqual({ uninvitedPortalAccess: false });
+    expect((await db(TABLES.Config).where({ key: 'onboarding' }).first()).value).toEqual({ networkListingSkipped: true });
+    expect((await db(TABLES.Config).where({ key: 'payout_statements' }).first()).value).toMatchObject({ legalName: 'Volza Technologies Pvt Ltd', numberPrefix: 'VZ-' });
+    expect((await db(TABLES.Config).where({ key: 'paypal_payouts' }).first()).value).toEqual({ sendUnsupportedAs: 'USD' });
+    expect((await db(TABLES.Config).where({ key: 'partner_referrals' }).first()).value).toEqual(referralStages);
+    expect((await db(TABLES.Config).where({ key: 'tracking_alerts' }).first()).value).toEqual({ email: false });
     expect(report.skipped[TABLES.Config]).toBe(1);
     expect(await db(TABLES.Config).where({ key: 'network_membership' })).toHaveLength(0);
     expect((await db(TABLES.Config).where({ key: 'partner_signup' }).first()).value).toEqual({
@@ -919,8 +960,61 @@ describe.skipIf(skipIntegration)('JSON round-trip', () => {
     expect((await counts())[TABLES.PartnerPayoutProfile]).toBe(0);
   }, 30_000);
 
-  it('exports at schemaVersion 9', () => {
-    expect(SCHEMA_VERSION).toBe(9);
+  it('accepts a v9 bundle — coupons restore as not chosen by the brand', async () => {
+    const seeded = await seedEverything();
+    const v9 = await exportAll(db, TENANT);
+    v9[TABLES.Coupon] = (v9[TABLES.Coupon] as Record<string, unknown>[]).map(({ brandChosen: _dropped, ...row }) => row);
+    await wipe();
+
+    const app = createApp();
+    const ADMIN_KEY = process.env.ADMIN_API_KEY ?? 'op_test_admin_key_0123456789abcdef0123';
+    const viaRoute = await request(app)
+      .post('/import')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`)
+      .send({ schemaVersion: 9, tables: v9 });
+    expect(viaRoute.status).toBe(200);
+    const coupon = await db(TABLES.Coupon).where({ id: seeded.couponId }).first();
+    expect(coupon).toMatchObject({ code: 'CREATOR15', brandChosen: false });
+  }, 30_000);
+
+  it('accepts a v11 bundle — no landings, every click restores as never landed', async () => {
+    const seeded = await seedEverything();
+    const v11 = await exportAll(db, TENANT);
+    delete v11[TABLES.ClickLanding];
+    await wipe();
+
+    const app = createApp();
+    const ADMIN_KEY = process.env.ADMIN_API_KEY ?? 'op_test_admin_key_0123456789abcdef0123';
+    const viaRoute = await request(app)
+      .post('/import')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`)
+      .send({ schemaVersion: 11, tables: v11 });
+    expect(viaRoute.status).toBe(200);
+    expect(await db(TABLES.Click).where({ id: seeded.clickId }).first()).toBeTruthy();
+    expect((await counts())[TABLES.ClickLanding]).toBe(0);
+  }, 30_000);
+
+  it('accepts a v12 bundle — programs restore with coupons competing as clicks', async () => {
+    const seeded = await seedEverything();
+    const v12 = await exportAll(db, TENANT);
+    v12[TABLES.Program] = (v12[TABLES.Program] as Record<string, unknown>[]).map(
+      ({ couponsYieldToLinks: _dropped, ...row }) => row,
+    );
+    await wipe();
+
+    const app = createApp();
+    const ADMIN_KEY = process.env.ADMIN_API_KEY ?? 'op_test_admin_key_0123456789abcdef0123';
+    const viaRoute = await request(app)
+      .post('/import')
+      .set('Authorization', `Bearer ${ADMIN_KEY}`)
+      .send({ schemaVersion: 12, tables: v12 });
+    expect(viaRoute.status).toBe(200);
+    const program = await db(TABLES.Program).where({ id: seeded.programId }).first();
+    expect(program.couponsYieldToLinks).toBe(false);
+  }, 30_000);
+
+  it('exports at schemaVersion 13', () => {
+    expect(SCHEMA_VERSION).toBe(13);
   });
 });
 
@@ -1094,7 +1188,9 @@ describe.skipIf(skipIntegration)('SQL dump', () => {
     expect(program.commissionRule).toEqual([{ trigger: 'every', type: 'percent', value: 20 }]);
     expect(program.categories).toEqual(['saas', 'devtools']);
     expect(program.renewalsStayWithPartner).toBe(false);
+    expect(program.couponsYieldToLinks).toBe(true);
     expect((await db(TABLES.Click).first()).subId).toBe('wct_9f2a-17');
+    expect((await db(TABLES.Coupon).first()).brandChosen).toBe(true);
   }, 30_000);
 
   it('payout details restore opened, and the first read seals them', async () => {

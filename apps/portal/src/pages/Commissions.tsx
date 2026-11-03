@@ -1,7 +1,13 @@
 import { useInfiniteQuery } from '@tanstack/react-query';
 import { Receipt } from 'lucide-react';
 import { api, type Principal } from '../api.js';
-import { commissionSourceLabel, isBonusCommission, type CommissionSourceFields } from '../lib/commission-source.js';
+import {
+  commissionSourceLabel,
+  isBonusCommission,
+  isRecruiterCommission,
+  type CommissionSourceFields,
+} from '../lib/commission-source.js';
+import { TenantLink } from '../tenant-link.js';
 import { theme } from '../theme.js';
 import { Avatar, Button, Card, EmptyState, ErrorBanner, Page, StatusPill, Table, formatDate, money, shortId } from '../ui.js';
 
@@ -18,6 +24,8 @@ interface Commission extends CommissionSourceFields {
   accruedAt: string;
   paidAt: string | null;
   campaignName?: string | null;
+  /** The attributed event; null on a bonus's commission. */
+  eventId?: string | null;
 }
 
 const PAGE_SIZE = 200;
@@ -36,12 +44,13 @@ export function CommissionPartnerCell({ c }: { c: Pick<Commission, 'partnerId' |
 
 /** What it was earned on, with the program underneath. A bonus's note is
  *  the brand's own words to the partner, so it wraps rather than truncates.
+ *  A bonus and a recruiter's share stand out from the sales around them.
  *  Shared with the review queue (AdminReview.tsx). */
 export function CommissionSourceCell({ c }: { c: CommissionSourceFields & { campaignName?: string | null } }) {
-  const bonus = isBonusCommission(c);
+  const standOut = isBonusCommission(c) || isRecruiterCommission(c);
   return (
     <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2, maxWidth: 320, whiteSpace: 'normal' }}>
-      <span style={{ color: bonus ? theme.accentText : theme.text, fontWeight: bonus ? 500 : 400, overflowWrap: 'anywhere' }}>
+      <span style={{ color: standOut ? theme.accentText : theme.text, fontWeight: standOut ? 500 : 400, overflowWrap: 'anywhere' }}>
         {commissionSourceLabel(c)}
       </span>
       {c.campaignName && <span style={{ fontSize: 12, color: theme.textDim }}>{c.campaignName}</span>}
@@ -67,7 +76,7 @@ export function CommissionsPage({ principal }: { principal: Principal }) {
 
   const isAdminView = principal.role === 'admin' && !partnerId;
   const columns = isAdminView
-    ? ['ID', 'Partner', 'Source', { label: 'Amount', align: 'right' as const }, 'Status', 'Accrued', 'Paid']
+    ? ['ID', 'Partner', 'Source', { label: 'Amount', align: 'right' as const }, 'Status', 'Accrued', 'Paid', 'Journey']
     : ['ID', 'Source', { label: 'Amount', align: 'right' as const }, 'Status', 'Accrued', 'Paid'];
 
   const rows = (data?.pages.flatMap((p) => p.commissions) ?? []).map((c) => {
@@ -79,6 +88,8 @@ export function CommissionsPage({ principal }: { principal: Principal }) {
       <StatusPill status={c.status} />,
       <span style={{ color: theme.textMuted }}>{formatDate(c.accruedAt, { relative: true })}</span>,
       <span style={{ color: theme.textMuted }}>{formatDate(c.paidAt, { relative: true })}</span>,
+      // Who else touched the customer, and why this partner got the credit.
+      isAdminView ? (c.eventId ? <TenantLink to={`/admin/journey?event=${encodeURIComponent(c.eventId)}`}>Open</TenantLink> : <span />) : null,
     ];
     return base.filter((x) => x !== null) as React.ReactNode[];
   });

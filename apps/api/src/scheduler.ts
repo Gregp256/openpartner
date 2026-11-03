@@ -19,11 +19,24 @@
  *   - payout-transfers: every 15 minutes. Retries/reconciles Connect
  *                   transfer intents left open by a crash, an ambiguous
  *                   Stripe response, or a partner who wasn't ready.
+ *   - paypal-payouts: every 5 minutes. Posts Pay with PayPal batches
+ *                   waiting to go out (or re-sends one whose answer never
+ *                   came), and reads PayPal's status for batches it is
+ *                   processing (paypal-payouts.ts).
+ *   - paypal-payments-catchup: hourly. Records the PayPal payments a
+ *                   webhook missed, for apps tracking payments
+ *                   (paypal-payments-catchup.ts). Every mode: a self-host
+ *                   PayPal can't post to has only this.
  *   - sanctions-screening: hourly. Screens partners with approved
  *                   commissions against the Consolidated Screening List
  *                   the first time they're payable, and again at most
  *                   daily (the payouts tick also runs this part first),
  *                   then any brand never screened under its current name.
+ *   - tracking-alerts: daily at 06:40 UTC. Per active tenant, emails the
+ *                   admins each setup check that turns failing and each
+ *                   Tracking health flag the first time it appears
+ *                   (tracking-alerts.ts), unless the brand turned the
+ *                   email off.
  *
  * Both jobs are no-ops in selfhost mode for usage-report. Payouts run in
  * every mode (a self-host operator with no approved commissions just gets
@@ -56,6 +69,7 @@ import { runScreeningSweep, screenPayablePartners } from './sanctions-screening.
 import { sealPlaintextPayoutProfiles } from './payout-profile.js';
 import { runSealWebhookSecretsJob } from './webhook-secret.js';
 import { runSealPostbackUrlsJob } from './postback-url.js';
+import { purgeTestClicks, TEST_CLICK } from './test-clicks.js';
 
 interface ScheduledJob {
   name: string;
@@ -188,6 +202,26 @@ const JOBS: ScheduledJob[] = [
     },
   },
   {
+    name: 'paypal-payouts',
+    cronExpr: '*/5 * * * *',
+    description:
+      'Pay with PayPal: post committed batches with their frozen sender_batch_id (re-sending only within 29 days of the first POST), read back batches PayPal is processing, confirm paid items and release failed or returned ones (every 5 minutes)',
+    handler: async () => {
+      const { runPaypalPayoutsJob } = await import('./paypal-payouts.js');
+      return runPaypalPayoutsJob(db);
+    },
+  },
+  {
+    name: 'paypal-payments-catchup',
+    cronExpr: '50 * * * *',
+    description:
+      'For each PayPal app tracking payments, list the webhook events of the last 72 hours and Transaction Search of the last 4 days, record the payments no webhook delivered, and put its webhook back to the events OpenPartner reads (paypal-payments-catchup.ts; hourly at :50)',
+    handler: async () => {
+      const { runPaypalPaymentsCatchup } = await import('./paypal-payments-catchup.js');
+      return runPaypalPaymentsCatchup();
+    },
+  },
+  {
     name: 'sanctions-screening',
     cronExpr: '35 * * * *',
     description:
@@ -228,6 +262,26 @@ const JOBS: ScheduledJob[] = [
     handler: async () => {
       const { reconcileNetworkReview } = await import('./network-review-reconcile.js');
       return reconcileNetworkReview();
+    },
+  },
+  {
+    name: 'network-creator-review-alert',
+    cronExpr: '5,20,35,50 * * * *',
+    description:
+      'Hosted multi-tenant: email the ops inbox when Network creators finish their profile and wait for review (every 15 minutes)',
+    handler: async () => {
+      const { alertOpsToCreatorsAwaitingReview } = await import('./network-creator-review-alert.js');
+      return alertOpsToCreatorsAwaitingReview();
+    },
+  },
+  {
+    name: 'network-mailbox-alert',
+    cronExpr: '10,25,40,55 * * * *',
+    description:
+      "Hosted multi-tenant: email the platform admins once when a creator-index mailbox loses its Microsoft connection, which stops it sending until it's reconnected (every 15 minutes)",
+    handler: async () => {
+      const { alertAdminsToLostMailboxes } = await import('./network-mailbox-alert.js');
+      return alertAdminsToLostMailboxes();
     },
   },
   {
@@ -279,6 +333,29 @@ const JOBS: ScheduledJob[] = [
       const r = await adminRunCreatorReminders(networkUrl, { dryRun: false });
       return { sent: r.sent, failed: r.failed, eligible: r.eligible.length };
     },
+  },
+  {
+    name: 'creator-storefront-nudge',
+    cronExpr: '45 15 * * *',
+    description:
+      'Hosted multi-tenant, when switched on in the ops console: trigger the Network to email creators a week in who have no storefront, once each (daily 15:45 UTC)',
+    handler: async () => {
+      if (getTenancyMode() !== 'multi') return { skipped: 'single_tenant' };
+      const { getNotificationSettings } = await import('./platform-settings.js');
+      if (!(await getNotificationSettings(db)).creatorStorefrontNudge) return { skipped: 'disabled' };
+      const { adminRunStorefrontNudge, platformNetworkUrl } = await import('./network-client.js');
+      const networkUrl = platformNetworkUrl();
+      if (!networkUrl || !process.env.NETWORK_ADMIN_API_KEY) return { skipped: 'network_admin_not_configured' };
+      const r = await adminRunStorefrontNudge(networkUrl, { dryRun: false });
+      return { sent: r.sent, failed: r.failed, eligible: r.eligible.length };
+    },
+  },
+  {
+    name: 'creator-index-invites',
+    cronExpr: '20 * * * *',
+    description:
+      "Hosted multi-tenant: trigger the Network to email creators not on OpenPartner yet whom brands invited, one email a week each at most (hourly :20). The switch is the creator index's own invitesEnabled, in the ops console",
+    handler: runCreatorIndexInvitesJob,
   },
   {
     name: 'funding-collector',
@@ -365,6 +442,41 @@ const JOBS: ScheduledJob[] = [
     handler: runPerformanceBountiesJob,
   },
   {
+    name: 'stripe-app-reward-backfill',
+    cronExpr: '50 * * * *',
+    description:
+      'Hosted: give partner codes with a customer discount their promotion code in the brand’s connected Stripe where it is still missing — a connect-time pass that failed, a mint whose Stripe call failed, a program that gained a reward later (customer-rewards.ts; hourly at :50)',
+    handler: async () => {
+      if (getMode() === 'selfhost') return { skipped: 'selfhost' };
+      const { runRewardBackfillSweep } = await import('./customer-rewards.js');
+      return runRewardBackfillSweep();
+    },
+  },
+  {
+    name: 'stripe-event-catchup',
+    cronExpr: '25 */6 * * *',
+    description:
+      'Hosted: list each connected brand’s Stripe events from the last 72 hours and record the ones no webhook delivered (stripe-event-catchup.ts; every 6 hours at :25)',
+    handler: async () => {
+      if (getMode() === 'selfhost') return { skipped: 'selfhost' };
+      const { runStripeEventCatchup } = await import('./stripe-event-catchup.js');
+      return runStripeEventCatchup();
+    },
+  },
+  {
+    name: 'tracking-alerts',
+    cronExpr: '40 6 * * *',
+    description:
+      'Per tenant: run the setup checks (setup-checks.ts), compare each browser and partner with its own recent past (tracking-flags.ts), and email the admins each check that turns failing and each flag the first time it appears, unless the brand turned it off (daily 06:40 UTC)',
+    handler: runTrackingAlertsJob,
+  },
+  {
+    name: 'test-click-purge',
+    cronExpr: '50 6 * * *',
+    description: `Delete admins' test clicks (test-clicks.ts) ${TEST_CLICK.retentionDays} days after they were made (daily 06:50 UTC)`,
+    handler: async () => ({ deleted: await purgeTestClicks(db) }),
+  },
+  {
     name: 'seal-payout-details',
     cronExpr: '35 * * * *',
     description:
@@ -392,6 +504,20 @@ const JOBS: ScheduledJob[] = [
  * sync.ts). Every console save pushes it already; this heals a push that
  * failed, and covers a Network that was updated or restored since.
  */
+/** The creator index's weekly invite email (openpartner-network
+ *  docs/creator-index.md §5.2). The Network decides who is due, and whether
+ *  invites are on at all. */
+export async function runCreatorIndexInvitesJob() {
+  if (getMode() === 'selfhost') return { skipped: 'selfhost' };
+  if (getTenancyMode() !== 'multi') return { skipped: 'single_tenant' };
+  const { adminRunCreatorIndexInvites, platformNetworkUrl } = await import('./network-client.js');
+  const networkUrl = platformNetworkUrl();
+  if (!networkUrl || !process.env.NETWORK_ADMIN_API_KEY) return { skipped: 'network_admin_not_configured' };
+  const r = await adminRunCreatorIndexInvites(networkUrl, { dryRun: false });
+  if (!r.ran) return { skipped: 'invites_off' };
+  return { sent: r.sent, failed: r.failed, expired: r.expired, candidates: r.candidates };
+}
+
 export async function runCountryAccessSyncJob() {
   if (getTenancyMode() !== 'multi') return { skipped: 'single_tenant' };
   const { pushCountryAccessToNetwork } = await import('./country-access-sync.js');
@@ -439,6 +565,15 @@ export async function runPerformanceBountiesJob() {
 }
 
 /**
+ * The daily Tracking health alert sweep (tracking-alerts.ts), one tenant
+ * transaction each. Returns counts only.
+ */
+export async function runTrackingAlertsJob() {
+  const { sweepTenantTrackingAlerts } = await import('./tracking-alerts.js');
+  return forEachActiveTenant((trx, tenantId) => sweepTenantTrackingAlerts(trx, tenantId));
+}
+
+/**
  * Tables with a tenantId column that the tenant purge deliberately keeps:
  * compliance records retained for 10 years (OFAC, 31 CFR 501.601; see
  * docs/country-access.md "Records"). They're append-only with no foreign
@@ -468,6 +603,7 @@ export const TENANT_PURGE_ORDER = [
   TABLES.WebhookEndpoint,
   TABLES.Session,
   TABLES.MagicLinkToken,
+  TABLES.PartnerSigninLinkLog,
   // The brand's partner passwords and any signup password still waiting on
   // an activation link. Platform passwords belong to an email, not a brand:
   // they sit under DEFAULT_TENANT_ID, like platform magic-link tokens, and
@@ -477,13 +613,24 @@ export const TENANT_PURGE_ORDER = [
   TABLES.ConversionPostbackToken,
   TABLES.Config,
   TABLES.BrandNotification,
+  TABLES.TrackingIssue,
+  TABLES.TrackingAlert,
+  // Before Program (TestClick.programId).
+  TABLES.TestClick,
   TABLES.OperatorRecoveryRequest,
   TABLES.UsageLedger,
   TABLES.UsageFeeShadow,
   TABLES.HostedFeeTerms,
   TABLES.HostedBillingProfile,
   TABLES.HostedBillingState,
+  TABLES.StripeEventLog,
   TABLES.TenantStripeConnection,
+  TABLES.PaymentEventLog,
+  // Before PaypalConnection (PaypalPayoutBatch.connectionId,
+  // PaypalSubscription.connectionId).
+  TABLES.PaypalPayoutBatch,
+  TABLES.PaypalSubscription,
+  TABLES.PaypalConnection,
   TABLES.PortalCustomDomain,
   // Before Payout (PayoutReversal.payoutId).
   TABLES.PayoutReversal,
@@ -507,6 +654,8 @@ export const TENANT_PURGE_ORDER = [
   TABLES.Attribution,
   TABLES.Event,
   TABLES.Identity,
+  // Cascades with its Click; named so the purge never depends on that.
+  TABLES.ClickLanding,
   TABLES.Click,
   TABLES.Link,
   TABLES.Coupon,

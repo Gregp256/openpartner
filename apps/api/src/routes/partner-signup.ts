@@ -36,6 +36,13 @@
  * Everyone else is asked once in the portal. Network failures are queued
  * in NetworkOutbox and don't fail the signup.
  *
+ * Recruiting (two-tier, recruiter-commissions.ts): a join link carrying
+ * `?ref=<recruitCode>` names the partner who sent the applicant. The page
+ * passes it on as `ref`; a code that names a partner who may still recruit
+ * makes them the new partner's recruiter from the moment of signup. Any
+ * other code is ignored, so a stale link never fails a signup. Status takes
+ * `?ref=` too and answers the recruiter's name, for "Jane invited you".
+ *
  * Webhooks: every signup fires `partner.created` with `source: 'join_page'`.
  * An auto-approved applicant is active from the moment they apply, so
  * `partner.activated` (`invited: false`) follows straight away; one held
@@ -44,7 +51,7 @@
  */
 
 import { Router } from 'express';
-import { z } from 'zod';
+import { z } from '../zod.js';
 import { ulid } from 'ulid';
 import {
   AUDIENCE_SIZES,
@@ -77,6 +84,7 @@ import {
   recordLocationDeclaration,
 } from '../country-access.js';
 import { grantNetworkConsent, isNetworkOfferedToPartners, syncPartnerToNetwork } from '../network-consent.js';
+import { findRecruiterByCode } from '../recruiter-commissions.js';
 import { dispatchEvent } from '../webhook-dispatcher.js';
 import { onCommit } from '../on-commit.js';
 import type { WebhookPayload } from '../openapi/webhook-events.js';
@@ -102,20 +110,23 @@ const applicationSchema = z.object(
       .min(L.socialMin, 'Add at least one social profile')
       .max(L.socialMax, `Add at most ${L.socialMax} social profiles`)
       .transform((urls) => [...new Set(urls)]),
-    audienceSize: z.enum(AUDIENCE_SIZES, { errorMap: () => ({ message: 'Pick your audience size' }) }),
+    audienceSize: z.enum(AUDIENCE_SIZES, { error: 'Pick your audience size' }),
     pitch: z
       .string()
       .trim()
       .min(L.pitchMin, `Tell the brand how you'd promote it, in at least ${L.pitchMin} characters`)
       .max(L.pitchMax, `Keep your pitch under ${L.pitchMax} characters`),
   },
-  { required_error: 'Complete the application: website, social profiles, audience size and pitch' },
+  {
+    error: (issue) =>
+      issue.input === undefined ? 'Complete the application: website, social profiles, audience size and pitch' : undefined,
+  },
 );
 
 const schema = z.object({
   email: z.string().trim().email().max(254),
   name: z.string().trim().min(1).max(120),
-  profile: z.record(z.unknown()).optional(),
+  profile: z.record(z.string(), z.unknown()).optional(),
   application: applicationSchema,
   /** The join page's optional "also join the OpenPartner Network"
    *  checkbox. Unchecked (or absent) = not asked yet: the partner gets the
@@ -127,6 +138,8 @@ const schema = z.object({
   country: countryCodeSchema().optional(),
   /** Ukraine only: the applicant is outside the occupied regions. */
   outsideOccupiedRegions: z.boolean().optional(),
+  /** The recruit code off the join link (`?ref=`), when a partner sent them. */
+  ref: z.string().trim().max(64).optional(),
 });
 
 // Partner.metadata keys the server owns. This endpoint is public, so a
@@ -149,8 +162,9 @@ async function notifyAdminsOfApplication(
   reviewUrl: string,
   application: PartnerApplication,
 ): Promise<void> {
+  // Full admins: a view-only seat can't approve the application.
   const admins = (await db<AdminRow>(TABLES.Admin)
-    .where({ tenantId })
+    .where({ tenantId, role: 'admin' })
     .whereNotNull('activatedAt')
     .whereNull('revokedAt')
     .select('id', 'email')) as Array<Pick<AdminRow, 'id' | 'email'>>;
@@ -190,7 +204,7 @@ interface PartnerSignupSettings {
 
 const PARTNER_SIGNUP_CONFIG_KEY = 'partner_signup';
 
-async function readSignupSettings(
+export async function readSignupSettings(
   db: import('knex').Knex,
   tenantId: string,
 ): Promise<PartnerSignupSettings> {
@@ -210,6 +224,8 @@ async function readSignupSettings(
 partnerSignupRouter.get('/partner-signup/status', statusLimit, async (req, res) => {
   const { db, tenantId } = tenantOf(req);
   const settings = await readSignupSettings(db, tenantId);
+  const ref = typeof req.query.ref === 'string' ? req.query.ref : null;
+  const recruiter = ref ? await findRecruiterByCode(db, tenantId, ref) : undefined;
   res.json({
     open: !settings.disabled,
     reviewRequired: settings.policy === 'require_review',
@@ -217,6 +233,9 @@ partnerSignupRouter.get('/partner-signup/status', statusLimit, async (req, res) 
     networkOffered: await isNetworkOfferedToPartners(db, tenantId),
     // Hosted platform: the join page asks where the applicant is based.
     countryRequired: getTenancyMode() === 'multi',
+    // Asked with ?ref=: the partner whose recruit link this is, for "Jane
+    // invited you", or null for a code that names nobody who may recruit.
+    ...(ref ? { recruiter: recruiter ? { name: recruiter.name } : null } : {}),
   });
 });
 
@@ -270,6 +289,7 @@ partnerSignupRouter.post('/partner-signup', signupLimit, async (req, res) => {
   const id = ulid();
   const now = new Date();
   const activatedAt = settings.policy === 'auto_approve' ? now : null;
+  const recruiter = body.data.ref ? await findRecruiterByCode(db, tenantId, body.data.ref) : undefined;
   const application: PartnerApplication = { ...body.data.application, submittedAt: now.toISOString() };
   let partner: PartnerRow;
   try {
@@ -285,6 +305,7 @@ partnerSignupRouter.post('/partner-signup', signupLimit, async (req, res) => {
           ...(activatedAt ? {} : { review: { status: 'pending', appliedAt: now.toISOString() } satisfies PartnerReview }),
         },
         activatedAt,
+        ...(recruiter ? { recruitedByPartnerId: recruiter.id, recruitedAt: now } : {}),
       })
       .returning('*')) as PartnerRow[];
     if (inserted.length === 0) {
@@ -342,6 +363,7 @@ partnerSignupRouter.post('/partner-signup', signupLimit, async (req, res) => {
     portalAccess: partner.portalAccess,
     programIds: [],
     source: 'join_page',
+    ...(partner.recruitedByPartnerId ? { recruitedByPartnerId: partner.recruitedByPartnerId } : {}),
   } satisfies WebhookPayload<'partner.created'>;
   onCommit(db, 'partner.created webhook', () => dispatchEvent(tenantId, 'partner.created', createdPayload));
   if (partner.activatedAt) {

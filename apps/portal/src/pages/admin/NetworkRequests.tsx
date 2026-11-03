@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../../api.js';
 import { Button, Card, ErrorBanner, Input, Label, Page, Select } from '../../ui.js';
 import { theme } from '../../theme.js';
+import { useViewOnly } from '../../lib/viewOnly.js';
 
 interface PartnershipRequest {
   id: string;
@@ -104,7 +105,9 @@ function RequestRow({
   busy: boolean;
 }) {
   const [note, setNote] = useState('');
-  const isPending = request.status === 'pending';
+  // A view-only seat sees the request; the decision is an edit.
+  const viewOnly = useViewOnly();
+  const isPending = request.status === 'pending' && !viewOnly;
   return (
     <Card>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
@@ -127,7 +130,10 @@ function RequestRow({
       )}
       {isPending && (
         <div style={{ marginTop: 12 }}>
-          <Label>Decision note (optional)</Label>
+          <Label>Note to the creator (optional)</Label>
+          <p style={{ color: theme.textMuted, fontSize: 12, margin: '0 0 6px' }}>
+            We email it to them with your decision, and they see it under My applications.
+          </p>
           <Input
             type="text"
             value={note}
@@ -156,6 +162,12 @@ function approveErrorMessage(err: unknown): string {
   if (!(err instanceof ApiError)) return 'failed';
   if (err.message.includes('creator_not_available')) {
     return "This creator isn't available for partnerships on the Network any more, so the request can't be approved. You can reject it.";
+  }
+  if (err.message.includes('partner_revoked')) {
+    return 'You revoked this creator as a partner. Reinstate them under Partners to approve them for this program.';
+  }
+  if (err.message.includes('partner_exists_on_brand')) {
+    return 'This creator is already your partner, and this workspace can’t add a program to an existing partner yet. Update OpenPartner to approve them for it.';
   }
   return err.message;
 }

@@ -1,7 +1,8 @@
 /**
  * /creator/storefront — the creator's storefront editor. Turn bookings on,
- * pitch each channel, and add priced packages under it (from templates or
- * from scratch), with a live preview of the public section beside the form.
+ * pitch each channel, add priced packages under it (from templates or
+ * from scratch) and pick finished bookings to show as verified work, with a
+ * live preview of the public section beside the form.
  * Packages show on the public profile (/creators/:handle) while bookings
  * are on; brands request them from there and the requests land in
  * /creator/bookings. First-timers get the guided setup at
@@ -11,14 +12,17 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDown, ArrowUp, Download, ExternalLink, Plus, Sparkles } from 'lucide-react';
-import { Button, Card, ErrorBanner, Input, Label, Page, Select, StatusPill, Textarea } from '../../ui.js';
+import { Button, Card, ErrorBanner, Input, Label, Page, Select, StatusPill, Textarea, formatDate } from '../../ui.js';
 import { theme } from '../../theme.js';
 import { useMediaQuery } from '../../lib/useMediaQuery.js';
-import type { NetworkProfile } from '../../lib/NetworkProfileEditor.js';
+import { MARKETPLACE_CREATORS_URL, publicStorefrontUrl } from '../../lib/public-site.js';
+import { PLATFORMS, VERIFIABLE, VerifyAccountDialog, type NetworkProfile, type Platform } from '../../lib/NetworkProfileEditor.js';
 import { creatorApi } from './creator-api.js';
+import { creatorProfileAdapter } from './CreatorMyProfile.js';
 import { ChannelHeader } from './StorefrontSection.js';
 import { PreviewColumn, StorefrontPreview } from './StorefrontPreview.js';
 import {
+  audienceNoun,
   formatPackagePrice,
   groupByChannel,
   parsePackagePrice,
@@ -31,11 +35,20 @@ import {
   type StorefrontChannel,
   type StorefrontPackage,
 } from './storefront-shared.js';
+import { PaymentsCard, creatorErrorCode, usePayments, type PaymentsView } from './CreatorPayments.js';
+import type { CaseStudy } from './CaseStudies.js';
 
 export interface Storefront {
   bookingsOpen: boolean;
+  /** Taking bookings now: bookings on AND a Stripe account that can take
+   *  card payments (the Network's docs/creator-storefront.md §8.2). */
+  storefrontOpen?: boolean;
+  payments?: PaymentsView;
   handle: string | null;
   profileComplete: boolean;
+  /** Operator review: the public page exists only once 'approved'. Absent
+   *  on a Network before creator review. */
+  reviewStatus?: 'pending' | 'approved' | 'rejected';
   maxPackages: number;
   packages: OwnPackage[];
   /** The creator's platforms; absent on a Network before channel pitches. */
@@ -47,6 +60,26 @@ export const STOREFRONT_KEY = ['creator-storefront'];
 export const PROFILE_KEY = ['creator-my-profile'];
 /** GET /creators/me/platforms, shared with the profile page's Platforms card. */
 export const PLATFORMS_KEY = ['creator-my-platforms'];
+/** GET /creators/me/case-studies: completed bookings to show as verified work. */
+export const CASE_STUDIES_KEY = ['creator-case-studies'];
+
+/** One completed booking in the verified-work picker (the Network's
+ *  docs/campaign-reports.md §10). */
+export interface CaseStudyChoice {
+  bookingId: string;
+  title: string;
+  brand: { name: string; logoUrl: string | null } | null;
+  completedAt: string | null;
+  /** Its place on the storefront, 1 first; null when not shown. */
+  rank: number | null;
+  /** The brand lets the creator share it. */
+  shareable: boolean;
+  caseStudy: CaseStudy | null;
+}
+export interface CaseStudyChoices {
+  max: number;
+  bookings: CaseStudyChoice[];
+}
 
 /** A package as its form holds it, before it's saved. */
 export type PackageDraft = Omit<OwnPackage, 'id' | 'position'>;
@@ -60,6 +93,9 @@ type Editing =
   | { kind: 'package'; id: string }
   | { kind: 'new'; platform: string | null; template: PackageTemplate | null }
   | { kind: 'channel'; platform: string }
+  /** Adding a channel here, rather than on the profile (`platform`: one
+   *  picked already, from a block of packages without its account). */
+  | { kind: 'add-channel'; platform: string | null }
   | null;
 
 export function CreatorStorefrontPage() {
@@ -98,6 +134,18 @@ export function CreatorStorefrontPage() {
     mutationFn: (ids: string[]) => creatorApi('/creators/me/packages/order', { method: 'POST', body: { ids } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: STOREFRONT_KEY }),
   });
+  const work = useQuery({
+    queryKey: CASE_STUDIES_KEY,
+    queryFn: () => creatorApi<CaseStudyChoices>('/creators/me/case-studies'),
+    retry: false,
+  });
+  const shownWork = useMemo(
+    () =>
+      (work.data?.bookings ?? [])
+        .filter((b) => b.rank != null && b.caseStudy)
+        .sort((a, b) => a.rank! - b.rank!),
+    [work.data],
+  );
 
   const data = sf.data;
   const packages = useMemo(() => data?.packages ?? [], [data]);
@@ -177,16 +225,27 @@ export function CreatorStorefrontPage() {
           </div>
         </Card>
       )}
-      <BookingsCard storefront={data} pending={toggle.isPending} onToggle={() => toggle.mutate(!data.bookingsOpen)} />
-      {channels.length === 0 && (
-        <Card>
-          <div style={{ fontSize: 13, color: theme.textMuted }}>
-            Add the channels you publish on so brands can see your audience on each.{' '}
-            <Link to="/creator/profile" style={{ color: theme.accentText }}>Add channels on your profile</Link>
-          </div>
-        </Card>
-      )}
-      {groups.map((g) => (
+      <PaymentsCard />
+      <BookingsCard
+        storefront={data}
+        pending={toggle.isPending}
+        error={toggle.error}
+        onToggle={() => toggle.mutate(!data.bookingsOpen)}
+      />
+      {groups.map((g) => [
+        // New channels go in after the others, before "Across channels".
+        g.key === 'any' && (
+          <AddChannelCard
+            key="add-channel"
+            channels={channels}
+            open={editing?.kind === 'add-channel'}
+            initialPlatform={editing?.kind === 'add-channel' ? editing.platform : null}
+            onOpen={() => setEditing({ kind: 'add-channel', platform: null })}
+            onCancel={() => setEditing(null)}
+            // Straight on to the new channel's pitch.
+            onAdded={(platform) => setEditing({ kind: 'channel', platform })}
+          />
+        ),
         <GroupCard
           key={g.key}
           group={g}
@@ -207,17 +266,25 @@ export function CreatorStorefrontPage() {
                 }
               : null
           }
-        />
-      ))}
+        />,
+      ])}
       {atCap && (
         <p style={{ color: theme.textMuted, fontSize: 13, margin: 0 }}>
           That&rsquo;s the maximum of {data.maxPackages} packages. Delete one to add another.
         </p>
       )}
+      {/* An older Network has no verified work. */}
+      {work.data && <VerifiedWorkCard choices={work.data} shown={shownWork} />}
     </div>
   );
   const preview = data && (
-    <StorefrontPreview profile={profile.data} packages={previewPackages} channels={previewChannels} bookingsOpen={data.bookingsOpen} />
+    <StorefrontPreview
+      profile={profile.data}
+      packages={previewPackages}
+      channels={previewChannels}
+      bookingsOpen={data.bookingsOpen}
+      caseStudies={shownWork.map((b) => b.caseStudy!)}
+    />
   );
 
   return (
@@ -259,15 +326,31 @@ export function CreatorStorefrontPage() {
   );
 }
 
-/** The public storefront directory. Listing is the Network's: a creator with
- *  a public profile, bookings on and a published package is listed. */
-const MARKETPLACE_URL = 'https://openpartner.dev/marketplace/creators';
-
-function BookingsCard({ storefront, pending, onToggle }: { storefront: Storefront; pending: boolean; onToggle: () => void }) {
-  const publicPath = storefront.handle ? `/creators/${storefront.handle}` : null;
+function BookingsCard({
+  storefront,
+  pending,
+  error,
+  onToggle,
+}: {
+  storefront: Storefront;
+  pending: boolean;
+  error: unknown;
+  onToggle: () => void;
+}) {
+  // Every booking is paid upfront into the creator's Stripe account, so
+  // bookings can't open without one (the Payments card connects it). The
+  // card's own read is the freshest; the storefront's is from page load.
+  const payments = usePayments();
+  const paymentsReady = payments.data?.ready ?? storefront.payments?.ready ?? true;
+  // The storefront lives on the public site; the marketplace lists it there
+  // while the creator has a public profile, bookings on and a published
+  // package (the Network decides).
+  const publicUrl = storefront.handle ? publicStorefrontUrl(storefront.handle) : null;
   const hasPublished = storefront.packages.some((p) => p.published);
+  // Not approved by an operator yet: no public page either.
+  const notApproved = !!storefront.reviewStatus && storefront.reviewStatus !== 'approved';
   const marketplace = (
-    <a href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer" style={{ color: theme.accentText }}>
+    <a href={MARKETPLACE_CREATORS_URL} target="_blank" rel="noopener noreferrer" style={{ color: theme.accentText }}>
       OpenPartner marketplace
     </a>
   );
@@ -277,41 +360,55 @@ function BookingsCard({ storefront, pending, onToggle }: { storefront: Storefron
         <div style={{ flex: 1, minWidth: 220 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ fontSize: 15, fontWeight: 500 }}>Booking requests</span>
-            <StatusPill status={storefront.bookingsOpen ? 'active' : 'paused'} />
+            <StatusPill status={storefront.bookingsOpen && paymentsReady ? 'active' : 'paused'} />
           </div>
           <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 4 }}>
-            {!storefront.bookingsOpen ? (
+            {!paymentsReady ? (
+              <>Connect Stripe above first: brands pay you upfront for every booking. Then turn bookings on to show your packages and a request form on your public profile, and to list your storefront in the {marketplace}.</>
+            ) : !storefront.bookingsOpen ? (
               <>Turn on to show your packages and a request form on your public profile, and to list your storefront in the {marketplace} for brands to find.</>
             ) : !hasPublished ? (
               <>Bookings are on. Publish a package to show it on your public profile and list your storefront in the {marketplace}.</>
             ) : !storefront.profileComplete ? (
               <>Your packages and a request form go on your public profile, and into the {marketplace}, once your profile is complete.</>
+            ) : notApproved ? (
+              <>Your packages and a request form go on your public profile, and into the {marketplace}, once OpenPartner approves your profile.</>
             ) : (
-              <>Your packages and a request form are on your public profile, and your storefront is listed in the {marketplace}. Brands confirm their email before a request reaches you.</>
+              <>Your packages and a request form are on your public profile, and your storefront is listed in the {marketplace}. Brands sign in to OpenPartner before a request reaches you, you talk in Messages, and they pay before you start.</>
             )}
           </div>
         </div>
-        <Button variant={storefront.bookingsOpen ? 'secondary' : 'primary'} onClick={onToggle} disabled={pending}>
+        <Button
+          variant={storefront.bookingsOpen ? 'secondary' : 'primary'}
+          onClick={onToggle}
+          disabled={pending || (!storefront.bookingsOpen && !paymentsReady)}
+        >
           {storefront.bookingsOpen ? 'Pause bookings' : 'Turn on bookings'}
         </Button>
       </div>
+      <ErrorBanner error={creatorErrorCode(error) === 'payments_not_ready' ? 'Connect Stripe first: bookings are paid into your own Stripe account.' : error} />
       {!storefront.profileComplete ? (
         <div style={{ marginTop: 14, fontSize: 13, color: theme.warn, background: theme.warnSoft, borderRadius: theme.radiusSm, padding: '10px 12px' }}>
           Your profile isn&rsquo;t complete, so it has no public page yet and brands can&rsquo;t see your storefront.{' '}
           <Link to="/creator/profile" style={{ color: theme.warn, fontWeight: 600 }}>Finish your profile</Link>
         </div>
+      ) : notApproved ? (
+        <div style={{ marginTop: 14, fontSize: 13, color: theme.textMuted, background: theme.surface2, borderRadius: theme.radiusSm, padding: '10px 12px' }}>
+          {storefront.reviewStatus === 'rejected'
+            ? 'Your profile wasn’t approved for the OpenPartner Network, so it has no public page and brands can’t see your storefront.'
+            : 'Your profile is in review. Your public page and storefront go live once OpenPartner approves it.'}
+        </div>
       ) : (
-        publicPath && (
+        publicUrl && (
           <div style={{ marginTop: 14, fontSize: 13, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <span style={{ color: theme.textMuted }}>Your public page:</span>
             <a
-              href={publicPath}
+              href={publicUrl}
               target="_blank"
               rel="noopener noreferrer"
               style={{ fontFamily: theme.fontMono, color: theme.accentText, display: 'inline-flex', alignItems: 'center', gap: 4 }}
             >
-              {window.location.host}
-              {publicPath}
+              {publicUrl.replace(/^https?:\/\//, '')}
               <ExternalLink size={12} />
             </a>
           </div>
@@ -321,7 +418,245 @@ function BookingsCard({ storefront, pending, onToggle }: { storefront: Storefron
   );
 }
 
+/**
+ * Finished bookings to show on the storefront as verified work, up to the
+ * Network's maximum and in order. Each change saves the whole list. A
+ * booking the brand keeps private can't be picked.
+ */
+function VerifiedWorkCard({ choices, shown }: { choices: CaseStudyChoices; shown: CaseStudyChoice[] }) {
+  const qc = useQueryClient();
+  const save = useMutation({
+    mutationFn: (bookingIds: string[]) =>
+      creatorApi<CaseStudyChoices>('/creators/me/case-studies', { method: 'PUT', body: { bookingIds } }),
+    onSuccess: (next) => qc.setQueryData(CASE_STUDIES_KEY, next),
+    // A brand may have changed its sharing since the list loaded.
+    onError: () => qc.invalidateQueries({ queryKey: CASE_STUDIES_KEY }),
+  });
+  const ids = shown.map((b) => b.bookingId);
+  const full = ids.length >= choices.max;
+  const move = (i: number, delta: -1 | 1) => {
+    const next = [...ids];
+    [next[i], next[i + delta]] = [next[i + delta]!, next[i]!];
+    save.mutate(next);
+  };
+  const rest = choices.bookings.filter((b) => b.rank == null);
+
+  return (
+    <Card>
+      <div style={{ fontSize: 15, fontWeight: 500 }}>Verified work</div>
+      <div style={{ fontSize: 13, color: theme.textMuted, marginTop: 4 }}>
+        {choices.bookings.length === 0
+          ? 'Completed bookings show up here to add to your storefront.'
+          : `Show up to ${choices.max} completed bookings, with what each brand lets you share.`}
+      </div>
+      <ErrorBanner
+        error={creatorErrorCode(save.error) === 'not_shareable' ? 'That brand no longer lets you share this booking.' : save.error}
+      />
+      {choices.bookings.length > 0 && (
+        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+          {[...shown, ...rest].map((b) => {
+            const i = ids.indexOf(b.bookingId);
+            return (
+              <div
+                key={b.bookingId}
+                style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', border: `1px solid ${theme.border}`, borderRadius: theme.radiusSm, padding: '10px 12px', background: theme.surface }}
+              >
+                <div style={{ flex: 1, minWidth: 180 }}>
+                  <div style={{ fontSize: 14, fontWeight: 500 }}>{b.brand?.name ?? 'A brand'}</div>
+                  <div style={{ fontSize: 12.5, color: theme.textMuted }}>
+                    {b.title}
+                    {b.completedAt && <> · {formatDate(b.completedAt)}</>}
+                  </div>
+                </div>
+                {i >= 0 ? (
+                  <>
+                    <Button size="sm" variant="ghost" onClick={() => move(i, -1)} disabled={i === 0 || save.isPending} icon={<ArrowUp size={14} />}>Up</Button>
+                    <Button size="sm" variant="ghost" onClick={() => move(i, 1)} disabled={i === ids.length - 1 || save.isPending} icon={<ArrowDown size={14} />}>Down</Button>
+                    <Button size="sm" variant="secondary" onClick={() => save.mutate(ids.filter((id) => id !== b.bookingId))} disabled={save.isPending}>
+                      Hide
+                    </Button>
+                  </>
+                ) : b.shareable ? (
+                  <Button size="sm" variant="secondary" onClick={() => save.mutate([...ids, b.bookingId])} disabled={full || save.isPending}>
+                    Show
+                  </Button>
+                ) : (
+                  <span title="The brand keeps this booking private" style={{ fontSize: 12.5, color: theme.textMuted }}>
+                    Private
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 /** One channel (or "across channels"): its pitch, its packages, and adding more from templates. */
+/**
+ * Add a channel without leaving the storefront: a platform the creator
+ * hasn't listed, its handle, and (optionally) its audience. Once added the
+ * channel's block opens on its pitch, with its package templates under it.
+ * Counts are self-reported until the account is verified (YouTube, a
+ * website): the block's Verify then badges it, and a verified YouTube
+ * channel's numbers are kept up to date by the Network.
+ */
+function AddChannelCard({
+  channels,
+  open,
+  initialPlatform,
+  onOpen,
+  onCancel,
+  onAdded,
+}: {
+  channels: StorefrontChannel[];
+  open: boolean;
+  initialPlatform: string | null;
+  onOpen: () => void;
+  onCancel: () => void;
+  onAdded: (platform: string) => void;
+}) {
+  const qc = useQueryClient();
+  const remaining = PLATFORMS.filter((p) => !channels.some((c) => c.platform === p.kind));
+  const firstChoice = remaining.find((p) => p.kind === initialPlatform)?.kind ?? remaining[0]?.kind ?? null;
+  const [platform, setPlatform] = useState<Platform | null>(firstChoice);
+  const [handle, setHandle] = useState('');
+  const [followers, setFollowers] = useState('');
+  useEffect(() => {
+    if (open) {
+      setPlatform(firstChoice);
+      setHandle('');
+      setFollowers('');
+    }
+    // Reset each time the form opens, on the platform it was opened for.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, initialPlatform]);
+
+  const add = useMutation({
+    mutationFn: (p: Platform) =>
+      creatorProfileAdapter.putPlatform(p, { handle: handle.trim(), followerCount: followers.trim() === '' ? null : Number(followers) }),
+    onSuccess: async (_r, p) => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: STOREFRONT_KEY }),
+        qc.invalidateQueries({ queryKey: PLATFORMS_KEY }),
+        // Platforms count toward the profile checklist.
+        qc.invalidateQueries({ queryKey: PROFILE_KEY }),
+      ]);
+      onAdded(p);
+    },
+  });
+
+  if (remaining.length === 0) return null;
+  const choice = PLATFORMS.find((p) => p.kind === platform);
+  const noun = audienceNoun(platform ?? '');
+  const followerCount = Number(followers);
+  const followersValid = followers.trim() === '' || (Number.isInteger(followerCount) && followerCount >= 0);
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={onOpen}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          width: '100%',
+          padding: '14px 18px',
+          border: `1px dashed ${theme.border}`,
+          borderRadius: theme.radiusMd,
+          background: 'transparent',
+          color: theme.text,
+          font: 'inherit',
+          textAlign: 'left',
+          cursor: 'pointer',
+        }}
+      >
+        <Plus size={16} style={{ color: theme.accentText, flexShrink: 0 }} />
+        <span style={{ minWidth: 0 }}>
+          <span style={{ display: 'block', fontSize: 14, fontWeight: 500 }}>Add a channel</span>
+          <span style={{ display: 'block', fontSize: 12.5, color: theme.textMuted, marginTop: 2 }}>
+            {remaining
+              .slice(0, 4)
+              .map((p) => p.label)
+              .join(', ')}
+            {remaining.length > 4 ? ' and more' : ''}: your audience there, then packages for it.
+          </span>
+        </span>
+      </button>
+    );
+  }
+
+  return (
+    <Card>
+      <div style={{ fontSize: 14, fontWeight: 600 }}>Add a channel</div>
+      <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 2, marginBottom: 14 }}>
+        Brands see it on your storefront with its audience, above the packages you list for it.
+      </div>
+      {/* Wraps: beside the live preview the editor column is narrow. */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-end' }}>
+        <div style={{ flex: '1 1 140px', maxWidth: 200 }}>
+          <Label>Channel</Label>
+          <Select aria-label="Channel" value={platform ?? ''} onChange={(e) => setPlatform(e.target.value as Platform)}>
+            {remaining.map((p) => (
+              <option key={p.kind} value={p.kind}>
+                {p.label}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <div style={{ flex: '3 1 200px', minWidth: 0 }}>
+          <Label>
+            {platform === 'website' || platform === 'podcast' || platform === 'newsletter'
+              ? 'Address'
+              : platform === 'discord'
+                ? 'Invite link'
+                : platform === 'reddit'
+                  ? 'Community or user'
+                  : 'Handle'}
+          </Label>
+          <Input
+            aria-label="Handle"
+            // Also brings the form into view when opened from a block above.
+            autoFocus
+            value={handle}
+            onChange={(e) => setHandle(e.target.value)}
+            placeholder={choice?.placeholder}
+            style={{ fontFamily: theme.fontMono, fontSize: 13 }}
+          />
+        </div>
+        <div style={{ flex: '1 1 130px', maxWidth: 180 }}>
+          <Label>
+            {noun[0]!.toUpperCase()}
+            {noun.slice(1)} (optional)
+          </Label>
+          <Input aria-label="Audience" type="number" min={0} value={followers} onChange={(e) => setFollowers(e.target.value)} placeholder="e.g. 12000" />
+        </div>
+      </div>
+      <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 10, lineHeight: 1.5 }}>
+        {platform === 'youtube'
+          ? 'Self-reported until you verify it. Once it’s added, Verify gives it a verified badge and keeps your subscribers and views per video up to date.'
+          : platform === 'instagram' || platform === 'tiktok'
+            ? 'Self-reported until you verify it. Once it’s added, Verify gives it a verified badge and keeps your followers and engagement up to date.'
+            : platform && VERIFIABLE.has(platform)
+            ? 'Self-reported until you verify it. Once it’s added, Verify gives it a verified badge.'
+            : 'Shown to brands as self-reported.'}
+      </div>
+      <ErrorBanner error={add.error} />
+      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <Button onClick={() => platform && add.mutate(platform)} disabled={!platform || !handle.trim() || !followersValid || add.isPending}>
+          {add.isPending ? 'Adding…' : 'Add channel'}
+        </Button>
+        <Button variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
 function GroupCard({
   group,
   editing,
@@ -345,6 +680,8 @@ function GroupCard({
   onMovePackage: (index: number, delta: -1 | 1) => void;
   groupMove: { first: boolean; last: boolean; onMove: (delta: -1 | 1) => void } | null;
 }) {
+  const qc = useQueryClient();
+  const [verifying, setVerifying] = useState(false);
   const label = group.platform ? (PLATFORM_LABELS[group.platform] ?? group.platform) : 'Across channels';
   const editingPitch = editing?.kind === 'channel' && editing.platform === group.platform;
   const adding = editing?.kind === 'new' && editing.platform === group.platform ? editing : null;
@@ -363,7 +700,13 @@ function GroupCard({
                 {group.platform ? (
                   <>
                     You haven&rsquo;t added your {label} account, so brands don&rsquo;t see your audience there.{' '}
-                    <Link to="/creator/profile" style={{ color: theme.accentText }}>Add it on your profile</Link>
+                    <button
+                      type="button"
+                      onClick={() => setEditing({ kind: 'add-channel', platform: group.platform })}
+                      style={{ background: 'none', border: 'none', padding: 0, font: 'inherit', color: theme.accentText, cursor: 'pointer' }}
+                    >
+                      Add your {label} account
+                    </button>
                   </>
                 ) : (
                   'Bundles and work that isn’t tied to one channel.'
@@ -383,6 +726,11 @@ function GroupCard({
               </Button>
             </>
           )}
+          {group.channel && !group.channel.verified && VERIFIABLE.has(group.channel.platform as Platform) && (
+            <Button size="sm" variant="ghost" onClick={() => setVerifying(true)}>
+              Verify
+            </Button>
+          )}
           {group.channel && !editingPitch && (
             <Button size="sm" variant="secondary" onClick={() => setEditing({ kind: 'channel', platform: group.platform! })}>
               {group.channel.description || group.channel.cadence ? 'Edit pitch' : 'Add pitch'}
@@ -390,6 +738,19 @@ function GroupCard({
           )}
         </div>
       </div>
+      {verifying && group.channel && (
+        <VerifyAccountDialog
+          adapter={creatorProfileAdapter}
+          platform={group.channel.platform as Platform}
+          label={label}
+          handle={group.channel.handle}
+          onClose={() => setVerifying(false)}
+          onVerified={() => {
+            void qc.invalidateQueries({ queryKey: STOREFRONT_KEY });
+            void qc.invalidateQueries({ queryKey: PLATFORMS_KEY });
+          }}
+        />
+      )}
 
       {editingPitch && group.channel && (
         <div style={{ marginTop: 14 }}>

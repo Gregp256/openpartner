@@ -79,6 +79,7 @@ import { partnerPayoutHolds, type PayoutHoldReason } from './sanctions-screening
 import { centsToStripeMinor, fromStripeMinor, majorToCents } from './stripe-amounts.js';
 import type { PayoutTransferMeta } from './payout-transfers.js';
 import { getTenantBillingState } from './billing-plan.js';
+import { payoutStatementUrl } from './portal-url.js';
 import { dispatchEvent } from './webhook-dispatcher.js';
 import type { WebhookPayload } from './openapi/webhook-events.js';
 import { dispatchCommissionEvents } from './commission-events.js';
@@ -154,7 +155,9 @@ export interface PayoutRunResult {
 export interface PendingPayoutNotification {
   /** The payout.created payload, exactly as dispatched. */
   payout: WebhookPayload<'payout.created'>;
-  commissions: Array<Pick<CommissionRow, 'id' | 'partnerId' | 'attributionId' | 'bonusId' | 'amount' | 'currency'>>;
+  commissions: Array<
+    Pick<CommissionRow, 'id' | 'partnerId' | 'attributionId' | 'bonusId' | 'sourceCommissionId' | 'amount' | 'currency'>
+  >;
 }
 
 /**
@@ -533,12 +536,14 @@ export async function runPayouts(db: Knex, tenantId: string): Promise<PayoutRunR
               ? { grossCents, clawbackCents: netting.clawbackCents, adjustmentIds: netting.adjustmentIds }
               : undefined,
           ),
+          statementUrl: payoutStatementUrl(tenant, payoutId),
         },
         commissions: commissions.map((c) => ({
           id: c.id,
           partnerId: c.partnerId,
           attributionId: c.attributionId,
           bonusId: c.bonusId,
+          sourceCommissionId: c.sourceCommissionId,
           amount: c.amount,
           currency: c.currency,
         })),

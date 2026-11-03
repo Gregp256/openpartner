@@ -1,6 +1,6 @@
-import { useState } from 'react';
-import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query';
-import { Link } from 'react-router';
+import { useState, type ReactNode } from 'react';
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Link, useSearchParams } from 'react-router';
 import {
   MousePointerClick,
   Receipt,
@@ -12,6 +12,7 @@ import {
   Link2,
   CheckCircle2,
   Circle,
+  CircleMinus,
   ArrowRight,
   Landmark,
 } from 'lucide-react';
@@ -20,6 +21,7 @@ import { useTenantBase } from '../tenant-base.js';
 import { TenantLink } from '../tenant-link.js';
 import { alpha, theme } from '../theme.js';
 import { useBrand, useConnectPayouts, useDefaultCurrency } from '../lib/useBrand.js';
+import { EditOnly } from '../lib/viewOnly.js';
 import {
   Avatar,
   Button,
@@ -411,6 +413,9 @@ const OVERVIEW_SORTS: Array<{ value: OverviewSort; label: string }> = [
 
 interface AdminOverview {
   since: string;
+  /** The program the overview is filtered to; absent from an API that
+   *  predates the filter. */
+  programId?: string | null;
   sort: OverviewSort;
   nextCursor: string | null;
   totals: {
@@ -441,15 +446,42 @@ interface AdminOverview {
   }>;
 }
 
+interface ProgramOption {
+  id: string;
+  name: string;
+}
+
 function AdminDashboard() {
   const [sort, setSort] = useState<OverviewSort>('revenue');
+  // `?program=<id>` filters the whole page to one program, so a filtered
+  // view can be bookmarked and shared. An id that isn't one of the brand's
+  // programs (deleted, or another workspace's link) shows everything.
+  const [params, setParams] = useSearchParams();
+  const programs = useQuery({
+    queryKey: ['campaigns'],
+    queryFn: () => api<{ programs: ProgramOption[] }>('/programs'),
+  }).data?.programs;
+  const requested = params.get('program');
+  const program = requested && programs ? programs.find((p) => p.id === requested) : undefined;
+  const programId = requested && (!programs || program) ? requested : undefined;
+  const selectProgram = (id: string) =>
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (id) next.set('program', id);
+        else next.delete('program');
+        return next;
+      },
+      { replace: true },
+    );
   // Totals come from the first page (every page carries the same
-  // whole-tenant aggregates); partner cards accumulate page by page so a
-  // program with tens of thousands of partners never loads them all.
+  // aggregates); partner cards accumulate page by page so a program with
+  // tens of thousands of partners never loads them all.
   const { data, error, isLoading, isFetching, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
-    queryKey: ['admin-overview', sort],
+    queryKey: ['admin-overview', sort, programId ?? null],
     queryFn: ({ pageParam }) => {
       const qs = new URLSearchParams({ sort });
+      if (programId) qs.set('programId', programId);
       if (pageParam) qs.set('cursor', pageParam);
       return api<AdminOverview>(`/admin/overview?${qs}`);
     },
@@ -468,10 +500,37 @@ function AdminDashboard() {
     : {};
 
   return (
-    <Page title="Partner Program" subtitle="Overview of every partner driving attributed revenue.">
+    <Page
+      title="Partner Program"
+      subtitle={
+        program
+          ? `${program.name}: its partners and their activity over the last 30 days.`
+          : 'Overview of every partner driving attributed revenue.'
+      }
+      actions={
+        ((programs?.length ?? 0) > 1 || program) && (
+          <Select
+            aria-label="Program"
+            value={program?.id ?? ''}
+            onChange={(e) => selectProgram(e.target.value)}
+            style={{ width: 'auto', maxWidth: '100%', padding: '6px 10px', fontSize: 13 }}
+          >
+            <option value="">All programs</option>
+            {programs?.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </Select>
+        )
+      }
+    >
       <ErrorBanner error={error} />
-      <PendingApprovalsBanner />
-      <BrandOnboarding />
+      {/* Setup asks; a view-only seat can't act on them. */}
+      <EditOnly>
+        <PendingApprovalsBanner />
+        <BrandOnboarding />
+      </EditOnly>
       {isLoading || !totals ? (
         <Card>Loading…</Card>
       ) : (
@@ -513,11 +572,19 @@ function AdminDashboard() {
             Partners
           </SectionHeading>
           {partners.length === 0 ? (
-            <EmptyState
-              title="No partners yet"
-              hint="Create one from Admin → Partners to get started."
-              icon={<Users size={28} strokeWidth={1.25} />}
-            />
+            programId ? (
+              <EmptyState
+                title="No partners in this program yet"
+                hint="Grant partners access to it from Admin → Partners."
+                icon={<Users size={28} strokeWidth={1.25} />}
+              />
+            ) : (
+              <EmptyState
+                title="No partners yet"
+                hint="Create one from Admin → Partners to get started."
+                icon={<Users size={28} strokeWidth={1.25} />}
+              />
+            )
           ) : (
             <>
               <div
@@ -600,6 +667,9 @@ interface BrandOnboardingStatus {
   campaignCount: number;
   networkConnected: boolean;
   offeringPublishedCount: number;
+  /** "Not now" to the Network listing. Absent on an older API, which
+   *  doesn't know the setting (the control stays hidden). */
+  networkListingSkipped?: boolean;
   partnerCount: number;
   pendingPartnershipRequests: number;
   billingReady: boolean;
@@ -667,14 +737,42 @@ function PendingApprovalsBanner() {
 function BrandOnboarding() {
   const tenantBase = useTenantBase();
   const { programName, whiteLabel } = useBrand();
+  const qc = useQueryClient();
   const { data } = useQuery({
     queryKey: ['admin-onboarding-status'],
     queryFn: () => api<BrandOnboardingStatus>('/admin/onboarding-status'),
     staleTime: 30_000,
     retry: false,
   });
+  // "Not now" on the Network step. The Network is optional: once every
+  // other step is done, skipping it clears the card.
+  const skipNetwork = useMutation({
+    mutationFn: (networkListingSkipped: boolean) =>
+      api('/config/onboarding', { method: 'POST', body: { networkListingSkipped } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-onboarding-status'] }),
+  });
   if (!data || data.complete) return null;
-  const items = [
+  // Only the open Network step (join, or publish once joined) carries the
+  // control. Joining after a skip clears it server-side, so a brand that
+  // comes back to the Network sees the publish step again.
+  const networkSkipped = data.networkListingSkipped === true;
+  const networkStep = (done: boolean): Pick<OnboardingStep, 'skipped' | 'action'> => {
+    if (done || data.networkListingSkipped === undefined) return {};
+    return {
+      skipped: networkSkipped,
+      action: (
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => skipNetwork.mutate(!networkSkipped)}
+          disabled={skipNetwork.isPending}
+        >
+          {networkSkipped ? 'Undo' : 'Not now'}
+        </Button>
+      ),
+    };
+  };
+  const items: OnboardingStep[] = [
     { done: true, label: 'Brand account created', href: null as string | null },
     {
       done: data.brandInfoComplete,
@@ -695,8 +793,11 @@ function BrandOnboarding() {
           {
             done: data.networkConnected,
             label: 'List your brand on the OpenPartner Network',
-            hint: 'Lets creators across the federation discover and apply.',
+            hint: networkSkipped
+              ? 'Skipped. Join any time from Network in the sidebar.'
+              : 'Optional. Lets creators across the federation discover and apply.',
             href: `${tenantBase}/admin/network`,
+            ...networkStep(data.networkConnected),
           },
         ]),
     // Listing = a program shared to the marketplace (the "Share on the
@@ -707,11 +808,13 @@ function BrandOnboarding() {
           {
             done: data.offeringPublishedCount > 0,
             label: 'Publish a program on the marketplace',
-            hint:
-              data.approvalStatus === 'pending'
+            hint: networkSkipped
+              ? 'Skipped. Turn on "Share on the OpenPartner Network" for a program any time.'
+              : data.approvalStatus === 'pending'
                 ? 'Turn on "Share on the OpenPartner Network" for a program. It appears to creators once your brand is approved.'
                 : 'Turn on "Share on the OpenPartner Network" for a program so creators can find and apply to it.',
             href: `${tenantBase}/admin/programs`,
+            ...networkStep(data.offeringPublishedCount > 0),
           },
         ]
       : []),
@@ -720,9 +823,9 @@ function BrandOnboarding() {
       : [
           {
             done: data.trackingInstalled,
-            label: 'Connect conversion tracking',
-            hint: 'Install the OpenPartner SDK (identify signups) or connect Stripe so partner referrals are credited.',
-            href: `${tenantBase}/admin/integrations`,
+            label: 'Verify conversion tracking',
+            hint: 'Install the tracking script, then send a test click. Partners can join once it reaches your signup.',
+            href: `${tenantBase}/admin/tracking-health`,
           },
         ]),
     {
@@ -738,9 +841,10 @@ function BrandOnboarding() {
       <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 14 }}>
         A few one-clicks to get your brand fully set up. The card disappears when you&rsquo;re done.
       </div>
+      <ErrorBanner error={skipNetwork.error} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {items.map((it, i) => (
-          <BrandStep key={i} done={it.done} label={it.label} hint={it.hint} href={it.href} tone={it.tone} />
+          <BrandStep key={i} {...it} />
         ))}
       </div>
     </Card>
@@ -751,10 +855,14 @@ type StepTone = 'default' | 'warning' | 'danger';
 
 interface OnboardingStep {
   done: boolean;
+  /** Set aside by the brand ("Not now"): it no longer holds the card up. */
+  skipped?: boolean;
   label: string;
   hint?: string;
   href: string | null;
   tone?: StepTone;
+  /** A control beside the step, outside its link ("Not now" / "Undo"). */
+  action?: ReactNode;
 }
 
 /** The billing step doubles as the trial-deadline pressure. Once
@@ -798,39 +906,61 @@ function formatTrialDate(iso: string): string {
     : { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
-function BrandStep({ done, label, hint, href, tone = 'default' }: OnboardingStep) {
-  const palette = stepPalette(done, tone);
-  const inner = (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        padding: '10px 12px',
-        background: palette.bg,
-        border: `1px solid ${palette.border}`,
-        borderRadius: theme.radiusSm,
-      }}
-    >
+function BrandStep({ done, skipped = false, label, hint, href, tone = 'default', action }: OnboardingStep) {
+  const palette = stepPalette(done, tone, skipped);
+  // The link fills the box, padding included, and the action sits beside
+  // it rather than inside it (a button inside a link is invalid HTML).
+  const rowStyle = { display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', flex: 1, minWidth: 0 };
+  const content = (
+    <>
       <div style={{ color: palette.icon, display: 'inline-flex' }}>
-        {done ? <CheckCircle2 size={18} /> : <Circle size={18} />}
+        {done ? <CheckCircle2 size={18} /> : skipped ? <CircleMinus size={18} /> : <Circle size={18} />}
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 14, fontWeight: 500, color: theme.text, textDecoration: done ? 'line-through' : 'none' }}>
+        <div
+          style={{
+            fontSize: 14,
+            fontWeight: 500,
+            color: skipped ? theme.textMuted : theme.text,
+            textDecoration: done ? 'line-through' : 'none',
+          }}
+        >
           {label}
         </div>
         {hint && !done && <div style={{ fontSize: 12, color: palette.hint, marginTop: 2 }}>{hint}</div>}
       </div>
-      {!done && href && <ArrowRight size={14} style={{ color: theme.textDim }} />}
+      {!done && !skipped && href && <ArrowRight size={14} style={{ color: theme.textDim }} />}
+    </>
+  );
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        paddingRight: action ? 8 : 0,
+        background: palette.bg,
+        border: `1px ${skipped ? 'dashed' : 'solid'} ${palette.border}`,
+        borderRadius: theme.radiusSm,
+      }}
+    >
+      {done || !href ? (
+        <div style={rowStyle}>{content}</div>
+      ) : (
+        <Link to={href} style={{ ...rowStyle, textDecoration: 'none' }}>
+          {content}
+        </Link>
+      )}
+      {action}
     </div>
   );
-  if (done || !href) return inner;
-  return <Link to={href} style={{ textDecoration: 'none' }}>{inner}</Link>;
 }
 
-function stepPalette(done: boolean, tone: StepTone) {
+function stepPalette(done: boolean, tone: StepTone, skipped = false) {
   if (done) {
     return { bg: theme.successSoft, border: alpha(theme.success, 0.267), icon: theme.success, hint: theme.textDim };
+  }
+  if (skipped) {
+    return { bg: 'transparent', border: theme.borderSubtle, icon: theme.textDim, hint: theme.textDim };
   }
   if (tone === 'danger') {
     return { bg: theme.dangerSoft, border: alpha(theme.danger, 0.4), icon: theme.danger, hint: theme.danger };

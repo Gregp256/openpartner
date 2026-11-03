@@ -20,7 +20,7 @@
  */
 
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { z } from 'zod';
+import { offsetDateTime, z } from '../zod.js';
 import { ulid } from 'ulid';
 import {
   DEFAULT_TENANT_ID,
@@ -59,20 +59,49 @@ import {
   writeAudit,
 } from '../brand-review.js';
 import {
+  adminCreatorIndexStats,
+  adminGetCreatorIndexSettings,
+  adminGetIndexedCreator,
+  adminGetIndexedCreatorContact,
+  adminQueueIndexSeeds,
+  adminRemoveIndexedCreator,
+  adminHideIndexedCreators,
+  adminBlockIndexDomain,
+  adminUnblockIndexDomain,
+  adminSetIndexedCreatorContact,
+  adminSetIndexedCreatorState,
+  adminRunCreatorIndexInvites,
+  adminRunCreatorIndexJob,
+  adminRunCreatorIndexOutreach,
+  adminSearchIndexedCreators,
+  adminSendCreatorIndexOutreachSample,
+  OUTREACH_STYLES,
+  adminSetCreatorIndexSettings,
   adminBlockCreator,
+  adminCompleteMailboxConnect,
+  adminDisconnectMailbox,
+  adminSetMailboxSendAs,
+  adminStartMailboxConnect,
+  adminListCreatorMessages,
   adminListCreators,
   adminListVendors,
   adminReleaseStorefrontImport,
   adminRemindCreator,
   adminRunCreatorReminders,
+  adminRunStorefrontNudge,
+  adminSendCreatorMessage,
+  adminSetCreatorReview,
   adminSetFeaturedVendors,
   adminSetVendorReview,
   adminUnblockCreator,
   adminVendorReviewQueue,
   NetworkAdminError,
   platformNetworkUrl,
+  getNetworkBookingFee,
+  setNetworkBookingFee,
 } from '../network-client.js';
 import { linkVendorsToTenants } from '../network-review-reconcile.js';
+import { platformOpsEmail } from '../platform-ops-mail.js';
 import {
   MATCH_SCORE_THRESHOLD,
   cslConfigured,
@@ -85,13 +114,19 @@ import {
 import { brandSetupFor } from '../brand-setup.js';
 import { brandReminderHistory, remindBrandNow, runBrandSetupReminders } from '../brand-setup-reminders.js';
 import {
+  getBrandSignupSettings,
   getFeeRuleSettings,
   getInvoiceBillingSettings,
   getNotificationSettings,
+  getTrackingGateSettings,
+  setBrandSignupSettings,
   setFeeRuleSettings,
   setInvoiceBillingSettings,
   setNotificationSettings,
+  setTrackingGateSettings,
 } from '../platform-settings.js';
+import { trackingGateEnforced, trackingVerifiedFor } from '../tracking-verification.js';
+import { sendTrackingGateNotices, trackingGateAffected } from '../tracking-gate-notice.js';
 import {
   DAYS_UNTIL_DUE_DEFAULT,
   listInvoiceBillingTenants,
@@ -99,6 +134,8 @@ import {
   setTenantCollection,
 } from '../invoice-billing.js';
 import { INVOICE_GRACE_DAYS_DEFAULT } from '../billing-plan.js';
+import { getHouseProgramSettings, setHouseProgramSettings } from '../house-program.js';
+import { activeConnectionForTenant } from '../stripe-app.js';
 import { stripe } from '../stripe.js';
 import { METER_RATES, NOTICE_DAYS } from '../fee-terms.js';
 import { previewPricingNotices, sendPricingNotices } from '../fee-notice.js';
@@ -396,6 +433,7 @@ platformAdminRouter.get('/platform-admin/brands', requirePlatformAdmin, async (r
   // operator sees "stalled at tracking, reminded twice, warned on the 3rd"
   // without opening anything.
   const setups = await brandSetupFor(db, ids);
+  const verified = await trackingVerifiedFor(db, ids);
   const reminders = await brandReminderHistory(db, ids);
   const warnings = ids.length
     ? ((await db<PlatformAuditLogRow>(TABLES.PlatformAuditLog)
@@ -431,6 +469,7 @@ platformAdminRouter.get('/platform-admin/brands', requirePlatformAdmin, async (r
       blockedProgramCount: Number(countsByTenant.get(t.id)?.blocked ?? 0),
       setupComplete: setups.get(t.id)?.complete ?? false,
       setupMissing: setups.get(t.id)?.missing ?? [],
+      trackingVerified: verified.has(t.id),
       setupRemindersSent: reminders.get(t.id)?.sent ?? 0,
       lastSetupReminderAt: reminders.get(t.id)?.lastSentAt ?? null,
       lastPolicyWarningAt: lastWarningBy.get(t.id)?.at ?? null,
@@ -469,13 +508,23 @@ async function loadTenant(id: string): Promise<TenantRow | null> {
   return row ?? null;
 }
 
+/** `withoutTracking`: approve a brand whose tracking isn't verified
+ *  (tracking-verification.ts). Its links go live; partners still wait for
+ *  verification while the tracking gate is in force. */
+const approveSchema = z.object({ withoutTracking: z.boolean().optional() });
+
 platformAdminRouter.post(
   '/platform-admin/brands/:id/approve',
   requirePlatformAdmin,
   requirePlatformAdminWrite,
   async (req, res) => {
+    const body = approveSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body' });
     const tenant = await loadTenant(req.params.id!);
     if (!tenant) return res.status(404).json({ error: 'brand_not_found' });
+    if (!body.data.withoutTracking && !(await trackingVerifiedFor(db, [tenant.id])).has(tenant.id)) {
+      return res.status(409).json({ error: 'tracking_not_verified' });
+    }
     const reinstate = tenant.approvalStatus === 'rejected';
     await approveBrand(db, tenant, req.platformAdminActor!, { reinstate });
     res.json({ ok: true, approvalStatus: 'approved' });
@@ -666,10 +715,145 @@ platformAdminRouter.get('/platform-admin/creators', requirePlatformAdmin, async 
   const networkUrl = networkOr503(res);
   if (!networkUrl) return;
   try {
-    const creators = await adminListCreators(networkUrl);
+    // The newest 500, plus every complete creator waiting for review in case
+    // they're older (a held creator, or one buried under the many signups
+    // that never finish their profile). A Network that predates the review
+    // gate ignores the filters and the merge dedupes.
+    const [recent, pending] = await Promise.all([
+      adminListCreators(networkUrl),
+      adminListCreators(networkUrl, { review: 'pending', complete: true }),
+    ]);
+    const seen = new Set(recent.map((c) => c.id));
+    const creators = [...recent, ...pending.filter((c) => !seen.has(c.id))];
     res.json({ creators });
   } catch (err) {
     res.status(502).json(networkErrorBody(err));
+  }
+});
+
+// Creator review: a new creator isn't shown to brands or the public until
+// an operator approves them (the Network's creator-review.ts). The
+// operator's email goes on the record; replies to anything the creator is
+// emailed go to the ops inbox.
+
+/** A Network refusal with a code (404 not_found, 409 creator_not_active)
+ *  passes through; anything else is a 502. */
+function sendNetworkFailure(res: Response, err: unknown) {
+  if (err instanceof NetworkAdminError && err.code && err.status < 500) {
+    return res.status(err.status).json({ error: err.code });
+  }
+  return res.status(502).json(networkErrorBody(err));
+}
+
+const creatorReviewSchema = z.object({
+  /** 'pending' holds an approved creator back for another look. */
+  status: z.enum(['approved', 'rejected', 'pending']),
+  /** Stored on the Network; included in the creator's email only on a
+   *  rejection that notifies them. */
+  reason: z.string().trim().max(500).optional(),
+  notifyCreator: z.boolean().optional(),
+});
+
+const CREATOR_REVIEW_ACTIONS = {
+  approved: 'creator.approve',
+  rejected: 'creator.reject',
+  pending: 'creator.hold',
+} as const;
+
+platformAdminRouter.post(
+  '/platform-admin/creators/:id/review',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = creatorReviewSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    const actor = req.platformAdminActor!;
+    let result;
+    try {
+      result = await adminSetCreatorReview(networkUrl, req.params.id!, {
+        status: body.data.status,
+        reason: body.data.reason || null,
+        reviewedByEmail: actor.email,
+        notifyCreator: body.data.notifyCreator ?? false,
+        replyTo: platformOpsEmail(),
+      });
+    } catch (err) {
+      return sendNetworkFailure(res, err);
+    }
+    if (result.changed) {
+      await writeAudit(db, {
+        actor,
+        action: CREATOR_REVIEW_ACTIONS[body.data.status],
+        targetType: 'creator',
+        targetId: req.params.id!,
+        detail: { reason: body.data.reason || null, notified: !!result.notified },
+      });
+    }
+    res.json({ ok: true, reviewStatus: result.reviewStatus, changed: !!result.changed, notified: !!result.notified });
+  },
+);
+
+const creatorMessageSchema = z.object({
+  body: z.string().trim().min(1).max(2000),
+  /** Also email it (default). It shows in the creator's portal either way. */
+  email: z.boolean().optional(),
+  /** The console's key for this send, kept across retries: if the first
+   *  try reached the creator but its answer didn't reach us, a retry
+   *  returns that message instead of sending a second. */
+  idempotencyKey: z.string().trim().min(8).max(100).optional(),
+});
+
+platformAdminRouter.post(
+  '/platform-admin/creators/:id/messages',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = creatorMessageSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    const actor = req.platformAdminActor!;
+    let result;
+    try {
+      result = await adminSendCreatorMessage(networkUrl, req.params.id!, {
+        body: body.data.body,
+        sentByEmail: actor.email,
+        email: body.data.email ?? true,
+        replyTo: platformOpsEmail(),
+        idempotencyKey: body.data.idempotencyKey ?? null,
+      });
+    } catch (err) {
+      return sendNetworkFailure(res, err);
+    }
+    // A replay is audited only if the first try never got that far.
+    const audited =
+      result.replayed &&
+      !!(await db(TABLES.PlatformAuditLog)
+        .where({ action: 'creator.message', targetId: req.params.id! })
+        .whereRaw(`detail->>'messageId' = ?`, [result.message.id])
+        .first('id'));
+    if (!audited) {
+      await writeAudit(db, {
+        actor,
+        action: 'creator.message',
+        targetType: 'creator',
+        targetId: req.params.id!,
+        detail: { messageId: result.message.id, body: result.message.body, emailed: !!result.emailed },
+      });
+    }
+    res.status(result.replayed ? 200 : 201).json({ ok: true, message: result.message, emailed: !!result.emailed });
+  },
+);
+
+platformAdminRouter.get('/platform-admin/creators/:id/messages', requirePlatformAdmin, async (req, res) => {
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  try {
+    res.json({ messages: await adminListCreatorMessages(networkUrl, req.params.id!) });
+  } catch (err) {
+    sendNetworkFailure(res, err);
   }
 });
 
@@ -750,7 +934,7 @@ const featuredSchema = z.object({
     .array(
       z.object({
         id: z.string().min(1).max(64),
-        until: z.string().datetime({ offset: true }).nullable().optional(),
+        until: offsetDateTime().nullable().optional(),
       }),
     )
     .max(24)
@@ -938,6 +1122,29 @@ platformAdminRouter.delete(
       detail: { type: row.type, value: row.value },
     });
     res.json({ ok: true });
+  },
+);
+
+// Work email: whether a free mail address (FREE_MAIL_DOMAINS) may create a
+// brand. On by default for the hosted platform (brandSignupDefaults).
+
+platformAdminRouter.get('/platform-admin/brand-signup', requirePlatformAdmin, async (_req, res) => {
+  res.json({ settings: await getBrandSignupSettings(db) });
+});
+
+const brandSignupSettingsSchema = z.object({ workEmailRequired: z.boolean() }).strict();
+
+platformAdminRouter.put(
+  '/platform-admin/brand-signup',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = brandSignupSettingsSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const actor = req.platformAdminActor!;
+    const settings = await setBrandSignupSettings(db, body.data, actor.email);
+    await writeAudit(db, { actor, action: 'brand_signup.settings', targetType: 'platform', detail: body.data });
+    res.json({ settings });
   },
 );
 
@@ -1162,19 +1369,21 @@ platformAdminRouter.post(
 );
 
 // --------------------------------------------------------------------------
-// Notifications — setup reminders to brands + profile reminders to creators
+// Notifications — setup reminders to brands, profile reminders and the
+// storefront nudge to creators
 // --------------------------------------------------------------------------
 //
-// Both sweeps are OFF until an operator turns them on here (they email real
+// Every sweep is OFF until an operator turns it on here (they email real
 // people). The console previews exactly who the next run would email
 // (dryRun), can run one now, and can nudge a single brand/creator. Brand
-// reminders run in openpartner; creator reminders run on the Network (which
+// reminders run in openpartner; creator emails run on the Network (which
 // owns creators + the unsubscribe flow) and are triggered from here.
 
 platformAdminRouter.get('/platform-admin/notifications', requirePlatformAdmin, async (_req, res) => {
   const settings = await getNotificationSettings(db);
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const [recent] = (await db(TABLES.BrandNotification)
+    .where({ kind: 'setup_incomplete' })
     .where('sentAt', '>=', weekAgo)
     .count({ c: '*' })) as Array<{ c: string | number }>;
   res.json({
@@ -1188,6 +1397,7 @@ const notificationSettingsSchema = z
   .object({
     brandSetupReminders: z.boolean().optional(),
     creatorProfileReminders: z.boolean().optional(),
+    creatorStorefrontNudge: z.boolean().optional(),
   })
   .strict();
 
@@ -1202,6 +1412,50 @@ platformAdminRouter.put(
     const settings = await setNotificationSettings(db, body.data, actor.email);
     await writeAudit(db, { actor, action: 'notifications.settings', targetType: 'platform', detail: body.data });
     res.json({ settings });
+  },
+);
+
+// --------------------------------------------------------------------------
+// Tracking gate (tracking-verification.ts): from a date, approved brands
+// whose tracking isn't verified take no new partners and leave the
+// marketplace. The console sets the date, shows who it touches, and sends
+// those brands a one-time notice first.
+// --------------------------------------------------------------------------
+
+platformAdminRouter.get('/platform-admin/tracking-gate', requirePlatformAdmin, async (_req, res) => {
+  const settings = await getTrackingGateSettings(db);
+  res.json({ settings, enforced: await trackingGateEnforced(db), affected: await trackingGateAffected(db) });
+});
+
+const trackingGateSchema = z.object({ enforceFrom: offsetDateTime().nullable() }).strict();
+
+platformAdminRouter.put(
+  '/platform-admin/tracking-gate',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = trackingGateSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const actor = req.platformAdminActor!;
+    const settings = await setTrackingGateSettings(db, body.data, actor.email);
+    await writeAudit(db, { actor, action: 'tracking_gate.settings', targetType: 'platform', detail: { ...settings } });
+    res.json({ settings, enforced: await trackingGateEnforced(db) });
+  },
+);
+
+/** Send the notice to every affected brand not told yet. Needs a date set:
+ *  the email quotes it. */
+platformAdminRouter.post(
+  '/platform-admin/tracking-gate/notices',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const { enforceFrom } = await getTrackingGateSettings(db);
+    if (!enforceFrom) return res.status(409).json({ error: 'no_enforce_date' });
+    const actor = req.platformAdminActor!;
+    const result = await sendTrackingGateNotices(db, new Date(enforceFrom), actor.email);
+    await writeAudit(db, { actor, action: 'tracking_gate.notices', targetType: 'platform', detail: { ...result, enforceFrom } });
+    res.json(result);
   },
 );
 
@@ -1243,6 +1497,40 @@ platformAdminRouter.post('/platform-admin/notifications/creator-profile/run', re
     await writeAudit(db, {
       actor,
       action: 'notifications.creator_profile.run',
+      targetType: 'platform',
+      detail: { sent: result.sent, failed: result.failed },
+    });
+  }
+  res.json(result);
+});
+
+platformAdminRouter.post('/platform-admin/notifications/creator-storefront/run', requirePlatformAdmin, async (req, res) => {
+  const body = runSchema.safeParse(req.body ?? {});
+  if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+  const actor = req.platformAdminActor!;
+  if (!body.data.dryRun && actor.role !== 'admin') return res.status(403).json({ error: 'read_only_operator' });
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  let result;
+  try {
+    result = await adminRunStorefrontNudge(networkUrl, { dryRun: body.data.dryRun });
+  } catch (err) {
+    // A live run that timed out may still be sending: record that it was
+    // started.
+    if (!body.data.dryRun) {
+      await writeAudit(db, {
+        actor,
+        action: 'notifications.creator_storefront.run',
+        targetType: 'platform',
+        detail: { error: networkErrorBody(err).detail.slice(0, 200) },
+      });
+    }
+    return res.status(502).json(networkErrorBody(err));
+  }
+  if (!body.data.dryRun) {
+    await writeAudit(db, {
+      actor,
+      action: 'notifications.creator_storefront.run',
       targetType: 'platform',
       detail: { sent: result.sent, failed: result.failed },
     });
@@ -1413,7 +1701,7 @@ const feeRatesSchema = z
 const feeSettingsSchema = z
   .object({
     shadow: z.boolean().optional(),
-    cutoverAt: z.string().datetime({ offset: true }).nullable().optional(),
+    cutoverAt: offsetDateTime().nullable().optional(),
     rates: z.object({ flat: feeRatesSchema.optional(), revshare: feeRatesSchema.optional() }).strict().optional(),
   })
   .strict();
@@ -1430,6 +1718,38 @@ platformAdminRouter.put('/platform-admin/fees/settings', requirePlatformAdmin, r
   const settings = await setFeeRuleSettings(db, body.data, actor.email);
   await writeAudit(db, { actor, action: 'fees.settings', targetType: 'platform', detail: body.data });
   res.json({ settings });
+});
+
+// Storefront bookings (openpartner-network docs/creator-storefront.md §8.5)
+// are paid on the Network, with OpenPartner's fee on top. Hosted brands pay
+// their plan's commission rate (the settings above, booking-fee.ts);
+// self-hosted brands pay the Network's own rate, kept there and edited here.
+
+platformAdminRouter.get('/platform-admin/fees/booking-fee', requirePlatformAdmin, async (_req, res) => {
+  const networkUrl = platformNetworkUrl();
+  if (!networkUrl) return res.status(503).json({ error: 'network_not_configured' });
+  try {
+    res.json(await getNetworkBookingFee(networkUrl));
+  } catch (err) {
+    console.error('[platform-admin] booking fee read failed', err);
+    res.status(502).json({ error: 'network_unavailable' });
+  }
+});
+
+platformAdminRouter.put('/platform-admin/fees/booking-fee', requirePlatformAdmin, requirePlatformAdminWrite, async (req, res) => {
+  const body = z.object({ defaultBps: z.number().int().min(0).max(3000) }).strict().safeParse(req.body ?? {});
+  if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+  const networkUrl = platformNetworkUrl();
+  if (!networkUrl) return res.status(503).json({ error: 'network_not_configured' });
+  const actor = req.platformAdminActor!;
+  try {
+    const out = await setNetworkBookingFee(networkUrl, { defaultBps: body.data.defaultBps, updatedByEmail: actor.email });
+    await writeAudit(db, { actor, action: 'fees.booking_fee', targetType: 'platform', detail: body.data });
+    res.json(out);
+  } catch (err) {
+    console.error('[platform-admin] booking fee write failed', err);
+    res.status(502).json({ error: 'network_unavailable' });
+  }
 });
 
 const feeEstimateSchema = z.object({ days: z.number().int().min(1).max(365).default(90) });
@@ -1479,7 +1799,7 @@ const contractTermsSchema = z
     revenueRate: z.number().min(0).max(1).nullable(),
     commissionRate: z.number().min(0).max(1).nullable(),
     monthlyMinimumUsd: z.number().min(0).max(10_000_000).nullable(),
-    effectiveAt: z.string().datetime({ offset: true }).nullable(),
+    effectiveAt: offsetDateTime().nullable(),
     note: z.string().trim().max(2000).nullable(),
   })
   .strict();
@@ -1594,6 +1914,656 @@ platformAdminRouter.put(
         return res.status(err.code === 'not_found' ? 404 : 409).json({ error: err.code, detail: err.message });
       }
       throw err;
+    }
+  },
+);
+
+// --------------------------------------------------------------------------
+// Own program — OpenPartner's own partner program (house-program.ts)
+// --------------------------------------------------------------------------
+//
+// The tenant whose partners refer brands to OpenPartner. While one is set,
+// a brand signup carrying one of its clicks is recorded there, and the
+// brand's billing Customer names it, so that tenant's Stripe App connection
+// to the billing account credits the brand's invoices. Unset, nothing is.
+
+async function houseProgramView() {
+  const settings = await getHouseProgramSettings(db);
+  if (!settings.tenantId) return { settings, tenant: null, stripeConnection: null, referredBrands: 0 };
+  const tenant = await db<TenantRow>(TABLES.Tenant)
+    .where({ id: settings.tenantId })
+    .first(['id', 'slug', 'displayName', 'status', 'approvalStatus']);
+  const conn = await activeConnectionForTenant(db, settings.tenantId);
+  const [referred] = (await db(TABLES.Event)
+    .where({ tenantId: settings.tenantId, type: 'signup' })
+    .whereLike('externalEventId', 'brand_signup:%')
+    .count({ c: '*' })) as Array<{ c: string | number }>;
+  return {
+    settings,
+    tenant: tenant ?? null,
+    stripeConnection: conn
+      ? { stripeAccountId: conn.stripeAccountId, livemode: conn.livemode, connectedAt: conn.connectedAt, lastEventAt: conn.lastEventAt }
+      : null,
+    referredBrands: Number(referred?.c ?? 0),
+  };
+}
+
+platformAdminRouter.get('/platform-admin/house-program', requirePlatformAdmin, async (_req, res) => {
+  res.json(await houseProgramView());
+});
+
+const houseProgramSchema = z
+  .object({
+    /** The program's tenant by slug; null turns crediting off. */
+    slug: z.string().trim().toLowerCase().min(1).max(64).nullable(),
+  })
+  .strict();
+
+platformAdminRouter.put(
+  '/platform-admin/house-program',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = houseProgramSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    let tenantId: string | null = null;
+    if (body.data.slug) {
+      const tenant = await db<TenantRow>(TABLES.Tenant).where({ slug: body.data.slug }).first(['id']);
+      if (!tenant) return res.status(404).json({ error: 'tenant_not_found' });
+      tenantId = tenant.id;
+    }
+    const actor = req.platformAdminActor!;
+    const before = await getHouseProgramSettings(db);
+    const settings = await setHouseProgramSettings(db, { tenantId }, actor.email);
+    await writeAudit(db, {
+      actor,
+      action: 'house_program.settings',
+      targetType: 'tenant',
+      targetId: tenantId,
+      detail: { before, after: settings },
+    });
+    res.json(await houseProgramView());
+  },
+);
+
+// --------------------------------------------------------------------------
+// Creator index (openpartner-network docs/creator-index.md §6)
+// --------------------------------------------------------------------------
+//
+// Creators not on OpenPartner yet, read from public profiles. The settings,
+// the data and the jobs all live on the Network; these routes relay them with
+// the admin key. Support operators can look; writes and runs need an admin,
+// except a dry run of the invite email.
+
+platformAdminRouter.get('/platform-admin/creator-index/settings', requirePlatformAdmin, async (_req, res) => {
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  try {
+    res.json(await adminGetCreatorIndexSettings(networkUrl));
+  } catch (err) {
+    sendNetworkFailure(res, err);
+  }
+});
+
+const creatorIndexSettingsSchema = z
+  .object({
+    enabled: z.boolean(),
+    invitesEnabled: z.boolean(),
+    outreachEnabled: z.boolean().optional(),
+    // Left out by a console on a Network that predates it.
+    outreachStyle: z.enum(OUTREACH_STYLES).optional(),
+    monthlyBudgetUsd: z.number().int().min(0).max(100_000),
+    memberStatsBudgetUsd: z.number().int().min(0).max(100_000).optional(),
+    minFollowers: z.number().int().min(0).max(10_000_000),
+    // Null: no cap. The Network checks it's over minFollowers.
+    maxFollowers: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
+    // Kept in the index but hidden over it. Null: none; the Network checks
+    // it's over minFollowers.
+    hideOverFollowers: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
+    minPostsPer30d: z.number().int().min(0).max(1_000),
+    refreshDays: z.number().int().min(7).max(90),
+    excludedCountries: z.array(z.string().trim().length(2).transform((v) => v.toUpperCase()).refine(isCountryCode, 'unknown country code')).max(250),
+    hiddenRegions: z.array(z.string().trim().toUpperCase().regex(/^[A-Z]{2}-[A-Z0-9]{1,3}$/)).max(100),
+    seedQueries: z.array(z.string().trim().min(3).max(200)).max(50),
+    discoverySources: z
+      .object({ storefronts: z.boolean(), sponsorPages: z.boolean(), mediaKits: z.boolean().optional(), people: z.boolean(), creatorDatabase: z.boolean().optional() })
+      .strict()
+      .optional(),
+    // Creators the creator database source takes per Discover run.
+    creatorDatabasePerRun: z.number().int().min(0).max(500).optional(),
+    requirePartnershipSignal: z.boolean().optional(),
+    readConcurrency: z.number().int().min(1).max(20).optional(),
+    contactEnrichment: z.object({ creatorData: z.boolean(), ownDomain: z.boolean() }).strict().optional(),
+    classifierModel: z.string().trim().min(1).max(60),
+  })
+  .strict();
+
+platformAdminRouter.put(
+  '/platform-admin/creator-index/settings',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = creatorIndexSettingsSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    const actor = req.platformAdminActor!;
+    try {
+      const before = (await adminGetCreatorIndexSettings(networkUrl)).settings;
+      const saved = await adminSetCreatorIndexSettings(networkUrl, { ...body.data, updatedByEmail: actor.email });
+      await writeAudit(db, {
+        actor,
+        action: 'creator_index.settings',
+        targetType: 'platform',
+        detail: { before, after: saved.settings, visibilityChanged: saved.visibilityChanged },
+      });
+      res.json(saved);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+platformAdminRouter.get('/platform-admin/creator-index/stats', requirePlatformAdmin, async (_req, res) => {
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  try {
+    res.json(await adminCreatorIndexStats(networkUrl));
+  } catch (err) {
+    sendNetworkFailure(res, err);
+  }
+});
+
+platformAdminRouter.get('/platform-admin/creator-index/creators', requirePlatformAdmin, async (req, res) => {
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  const qs = new URLSearchParams();
+  // `missing`: address, state, or both, for who ops can still fill in;
+  // `sort`, a reach range, `hidden` (yes or no), and `after` (the next
+  // page's cursor).
+  for (const key of ['q', 'status', 'limit', 'missing', 'sort', 'minFollowers', 'maxFollowers', 'hidden', 'after']) {
+    const v = req.query[key];
+    if (typeof v === 'string' && v) qs.set(key, v);
+  }
+  try {
+    res.json(await adminSearchIndexedCreators(networkUrl, qs.toString()));
+  } catch (err) {
+    sendNetworkFailure(res, err);
+  }
+});
+
+const hideCreatorsSchema = z
+  .object({
+    hidden: z.boolean(),
+    ids: z.array(z.string().min(1).max(64)).min(1).max(1_000).optional(),
+    // The list's own filters: everyone they match.
+    match: z
+      .object({
+        q: z.string().trim().max(80).optional(),
+        status: z.enum(['active', 'muted', 'claimed']).optional(),
+        missing: z.string().max(40).optional(),
+        minFollowers: z.coerce.number().int().min(0).optional(),
+        maxFollowers: z.coerce.number().int().min(0).optional(),
+        hidden: z.enum(['yes', 'no']).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .refine((b) => !!b.ids !== !!b.match, 'ids or match');
+
+/** Hide or unhide in bulk: kept in the index, but not shown to brands or
+ *  emailed. Audited with how many and how they were picked. */
+platformAdminRouter.post(
+  '/platform-admin/creator-index/creators/hidden',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = hideCreatorsSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body' });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const result = await adminHideIndexedCreators(networkUrl, body.data);
+      await writeAudit(db, {
+        actor: req.platformAdminActor!,
+        action: body.data.hidden ? 'creator_index.hide' : 'creator_index.unhide',
+        targetType: 'indexed_creator',
+        detail: { changed: result.changed, ...(body.data.ids ? { ids: body.data.ids.length } : { match: body.data.match }) },
+      });
+      res.json(result);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+platformAdminRouter.get('/platform-admin/creator-index/creators/:id', requirePlatformAdmin, async (req, res) => {
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  try {
+    res.json(await adminGetIndexedCreator(networkUrl, req.params.id!));
+  } catch (err) {
+    sendNetworkFailure(res, err);
+  }
+});
+
+platformAdminRouter.delete(
+  '/platform-admin/creator-index/creators/:id',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      await adminRemoveIndexedCreator(networkUrl, req.params.id!);
+      await writeAudit(db, { actor: req.platformAdminActor!, action: 'creator_index.remove', targetType: 'indexed_creator', targetId: req.params.id! });
+      res.status(204).send();
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+const blockDomainSchema = z.object({ domain: z.string().trim().min(3).max(253) }).strict();
+
+/** A company that asked for no one there to be emailed. The Network keeps
+ *  only a hash; the audit log is where ops can see which domains were blocked. */
+platformAdminRouter.post(
+  '/platform-admin/creator-index/blocked-domains',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = blockDomainSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_domain' });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const result = await adminBlockIndexDomain(networkUrl, body.data.domain);
+      await writeAudit(db, {
+        actor: req.platformAdminActor!,
+        action: 'creator_index.domain_block',
+        targetType: 'email_domain',
+        targetId: result.domain,
+        detail: { removed: result.removed },
+      });
+      res.json(result);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+platformAdminRouter.delete(
+  '/platform-admin/creator-index/blocked-domains/:domain',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      await adminUnblockIndexDomain(networkUrl, req.params.domain!);
+      await writeAudit(db, {
+        actor: req.platformAdminActor!,
+        action: 'creator_index.domain_unblock',
+        targetType: 'email_domain',
+        targetId: req.params.domain!.trim().toLowerCase(),
+      });
+      res.status(204).send();
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+/** One creator's address in full: the list shows them masked. Admins only,
+ *  and each look is in the audit log. */
+platformAdminRouter.get(
+  '/platform-admin/creator-index/creators/:id/contact',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const body = await adminGetIndexedCreatorContact(networkUrl, req.params.id!);
+      await writeAudit(db, { actor: req.platformAdminActor!, action: 'creator_index.contact_view', targetType: 'indexed_creator', targetId: req.params.id! });
+      res.set('Cache-Control', 'no-store').json(body);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+const indexContactSchema = z
+  .object({
+    email: z.string().trim().min(3).max(254),
+    sourceUrl: z.string().trim().min(8).max(500),
+  })
+  .strict();
+
+/** An address ops found published somewhere, with the page it's on. The
+ *  Network checks the page shows it and that it delivers. */
+platformAdminRouter.put(
+  '/platform-admin/creator-index/creators/:id/contact',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = indexContactSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const result = await adminSetIndexedCreatorContact(networkUrl, req.params.id!, body.data);
+      await writeAudit(db, {
+        actor: req.platformAdminActor!,
+        action: 'creator_index.contact_set',
+        targetType: 'indexed_creator',
+        targetId: req.params.id!,
+        detail: { sourceUrl: body.data.sourceUrl },
+      });
+      res.json(result);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+const indexStateSchema = z
+  .object({
+    region: z.string().trim().min(4).max(6),
+    // The Network keeps it as the location text, which holds 200.
+    sourceUrl: z.string().trim().min(8).max(200),
+  })
+  .strict();
+
+/** A US creator's state ops found, with the page that shows it. The Network
+ *  lets ops set one only where the profiles give none, or a hidden one. */
+platformAdminRouter.put(
+  '/platform-admin/creator-index/creators/:id/location',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = indexStateSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const result = await adminSetIndexedCreatorState(networkUrl, req.params.id!, body.data);
+      await writeAudit(db, {
+        actor: req.platformAdminActor!,
+        action: 'creator_index.location_set',
+        targetType: 'indexed_creator',
+        targetId: req.params.id!,
+        detail: { region: body.data.region, sourceUrl: body.data.sourceUrl },
+      });
+      res.json(result);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+const indexSeedsSchema = z.object({ urls: z.array(z.string().trim().min(5).max(500)).min(1).max(500) });
+
+platformAdminRouter.post(
+  '/platform-admin/creator-index/seeds',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = indexSeedsSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const counts = await adminQueueIndexSeeds(networkUrl, body.data.urls);
+      await writeAudit(db, { actor: req.platformAdminActor!, action: 'creator_index.seeds', targetType: 'platform', detail: counts });
+      res.json(counts);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+const INDEX_JOBS = ['discover', 'read', 'refresh'] as const;
+
+platformAdminRouter.post(
+  '/platform-admin/creator-index/run/:job',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const job = req.params.job as (typeof INDEX_JOBS)[number];
+    if (!INDEX_JOBS.includes(job)) return res.status(404).json({ error: 'unknown_job' });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const result = await adminRunCreatorIndexJob(networkUrl, job);
+      await writeAudit(db, { actor: req.platformAdminActor!, action: `creator_index.run_${job}`, targetType: 'platform', detail: result });
+      res.json(result);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+platformAdminRouter.post('/platform-admin/creator-index/invites/run', requirePlatformAdmin, async (req, res) => {
+  const dryRun = (req.body as { dryRun?: unknown } | undefined)?.dryRun !== false;
+  // Anyone on the console can see who would be emailed; sending takes an admin.
+  if (!dryRun && req.platformAdminActor!.role !== 'admin') return res.status(403).json({ error: 'read_only_operator' });
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  try {
+    const result = await adminRunCreatorIndexInvites(networkUrl, { dryRun });
+    if (!dryRun) {
+      await writeAudit(db, {
+        actor: req.platformAdminActor!,
+        action: 'creator_index.invites_run',
+        targetType: 'platform',
+        detail: { sent: result.sent, failed: result.failed, candidates: result.candidates },
+      });
+    }
+    res.json(result);
+  } catch (err) {
+    sendNetworkFailure(res, err);
+  }
+});
+
+const outreachRunSchema = z.object({
+  dryRun: z.boolean().default(true),
+  limit: z.number().int().min(1).max(100).default(50),
+});
+
+/** One batch of the "claim your profile" email (openpartner-network
+ *  docs/creator-index.md §5.5). Anyone on the console can preview who would
+ *  get it; sending takes an admin, and is audited. */
+platformAdminRouter.post('/platform-admin/creator-index/outreach/run', requirePlatformAdmin, async (req, res) => {
+  const body = outreachRunSchema.safeParse(req.body ?? {});
+  if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+  const { dryRun, limit } = body.data;
+  if (!dryRun && req.platformAdminActor!.role !== 'admin') return res.status(403).json({ error: 'read_only_operator' });
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  try {
+    const result = await adminRunCreatorIndexOutreach(networkUrl, { dryRun, limit });
+    if (!dryRun) {
+      await writeAudit(db, { actor: req.platformAdminActor!, action: 'creator_index.outreach_run', targetType: 'platform', detail: { limit } });
+    }
+    res.status(dryRun ? 200 : 202).json(result);
+  } catch (err) {
+    sendNetworkFailure(res, err);
+  }
+});
+
+const outreachSampleSchema = z.object({
+  to: z.array(z.string().trim().toLowerCase().email().max(254)).min(1).max(20),
+  // Left out: the style batches send.
+  style: z.enum(OUTREACH_STYLES).optional(),
+});
+
+/** The outreach email to addresses an admin types, one message each, for a
+ *  seed test (openpartner-network docs/creator-index.md §5.5). It's about
+ *  a made-up creator and counts nowhere. Audited with the addresses and
+ *  the style. */
+platformAdminRouter.post('/platform-admin/creator-index/outreach/sample', requirePlatformAdmin, requirePlatformAdminWrite, async (req, res) => {
+  const body = outreachSampleSchema.safeParse(req.body ?? {});
+  if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+  const networkUrl = networkOr503(res);
+  if (!networkUrl) return;
+  try {
+    const result = await adminSendCreatorIndexOutreachSample(networkUrl, body.data.to, body.data.style);
+    await writeAudit(db, {
+      actor: req.platformAdminActor!,
+      action: 'creator_index.outreach_sample',
+      targetType: 'platform',
+      detail: { to: body.data.to, style: result.style ?? null, sent: result.sent.length, failed: result.failed.length },
+    });
+    res.json(result);
+  } catch (err) {
+    sendNetworkFailure(res, err);
+  }
+});
+
+// The creator index's two mailboxes, connected by Microsoft sign-in
+// (openpartner-network docs/creator-index.md §5.5). The Network holds the
+// app's secret, the PKCE verifier and the tokens; Microsoft redirects the
+// admin's browser back here (/platform/mailboxes/callback), where the ops
+// session ties it to the sign-in, and this relays the code. Admins only, all
+// audited.
+
+const MAILBOX_KINDS = ['outreach', 'invite'] as const;
+type MailboxKindParam = (typeof MAILBOX_KINDS)[number];
+
+function mailboxKindOr404(raw: string | undefined, res: Response): MailboxKindParam | null {
+  if ((MAILBOX_KINDS as readonly string[]).includes(raw ?? '')) return raw as MailboxKindParam;
+  res.status(404).json({ error: 'unknown_mailbox' });
+  return null;
+}
+
+/** Where Microsoft sends the admin back to: registered on the Entra app. */
+export function mailboxRedirectUri(): string {
+  return `${getPortalBaseUrl().replace(/\/$/, '')}/platform/mailboxes/callback`;
+}
+
+/** The Network's reason for a refused sign-in (Microsoft's AADSTS text). */
+function networkErrorDetail(err: unknown): string | null {
+  if (!(err instanceof NetworkAdminError)) return null;
+  const body = err.message.slice(err.message.indexOf('{'));
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown };
+    return typeof parsed.detail === 'string' ? parsed.detail.slice(0, 300) : null;
+  } catch {
+    return null;
+  }
+}
+
+const sendAsSchema = z.string().trim().max(400).nullable().optional();
+
+platformAdminRouter.post(
+  '/platform-admin/creator-index/mailboxes/:kind/connect',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const kind = mailboxKindOr404(req.params.kind, res);
+    if (!kind) return;
+    const body = z.object({ sendAs: sendAsSchema }).strict().safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    const actor = req.platformAdminActor!;
+    const sendAs = body.data.sendAs || null;
+    try {
+      const started = await adminStartMailboxConnect(networkUrl, kind, { redirectUri: mailboxRedirectUri(), startedByEmail: actor.email, sendAs });
+      await writeAudit(db, { actor, action: 'creator_index.mailbox_connect_start', targetType: 'network_mailbox', targetId: kind, detail: { sendAs } });
+      res.json({ authorizeUrl: started.authorizeUrl });
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+const mailboxCallbackSchema = z
+  .object({
+    state: z.string().trim().min(16).max(200),
+    code: z.string().trim().min(1).max(4000),
+  })
+  .strict();
+
+/** Microsoft's redirect, relayed by the console page: the Network takes the
+ *  state only from the admin who started that sign-in. */
+platformAdminRouter.post(
+  '/platform-admin/creator-index/mailboxes/callback',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const body = mailboxCallbackSchema.safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body' });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    const actor = req.platformAdminActor!;
+    try {
+      const done = await adminCompleteMailboxConnect(networkUrl, { ...body.data, completedByEmail: actor.email });
+      const connection = done.mailbox.connection;
+      await writeAudit(db, {
+        actor,
+        action: 'creator_index.mailbox_connected',
+        targetType: 'network_mailbox',
+        targetId: done.kind,
+        detail: { account: connection?.account ?? null, sendAs: connection?.sendAs ?? null },
+      });
+      res.json(done);
+    } catch (err) {
+      if (err instanceof NetworkAdminError && err.code) {
+        const detail = networkErrorDetail(err);
+        await writeAudit(db, { actor, action: 'creator_index.mailbox_connect_failed', targetType: 'network_mailbox', detail: { error: err.code, reason: detail } });
+        if (err.status < 500) return res.status(err.status).json({ error: err.code, ...(detail ? { detail } : {}) });
+      }
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+/** A shared mailbox the connected user sends as, or null for their own. */
+platformAdminRouter.put(
+  '/platform-admin/creator-index/mailboxes/:kind/send-as',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const kind = mailboxKindOr404(req.params.kind, res);
+    if (!kind) return;
+    const body = z.object({ sendAs: sendAsSchema }).strict().safeParse(req.body ?? {});
+    if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    const sendAs = body.data.sendAs || null;
+    try {
+      const result = await adminSetMailboxSendAs(networkUrl, kind, sendAs);
+      await writeAudit(db, { actor: req.platformAdminActor!, action: 'creator_index.mailbox_send_as', targetType: 'network_mailbox', targetId: kind, detail: { sendAs } });
+      res.json(result);
+    } catch (err) {
+      sendNetworkFailure(res, err);
+    }
+  },
+);
+
+/** Forget the connection. The Network then sends as its env sets up, if at
+ *  all. */
+platformAdminRouter.delete(
+  '/platform-admin/creator-index/mailboxes/:kind',
+  requirePlatformAdmin,
+  requirePlatformAdminWrite,
+  async (req, res) => {
+    const kind = mailboxKindOr404(req.params.kind, res);
+    if (!kind) return;
+    const networkUrl = networkOr503(res);
+    if (!networkUrl) return;
+    try {
+      const result = await adminDisconnectMailbox(networkUrl, kind);
+      if (result.removed) {
+        await writeAudit(db, { actor: req.platformAdminActor!, action: 'creator_index.mailbox_disconnect', targetType: 'network_mailbox', targetId: kind });
+      }
+      res.json(result);
+    } catch (err) {
+      sendNetworkFailure(res, err);
     }
   },
 );

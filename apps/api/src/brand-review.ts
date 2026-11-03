@@ -13,12 +13,14 @@ import { ulid } from 'ulid';
 import type { Knex } from 'knex';
 import {
   TABLES,
+  isFreeMailAddress,
   type AdminRow,
   type ProgramRow,
   type SignupBlocklistRow,
   type TenantRow,
 } from '@openpartner/db';
 import { getMailer } from './mailer.js';
+import { getBrandSignupSettings } from './platform-settings.js';
 import { platformOpsEmail, sendOpsEmail } from './platform-ops-mail.js';
 import { getPortalBaseUrl } from './portal-url.js';
 import {
@@ -27,6 +29,7 @@ import {
   opsBrandDecisionEmail,
   opsBrandNeedsReviewEmail,
 } from './email-templates.js';
+import { isTrackingVerified, networkReviewStatus, trackingGateEnforced, type ReviewStatus } from './tracking-verification.js';
 
 export interface OpsActor {
   id: string;
@@ -66,6 +69,29 @@ export async function findBlockingEntry(
       else void qb.whereRaw('1 = 0');
     });
   return rows[0] ?? null;
+}
+
+/**
+ * True when this address may not create a brand: it's at a free mail
+ * provider and ops require a work email (PlatformSetting brandSignup).
+ * Someone who already admins an approved, active brand cleared review once,
+ * so they may add another from the same address. A view-only seat on one
+ * doesn't count: being shown a brand isn't running it. Unlike the blocklist this
+ * refusal is specific (work_email_required): it isn't a ban.
+ */
+export async function workEmailRequiredFor(db: Knex, email: string): Promise<boolean> {
+  const normalized = normalizeEmail(email);
+  if (!isFreeMailAddress(normalized)) return false;
+  if (!(await getBrandSignupSettings(db)).workEmailRequired) return false;
+  const approved = await db(TABLES.Admin)
+    .join(TABLES.Tenant, `${TABLES.Tenant}.id`, `${TABLES.Admin}.tenantId`)
+    .whereRaw(`lower("${TABLES.Admin}"."email") = ?`, [normalized])
+    .whereNull(`${TABLES.Admin}.revokedAt`)
+    .andWhere(`${TABLES.Admin}.role`, 'admin')
+    .andWhere(`${TABLES.Tenant}.approvalStatus`, 'approved')
+    .andWhere(`${TABLES.Tenant}.status`, 'active')
+    .first(`${TABLES.Tenant}.id`);
+  return !approved;
 }
 
 /** Add (or update the reason of) a blocklist entry. Idempotent on
@@ -158,24 +184,24 @@ async function notifyOpsDecision(
 // Brand-facing notifications
 // --------------------------------------------------------------------------
 
-/** Oldest non-revoked admin for a tenant — our canonical "primary contact"
- *  (same convention as campaign-end-notifications). Null when the brand has
- *  no admin (shouldn't happen post-signup). */
+/** Oldest non-revoked full admin for a tenant — our canonical "primary
+ *  contact" (same convention as campaign-end-notifications). Null when the
+ *  brand has no admin (shouldn't happen post-signup). */
 async function primaryAdmin(db: Knex, tenantId: string): Promise<AdminRow | null> {
   const row = await db<AdminRow>(TABLES.Admin)
-    .where({ tenantId })
+    .where({ tenantId, role: 'admin' })
     .whereNull('revokedAt')
     .orderBy('createdAt', 'asc')
     .first();
   return row ?? null;
 }
 
-async function notifyBrandApproved(db: Knex, tenant: TenantRow): Promise<void> {
+async function notifyBrandApproved(db: Knex, tenant: TenantRow, trackingPending: boolean): Promise<void> {
   const admin = await primaryAdmin(db, tenant.id);
   if (!admin) return;
   // Respect a white-label custom domain if the brand already has one.
   const enterUrl = `${getPortalBaseUrl({ slug: tenant.slug, customDomain: tenant.customDomain })}/`;
-  const tmpl = brandApprovedEmail(admin.name, tenant.displayName, enterUrl);
+  const tmpl = brandApprovedEmail(admin.name, tenant.displayName, enterUrl, trackingPending);
   try {
     await getMailer().send({ db, tenantId: tenant.id }, {
       to: admin.email,
@@ -225,6 +251,8 @@ export async function approveBrand(
   opts: { reinstate?: boolean } = {},
 ): Promise<void> {
   const now = new Date();
+  const verified = await isTrackingVerified(db, tenant.id);
+  const enforced = await trackingGateEnforced(db, now);
   await db<TenantRow>(TABLES.Tenant).where({ id: tenant.id }).update({
     approvalStatus: 'approved',
     approvalReason: null,
@@ -240,18 +268,19 @@ export async function approveBrand(
     action: opts.reinstate ? 'brand.reinstate' : 'brand.approve',
     targetType: 'tenant',
     targetId: tenant.id,
-    detail: { slug: tenant.slug, priorApprovalStatus: tenant.approvalStatus },
+    detail: { slug: tenant.slug, priorApprovalStatus: tenant.approvalStatus, trackingVerified: verified },
   });
   // List the brand on the marketplace — the Network keeps every offering of
-  // a vendor whose review isn't 'approved' out of discovery — and undo the
+  // a vendor whose review isn't 'approved' out of discovery, and the
+  // tracking gate keeps an unverified brand there — and undo the
   // Network-side suspension a prior rejection applied. A failed push is
   // retried by the network-review-reconcile job.
-  await setBrandReviewOnNetwork(db, tenant.id, 'approved');
+  await setBrandReviewOnNetwork(db, tenant.id, networkReviewStatus('approved', verified, enforced));
   if (tenant.approvalStatus === 'rejected') {
     await reactivateBrandOnNetwork(db, tenant.id);
   }
 
-  await notifyBrandApproved(db, { ...tenant, status: 'active', approvalStatus: 'approved' });
+  await notifyBrandApproved(db, { ...tenant, status: 'active', approvalStatus: 'approved' }, enforced && !verified);
   await notifyOpsDecision(db, {
     brandName: tenant.displayName,
     slug: tenant.slug,
@@ -402,7 +431,7 @@ async function suspendBrandOnNetwork(db: Knex, tenantId: string, reason: string)
 async function setBrandReviewOnNetwork(
   db: Knex,
   tenantId: string,
-  status: 'approved' | 'rejected',
+  status: ReviewStatus,
   reason?: string | null,
 ): Promise<void> {
   const v = await networkVendorOf(db, tenantId);

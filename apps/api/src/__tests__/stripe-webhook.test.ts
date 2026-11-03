@@ -34,6 +34,7 @@ const stripeApi = vi.hoisted(() => ({
   invoicesList: vi.fn(),
   checkoutSessionsRetrieve: vi.fn(),
   promotionCodesRetrieve: vi.fn(),
+  couponsRetrieve: vi.fn(),
   chargesRetrieve: vi.fn(),
   invoicePaymentsList: vi.fn(),
 }));
@@ -46,6 +47,7 @@ function resetStripeApi() {
   stripeApi.invoicesList.mockReset().mockRejectedValue(new Error('unexpected invoices.list'));
   stripeApi.checkoutSessionsRetrieve.mockReset().mockRejectedValue(new Error('unexpected checkout.sessions.retrieve'));
   stripeApi.promotionCodesRetrieve.mockReset().mockRejectedValue(new Error('unexpected promotionCodes.retrieve'));
+  stripeApi.couponsRetrieve.mockReset().mockRejectedValue(new Error('unexpected coupons.retrieve'));
   stripeApi.chargesRetrieve.mockReset().mockRejectedValue(new Error('unexpected charges.retrieve'));
   stripeApi.invoicePaymentsList.mockReset().mockRejectedValue(new Error('unexpected invoicePayments.list'));
 }
@@ -74,6 +76,7 @@ vi.mock('stripe', async () => {
     (instance as unknown as { promotionCodes: unknown }).promotionCodes = {
       retrieve: stripeApi.promotionCodesRetrieve,
     };
+    (instance as unknown as { coupons: unknown }).coupons = { retrieve: stripeApi.couponsRetrieve };
     (instance as unknown as { charges: unknown }).charges = { retrieve: stripeApi.chargesRetrieve };
     (instance as unknown as { invoicePayments: unknown }).invoicePayments = { list: stripeApi.invoicePaymentsList };
     return instance;
@@ -141,11 +144,14 @@ const TABLES_TO_CLEAN = [
   TABLES.HostedFundingTransfer,
   TABLES.HostedFundingBatch,
   TABLES.StripeWebhookInbox,
+  // Every brand event the pipeline processes is logged (stripe-event-catchup.ts).
+  TABLES.StripeEventLog,
   // Before Partner — Payout.partnerId is an FK. Commission is already
   // deleted above, which is what frees Payout.
   TABLES.Payout,
   TABLES.Partner,
   TABLES.Config,
+  TABLES.TrackingIssue,
 ];
 
 interface Ids {
@@ -199,7 +205,11 @@ beforeAll(async () => {
 afterAll(async () => {
   // The last test's Identity → Click → Link chain would otherwise block a
   // later file's narrower Click / Partner wipe on its FKs.
-  if (!skipIntegration) for (const t of TABLES_TO_CLEAN) await db(t).del();
+  if (!skipIntegration) {
+    for (const t of TABLES_TO_CLEAN) await db(t).del();
+    // A test click passed through checkout below verifies the brand.
+    await db(TABLES.Tenant).where({ id: DEFAULT_TENANT_ID }).update({ trackingTestPassedAt: null });
+  }
   await db.destroy();
 });
 
@@ -262,6 +272,73 @@ describe.skipIf(skipIntegration)('stripe webhook — merchant billing flow', () 
     expect(identity).toBeFalsy();
     const event = await db(TABLES.Event).where({ userId: customerId }).first();
     expect(event).toBeFalsy();
+    // Dropped, but counted for Admin → Tracking health.
+    const issue = await db(TABLES.TrackingIssue).where({ kind: 'stripe_unknown_click' }).first();
+    expect(issue).toMatchObject({ count: 1, sampleRef: bogusCref });
+  });
+
+  it("links an admin's test click a checkout carried, and stitches nothing to it", async () => {
+    const { programId } = await seedClick();
+    const testId = ulid();
+    const testClickId = ulid();
+    await db(TABLES.TestClick).insert({
+      id: testId,
+      tenantId: DEFAULT_TENANT_ID,
+      programId,
+      tokenHash: `checkout-test-${testId}`,
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 30 * 60_000),
+      clickId: testClickId,
+      clickedAt: new Date(),
+    });
+    const customerId = `cus_${ulid()}`;
+
+    const res = await postWebhook({
+      id: `evt_${ulid()}`,
+      type: 'checkout.session.completed',
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: `cs_${ulid()}`,
+          mode: 'subscription',
+          client_reference_id: testClickId,
+          customer: customerId,
+          subscription: `sub_${ulid()}`,
+        },
+      },
+    });
+
+    expect(res.status).toBe(200);
+    const test = await db(TABLES.TestClick).where({ id: testId }).first();
+    expect(test.linkedVia).toBe('checkout');
+    expect(test.identifiedAt).toBeInstanceOf(Date);
+    const tenant = await db(TABLES.Tenant).where({ id: DEFAULT_TENANT_ID }).first('trackingTestPassedAt');
+    expect(tenant.trackingTestPassedAt).toBeInstanceOf(Date);
+    expect(await db(TABLES.Identity).where({ userId: customerId }).first()).toBeFalsy();
+    expect(await db(TABLES.TrackingIssue).first()).toBeUndefined();
+  });
+
+  it("counts a client_reference_id that isn't a click id at all as the brand's own reference", async () => {
+    const res = await postWebhook({
+      id: `evt_${ulid()}`,
+      type: 'checkout.session.completed',
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: `cs_${ulid()}`,
+          mode: 'subscription',
+          client_reference_id: 'order-1234',
+          customer: `cus_${ulid()}`,
+          subscription: `sub_${ulid()}`,
+        },
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(await db(TABLES.TrackingIssue).where({ kind: 'stripe_foreign_reference' }).first()).toMatchObject({
+      count: 1,
+      sampleRef: 'order-1234',
+    });
+    expect(await db(TABLES.TrackingIssue).where({ kind: 'stripe_unknown_click' }).first()).toBeUndefined();
   });
 
   it('redelivery of the same Stripe event is idempotent', async () => {
@@ -438,7 +515,10 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
   // a partner link: no client_reference_id, so nothing but the code ties
   // them to the partner.
 
-  async function seedCoupon(stripePromotionCodeId: string | null = null): Promise<{ partnerId: string; code: string }> {
+  async function seedCoupon(
+    stripePromotionCodeId: string | null = null,
+    { brandChosen = false }: { brandChosen?: boolean } = {},
+  ): Promise<{ partnerId: string; code: string }> {
     const { partnerId, programId } = await seedClick();
     const code = `CREATOR${ulid().slice(-6)}`;
     await db(TABLES.Coupon).insert({
@@ -448,8 +528,23 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
       programId,
       code,
       stripePromotionCodeId,
+      brandChosen,
+      // Minted an hour back, so a promo created "now" was made for the code
+      // whatever the DB clock says.
+      createdAt: new Date(Date.now() - HOUR_MS),
     });
     return { partnerId, code };
+  }
+
+  /** A promotion code as Stripe returns it: by default the brand's own,
+   *  created now, after the seeded code (made for it). */
+  function promo(code: string, fields: Record<string, unknown> = {}) {
+    return { id: `promo_${ulid()}`, object: 'promotion_code', code, created: nowSeconds(), metadata: {}, ...fields };
+  }
+
+  /** A Stripe Coupon, by default created now. */
+  function stripeCoupon(id: string, fields: Record<string, unknown> = {}) {
+    return { id, object: 'coupon', created: nowSeconds(), metadata: {}, percent_off: 10, ...fields };
   }
 
   function couponCheckout(customerId: string, session: Record<string, unknown>) {
@@ -509,7 +604,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
 
     const res = await postWebhook(
       couponCheckout(customerId, {
-        discounts: [{ coupon: null, promotion_code: { id: `promo_${ulid()}`, code: code.toLowerCase() } }],
+        discounts: [{ coupon: null, promotion_code: promo(code.toLowerCase()) }],
       }),
     );
 
@@ -536,7 +631,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
     const { partnerId, code } = await seedCoupon();
     const customerId = `cus_${ulid()}`;
     const promoId = `promo_${ulid()}`;
-    stripeApi.promotionCodesRetrieve.mockResolvedValue({ id: promoId, object: 'promotion_code', code });
+    stripeApi.promotionCodesRetrieve.mockResolvedValue(promo(code, { id: promoId }));
     // Webhook payloads carry the session's discounts with ids, not objects.
     const payload = couponCheckout(customerId, { discounts: [{ coupon: `co_${ulid()}`, promotion_code: promoId }] });
 
@@ -579,7 +674,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
         },
       },
     });
-    stripeApi.promotionCodesRetrieve.mockResolvedValue({ id: promoId, object: 'promotion_code', code });
+    stripeApi.promotionCodesRetrieve.mockResolvedValue(promo(code, { id: promoId }));
 
     const res = await postWebhook(payload);
 
@@ -619,7 +714,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
     const discount = {
       id: discountId,
       object: 'discount',
-      promotion_code: { id: promoId, object: 'promotion_code', code },
+      promotion_code: promo(code, { id: promoId }),
       source: { coupon: `co_${ulid()}`, type: 'coupon' },
     };
     stripeApi.invoicesRetrieve.mockResolvedValue({
@@ -646,7 +741,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
 
     // The checkout event that follows reuses the coupon's click.
     await postWebhook(
-      couponCheckout(customerId, { discounts: [{ coupon: null, promotion_code: { id: promoId, code } }] }),
+      couponCheckout(customerId, { discounts: [{ coupon: null, promotion_code: promo(code, { id: promoId }) }] }),
     );
     expect(await db(TABLES.Click).where({ partnerId, landingUrl: `coupon://${code}` })).toHaveLength(1);
     expect(await db(TABLES.Event).where({ userId: customerId, type: 'signup' })).toHaveLength(1);
@@ -662,6 +757,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
       metadata: { openpartner_user_id: userId },
     });
     const discount = { id: `di_${ulid()}`, object: 'discount', promotion_code: null, source: { coupon: code, type: 'coupon' } };
+    stripeApi.couponsRetrieve.mockResolvedValue(stripeCoupon(code));
     const payload = discountedInvoicePaid(customerId, discount.id);
     stripeApi.invoicesRetrieve.mockResolvedValue({ ...payload.data.object, discounts: [discount] });
 
@@ -692,7 +788,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
         data: { object: { id: customerId, object: 'customer', metadata: { openpartner_user_id: merchantUserId } } },
       };
       const checkout = couponCheckout(customerId, {
-        discounts: [{ coupon: null, promotion_code: { id: `promo_${ulid()}`, code } }],
+        discounts: [{ coupon: null, promotion_code: promo(code) }],
       });
       return { partnerId, code, customerId, merchantUserId, customerCreated, checkout };
     }
@@ -753,7 +849,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
       const { clickId } = await seedClick();
       const checkout = couponCheckout(s.customerId, {
         client_reference_id: clickId,
-        discounts: [{ coupon: null, promotion_code: { id: `promo_${ulid()}`, code: s.code } }],
+        discounts: [{ coupon: null, promotion_code: promo(s.code) }],
       });
 
       expect((await postWebhook(checkout)).status).toBe(200);
@@ -782,6 +878,200 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
     expect(attribution?.partnerId).toBe(partnerId);
   });
 
+  describe("a partner code that equals one of the brand's own promos", () => {
+    // Older than every seeded code (minted an hour back).
+    const BEFORE_THE_CODE = () => nowSeconds() - 2 * 3600;
+
+    /** The partner the customer's signup was credited to, if any. */
+    async function creditedPartner(customerId: string): Promise<string | null> {
+      const signup = await db(TABLES.Event).where({ userId: customerId, type: 'signup' }).first();
+      if (!signup) return null;
+      return (await db(TABLES.Attribution).where({ eventId: signup.id }).first())?.partnerId ?? null;
+    }
+
+    async function expectNothingCredited(customerId: string, code: string) {
+      expect(await db(TABLES.Click).where({ landingUrl: `coupon://${code}` })).toHaveLength(0);
+      expect(await db(TABLES.Identity).where({ userId: customerId })).toHaveLength(0);
+      expect(await db(TABLES.Event).where({ userId: customerId })).toHaveLength(0);
+      const tenant = await db(TABLES.Tenant).where({ id: DEFAULT_TENANT_ID }).first();
+      expect(tenant!.couponIntegrationVerifiedAt).toBeNull();
+    }
+
+    it('a promotion code older than the partner code credits nobody, and says so', async () => {
+      const { code } = await seedCoupon();
+      const customerId = `cus_${ulid()}`;
+      const sitewide = promo(code, { created: BEFORE_THE_CODE() });
+      stripeApi.promotionCodesRetrieve.mockResolvedValue(sitewide);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const res = await postWebhook(
+          couponCheckout(customerId, { discounts: [{ coupon: `co_${ulid()}`, promotion_code: sitewide.id }] }),
+        );
+
+        expect(res.status).toBe(200);
+        expect(res.body.skipped).toBe('checkout.session.completed');
+        await expectNothingCredited(customerId, code);
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining("brand's own promo"),
+          expect.objectContaining({ code, stripeObject: sitewide.id }),
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('nor does an older promo with the same string when the code has a promotion code of its own', async () => {
+      // An inactive promo still discounting a subscription's invoices can
+      // share the string with the code's own, active one.
+      const { code } = await seedCoupon(`promo_${ulid()}`);
+      const customerId = `cus_${ulid()}`;
+      const discount = {
+        id: `di_${ulid()}`,
+        object: 'discount',
+        promotion_code: promo(code, { created: BEFORE_THE_CODE(), active: false }),
+        source: { coupon: `co_${ulid()}`, type: 'coupon' },
+      };
+      const payload = discountedInvoicePaid(customerId, discount.id);
+      stripeApi.invoicesRetrieve.mockResolvedValue({ ...payload.data.object, discounts: [discount] });
+
+      const res = await postWebhook(payload);
+
+      expect(res.status).toBe(200);
+      expect(stripeApi.promotionCodesRetrieve).not.toHaveBeenCalled();
+      expect(await db(TABLES.Click).where({ landingUrl: `coupon://${code}` })).toHaveLength(0);
+      expect(await db(TABLES.Event).where({ userId: customerId })).toHaveLength(0);
+    });
+
+    it('a promotion code OpenPartner minted for the code credits the partner, though the row lacks its id', async () => {
+      const { partnerId, code } = await seedCoupon();
+      const customerId = `cus_${ulid()}`;
+      const ours = promo(code, { created: BEFORE_THE_CODE(), metadata: { source: 'openpartner', openpartner_code: code } });
+      stripeApi.promotionCodesRetrieve.mockResolvedValue(ours);
+
+      const res = await postWebhook(couponCheckout(customerId, { discounts: [{ coupon: `co_${ulid()}`, promotion_code: ours.id }] }));
+
+      expect(res.status).toBe(200);
+      expect(await creditedPartner(customerId)).toBe(partnerId);
+    });
+
+    it("a promotion code OpenPartner minted for another code doesn't count as this one's", async () => {
+      const { code } = await seedCoupon();
+      const customerId = `cus_${ulid()}`;
+      const other = promo(code, { created: BEFORE_THE_CODE(), metadata: { source: 'openpartner', openpartner_code: 'SOMEONEELSE' } });
+      stripeApi.promotionCodesRetrieve.mockResolvedValue(other);
+
+      const res = await postWebhook(couponCheckout(customerId, { discounts: [{ coupon: `co_${ulid()}`, promotion_code: other.id }] }));
+
+      expect(res.status).toBe(200);
+      await expectNothingCredited(customerId, code);
+    });
+
+    it('compares in whole seconds: a promo created in the second the code was minted counts as made for it', async () => {
+      const minted = await seedCoupon();
+      const row = await db(TABLES.Coupon).where({ code: minted.code }).first();
+      const mintedSecond = Math.floor(new Date(row.createdAt).getTime() / 1000);
+
+      const sameSecond = `cus_${ulid()}`;
+      const tie = promo(minted.code, { created: mintedSecond });
+      stripeApi.promotionCodesRetrieve.mockResolvedValue(tie);
+      await postWebhook(couponCheckout(sameSecond, { discounts: [{ coupon: `co_${ulid()}`, promotion_code: tie.id }] }));
+      expect(await creditedPartner(sameSecond)).toBe(minted.partnerId);
+
+      const other = await seedCoupon();
+      const otherRow = await db(TABLES.Coupon).where({ code: other.code }).first();
+      const secondBefore = `cus_${ulid()}`;
+      const older = promo(other.code, { created: Math.floor(new Date(otherRow.createdAt).getTime() / 1000) - 1 });
+      stripeApi.promotionCodesRetrieve.mockResolvedValue(older);
+      await postWebhook(couponCheckout(secondBefore, { discounts: [{ coupon: `co_${ulid()}`, promotion_code: older.id }] }));
+      expect(await creditedPartner(secondBefore)).toBeNull();
+    });
+
+    it("a code the brand's admin chose maps the brand's existing promo onto the partner", async () => {
+      const { partnerId, code } = await seedCoupon(null, { brandChosen: true });
+      const customerId = `cus_${ulid()}`;
+      const sitewide = promo(code, { created: BEFORE_THE_CODE() });
+      stripeApi.promotionCodesRetrieve.mockResolvedValue(sitewide);
+
+      const res = await postWebhook(couponCheckout(customerId, { discounts: [{ coupon: `co_${ulid()}`, promotion_code: sitewide.id }] }));
+
+      expect(res.status).toBe(200);
+      expect(await creditedPartner(customerId)).toBe(partnerId);
+    });
+
+    describe('a Stripe Coupon id set to match the code (no promotion code)', () => {
+      it('credits the partner when the coupon was created for the code', async () => {
+        const { partnerId, code } = await seedCoupon();
+        const customerId = `cus_${ulid()}`;
+        stripeApi.couponsRetrieve.mockResolvedValue(stripeCoupon(code));
+
+        const res = await postWebhook(couponCheckout(customerId, { discounts: [{ coupon: code, promotion_code: null }] }));
+
+        expect(res.status).toBe(200);
+        expect(stripeApi.couponsRetrieve).toHaveBeenCalledWith(code);
+        expect(await creditedPartner(customerId)).toBe(partnerId);
+      });
+
+      it('uses the coupon a discount carries, without reading it', async () => {
+        const { partnerId, code } = await seedCoupon();
+        const customerId = `cus_${ulid()}`;
+        // A Discount from before API 2025-03-31 carries its Coupon object.
+        const discount = { id: `di_${ulid()}`, object: 'discount', promotion_code: null, coupon: stripeCoupon(code) };
+        const payload = discountedInvoicePaid(customerId, discount.id);
+        stripeApi.invoicesRetrieve.mockResolvedValue({ ...payload.data.object, discounts: [discount] });
+
+        const res = await postWebhook(payload);
+
+        expect(res.status).toBe(200);
+        expect(stripeApi.couponsRetrieve).not.toHaveBeenCalled();
+        const revenue = await db(TABLES.Event).where({ userId: customerId, type: 'invoice_paid' }).first();
+        expect((await db(TABLES.Attribution).where({ eventId: revenue!.id }).first())?.partnerId).toBe(partnerId);
+      });
+
+      it("credits nobody when the coupon is older than the code, unless the brand's admin chose it", async () => {
+        const plain = await seedCoupon();
+        const plainCustomer = `cus_${ulid()}`;
+        stripeApi.couponsRetrieve.mockResolvedValue(stripeCoupon(plain.code, { created: BEFORE_THE_CODE() }));
+        const declined = await postWebhook(couponCheckout(plainCustomer, { discounts: [{ coupon: plain.code, promotion_code: null }] }));
+        expect(declined.status).toBe(200);
+        await expectNothingCredited(plainCustomer, plain.code);
+
+        const chosen = await seedCoupon(null, { brandChosen: true });
+        const chosenCustomer = `cus_${ulid()}`;
+        stripeApi.couponsRetrieve.mockClear();
+        const mapped = await postWebhook(couponCheckout(chosenCustomer, { discounts: [{ coupon: chosen.code, promotion_code: null }] }));
+        expect(mapped.status).toBe(200);
+        // The admin's choice settles it without reading the coupon.
+        expect(stripeApi.couponsRetrieve).not.toHaveBeenCalled();
+        expect(await creditedPartner(chosenCustomer)).toBe(chosen.partnerId);
+      });
+
+      it("a coupon that can't be read credits nobody", async () => {
+        const { code } = await seedCoupon();
+        const customerId = `cus_${ulid()}`;
+        stripeApi.couponsRetrieve.mockRejectedValue(stripeError('StripeInvalidRequestError', 'resource_missing'));
+
+        const res = await postWebhook(couponCheckout(customerId, { discounts: [{ coupon: code, promotion_code: null }] }));
+
+        expect(res.status).toBe(200);
+        await expectNothingCredited(customerId, code);
+      });
+
+      it('a transient coupon read failure is a 500, so Stripe redelivers', async () => {
+        const { partnerId, code } = await seedCoupon();
+        const customerId = `cus_${ulid()}`;
+        const payload = couponCheckout(customerId, { discounts: [{ coupon: code, promotion_code: null }] });
+        stripeApi.couponsRetrieve.mockRejectedValue(stripeError('StripeConnectionError'));
+
+        expect((await postWebhook(payload)).status).toBe(500);
+        expect(await db(TABLES.Event)).toHaveLength(0);
+
+        stripeApi.couponsRetrieve.mockResolvedValue(stripeCoupon(code));
+        expect((await postWebhook(payload)).status).toBe(200);
+        expect(await creditedPartner(customerId)).toBe(partnerId);
+      });
+    });
+  });
+
   it('a transient promotion code read failure is a 500, so Stripe redelivers', async () => {
     const { partnerId, code } = await seedCoupon();
     const customerId = `cus_${ulid()}`;
@@ -794,7 +1084,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
     expect(await db(TABLES.Event)).toHaveLength(0);
 
     // The redelivery redeems.
-    stripeApi.promotionCodesRetrieve.mockResolvedValue({ id: promoId, object: 'promotion_code', code });
+    stripeApi.promotionCodesRetrieve.mockResolvedValue(promo(code, { id: promoId }));
     expect((await postWebhook(payload)).status).toBe(200);
     const event = await db(TABLES.Event).where({ userId: customerId, type: 'signup' }).first();
     const attribution = await db(TABLES.Attribution).where({ eventId: event!.id }).first();
@@ -848,7 +1138,7 @@ describe.skipIf(skipIntegration)('stripe webhook — coupon auto-redemption (sin
             promotion_code: { id: promoId, object: 'promotion_code', code },
           };
           stripeApi.invoicesRetrieve.mockResolvedValue({ ...payload.data.object, discounts: [discount] });
-          stripeApi.promotionCodesRetrieve.mockResolvedValue({ id: promoId, object: 'promotion_code', code });
+          stripeApi.promotionCodesRetrieve.mockResolvedValue(promo(code, { id: promoId }));
 
           const res = await postWebhook(payload);
 
@@ -1209,6 +1499,12 @@ describe.skipIf(skipIntegration)('stripe webhook — both linking methods at onc
 });
 
 /** An error shaped like the Stripe SDK's: `type` is the error class name. */
+const HOUR_MS = 60 * 60 * 1000;
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
 function stripeError(type: string, code?: string) {
   return Object.assign(new Error(`${type} (test)`), { type, ...(code ? { code } : {}) });
 }
@@ -3417,5 +3713,235 @@ describe.skipIf(skipIntegration)('stripe webhook — one-time (mode=payment) Che
     const { aggregateAttributedGmv } = await import('../usage-billing.js');
     // The session is in EUR: it is EUR GMV, not 129 dollars.
     expect(await aggregateAttributedGmv(db, DEFAULT_TENANT_ID, null, new Date(Date.now() + 60_000))).toEqual({ EUR: 129 });
+  });
+});
+
+describe.skipIf(skipIntegration)('stripe webhook — a forwarded conversion keyed on a Checkout Session (single-tenant self-host)', () => {
+  // POST /coupons/redeem was documented to take the Checkout Session id as its
+  // key, and the webhook records a one-time Checkout's revenue under that same
+  // key. A redemption that arrived first took it, and the revenue insert then
+  // read as a replay of it: the purchase's revenue and commission were silently
+  // lost. The forwarded call is refused now, whichever arrives first, as on
+  // OpenPartner Cloud with the Stripe App connected.
+
+  const ADMIN = 'op_test_stripe_session_key_0123456789abcd';
+  const auth = { Authorization: `Bearer ${ADMIN}` };
+  let previousAdminKey: string | undefined;
+  beforeAll(() => {
+    previousAdminKey = process.env.ADMIN_API_KEY;
+    process.env.ADMIN_API_KEY = ADMIN;
+  });
+  afterAll(async () => {
+    if (previousAdminKey === undefined) delete process.env.ADMIN_API_KEY;
+    else process.env.ADMIN_API_KEY = previousAdminKey;
+    if (!skipIntegration) {
+      await db(TABLES.ConversionPostbackToken).del();
+      await db(TABLES.Tenant).where({ id: DEFAULT_TENANT_ID }).update({ couponIntegrationVerifiedAt: null });
+    }
+  });
+
+  async function seedPromoCoupon() {
+    const { partnerId, programId, clickId } = await seedClick();
+    const code = `CREATOR${ulid().slice(-6)}`;
+    const promotionCodeId = `promo_${ulid()}`;
+    await db(TABLES.Coupon).insert({
+      id: ulid(),
+      tenantId: DEFAULT_TENANT_ID,
+      partnerId,
+      programId,
+      code,
+      stripePromotionCodeId: promotionCodeId,
+    });
+    return { partnerId, clickId, code, promotionCodeId };
+  }
+
+  /** A paid one-time Checkout with the partner's promotion code applied. */
+  function paidCheckout(sessionId: string, customerId: string, promotionCodeId: string) {
+    return {
+      id: `evt_${ulid()}`,
+      type: 'checkout.session.completed',
+      created: Math.floor(Date.now() / 1000),
+      data: {
+        object: {
+          id: sessionId,
+          object: 'checkout.session',
+          mode: 'payment',
+          status: 'complete',
+          payment_status: 'paid',
+          amount_total: 12900,
+          currency: 'eur',
+          client_reference_id: null,
+          customer: customerId,
+          payment_intent: `pi_${ulid()}`,
+          invoice: null,
+          discounts: [{ promotion_code: promotionCodeId }],
+        },
+      },
+    };
+  }
+
+  function redeem(code: string, externalEventId: string, fields: Record<string, unknown> = {}) {
+    return request(app)
+      .post('/coupons/redeem')
+      .set(auth)
+      .send({ code, eventType: 'signup', userId: 'user_42', externalEventId, ...fields });
+  }
+
+  it('a redemption keyed on the session is refused, and checkout.session.completed still records the revenue', async () => {
+    const { partnerId, code, promotionCodeId } = await seedPromoCoupon();
+    const sessionId = `cs_test_a1${ulid()}`;
+    const customerId = `cus_${ulid()}`;
+    // The brand links the Customer to its own user, as the 409 detail says.
+    stripeApi.customersRetrieve.mockResolvedValue({ id: customerId, metadata: { openpartner_user_id: 'user_42' }, deleted: false });
+
+    // The brand's checkout reports the code before Stripe's webhook arrives.
+    const bySession = await redeem(code, sessionId);
+    expect(bySession.status).toBe(409);
+    expect(bySession.body.error).toBe('recorded_from_stripe');
+    expect(bySession.body.detail).toMatch(/own order id/);
+    expect(await db(TABLES.Event)).toHaveLength(0);
+    expect(await db(TABLES.Click).where({ landingUrl: `coupon://${code}` })).toHaveLength(0);
+
+    // Under its own order id it records, as before.
+    const byOrder = await redeem(code, 'order-1001');
+    expect(byOrder.status).toBe(201);
+
+    const res = await postWebhook(paidCheckout(sessionId, customerId, promotionCodeId));
+    expect(res.status).toBe(200);
+
+    const revenue = await db(TABLES.Event).where({ type: 'invoice_paid' });
+    expect(revenue).toHaveLength(1);
+    expect(revenue[0]).toMatchObject({ userId: 'user_42', value: '129.00', currency: 'EUR', externalEventId: sessionId });
+    const attribution = await db(TABLES.Attribution).where({ eventId: revenue[0]!.id }).first();
+    expect(attribution?.partnerId).toBe(partnerId);
+    // seedClick's program pays 20% of value.
+    expect(await db(TABLES.Commission).where({ attributionId: attribution!.id }).pluck('amount')).toEqual(['25.80']);
+    // The redemption's signup is the user's one signup: the webhook adds none.
+    expect(await db(TABLES.Event).where({ type: 'signup' }).pluck('externalEventId')).toEqual(['order-1001']);
+  });
+
+  it("a code the brand's own app took, redeemed under its order id, is credited with the checkout's revenue", async () => {
+    // What the 409 detail tells the brand to do: no promotion code reaches
+    // Stripe, so the Customer's openpartner_user_id is the only link.
+    const { partnerId, code } = await seedPromoCoupon();
+    const sessionId = `cs_test_a1${ulid()}`;
+    const customerId = `cus_${ulid()}`;
+    stripeApi.customersRetrieve.mockResolvedValue({ id: customerId, metadata: { openpartner_user_id: 'user_42' }, deleted: false });
+
+    expect((await redeem(code, 'order-1002')).status).toBe(201);
+    const checkout = paidCheckout(sessionId, customerId, 'unused');
+    delete (checkout.data.object as { discounts?: unknown }).discounts;
+    expect((await postWebhook(checkout)).status).toBe(200);
+
+    const [revenue] = await db(TABLES.Event).where({ type: 'invoice_paid', externalEventId: sessionId });
+    expect(revenue).toMatchObject({ userId: 'user_42', value: '129.00' });
+    const attribution = await db(TABLES.Attribution).where({ eventId: revenue!.id }).first();
+    expect(attribution?.partnerId).toBe(partnerId);
+  });
+
+  it('is refused after the webhook too, on every route that shares the key (and /postback)', async () => {
+    const { clickId, code, promotionCodeId } = await seedPromoCoupon();
+    const sessionId = `cs_live_a1${ulid()}`;
+    await postWebhook(paidCheckout(sessionId, `cus_${ulid()}`, promotionCodeId));
+    const [revenue] = await db(TABLES.Event).where({ type: 'invoice_paid', externalEventId: sessionId });
+    expect(revenue).toBeTruthy();
+
+    const forwarded = { type: 'invoice_paid', value: 129, currency: 'EUR', externalEventId: sessionId };
+    const answers = [
+      await redeem(code, sessionId, { eventType: 'invoice_paid', value: 129, currency: 'EUR' }),
+      await request(app).post('/attribution/events').set(auth).send({ userId: 'user_42', ...forwarded }),
+      await request(app).post('/attribution/conversions').set(auth).send({ clickId, ...forwarded }),
+    ];
+    for (const res of answers) {
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe('recorded_from_stripe');
+    }
+    const token = await request(app).post('/conversion-postback/token').set(auth).send({});
+    expect(token.status).toBe(201);
+    const postback = await request(app)
+      .get('/postback')
+      .query({ token: token.body.plaintext, click_id: clickId, type: 'invoice_paid', amount: '129', txn_id: sessionId });
+    expect(postback.status).toBe(409);
+    expect(postback.text).toContain('recorded_from_stripe');
+    // Stripe's record stays the only one.
+    expect(await db(TABLES.Event).where({ type: 'invoice_paid' }).pluck('id')).toEqual([revenue!.id]);
+    expect(await db(TABLES.Commission)).toHaveLength(1);
+  });
+
+  it('is accepted where the webhook records no checkouts, and an invoice id always is', async () => {
+    const { code } = await seedPromoCoupon();
+    const saved = {
+      STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET,
+      STRIPE_WEBHOOK_SECRET_PLATFORM: process.env.STRIPE_WEBHOOK_SECRET_PLATFORM,
+      STRIPE_WEBHOOK_SECRET_CONNECT: process.env.STRIPE_WEBHOOK_SECRET_CONNECT,
+    };
+    try {
+      // A Connect-only secret verifies account.updated, never a checkout, so
+      // forwarding is this brand's only way to record one. (The gate reads
+      // the env per call; the route read it at startup.)
+      process.env.STRIPE_WEBHOOK_SECRET = '';
+      process.env.STRIPE_WEBHOOK_SECRET_PLATFORM = ' , ';
+      process.env.STRIPE_WEBHOOK_SECRET_CONNECT = 'whsec_connect_only';
+      expect((await redeem(code, `cs_test_a1${ulid()}`)).status).toBe(201);
+
+      // A platform secret alone does verify checkouts.
+      process.env.STRIPE_WEBHOOK_SECRET_PLATFORM = 'whsec_platform_old,whsec_platform_new';
+      expect((await redeem(code, `cs_test_a1${ulid()}`)).status).toBe(409);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+
+    // The self-host webhook keys an invoice's revenue on the Stripe event id,
+    // so an invoice id can't take its key.
+    expect((await redeem(code, `in_1${ulid()}`, { userId: 'user_43' })).status).toBe(201);
+  });
+
+  it('a session key a forwarded conversion already holds is logged, not dropped silently', async () => {
+    const { code, promotionCodeId } = await seedPromoCoupon();
+    const sessionId = `cs_test_a1${ulid()}`;
+    // A redemption recorded under the session id before the 409 existed.
+    const heldId = ulid();
+    await db(TABLES.Event).insert({
+      id: heldId,
+      tenantId: DEFAULT_TENANT_ID,
+      userId: 'user_42',
+      type: 'signup',
+      value: null,
+      currency: 'USD',
+      externalEventId: sessionId,
+      metadata: { source: 'coupon', code },
+      ts: new Date(),
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const collision = '[stripe-webhook] key already taken by a forwarded conversion; not recorded';
+    try {
+      // A plain redelivery, and the same checkout reported again under a new
+      // Stripe event id, replay what the webhook itself recorded: no warning.
+      const own = paidCheckout(`cs_test_a1${ulid()}`, `cus_${ulid()}`, promotionCodeId);
+      await postWebhook(own);
+      await postWebhook(own);
+      await postWebhook({ ...own, id: `evt_${ulid()}` });
+      expect(warn).not.toHaveBeenCalledWith(collision, expect.anything());
+      expect(await db(TABLES.Event).where({ type: 'invoice_paid' })).toHaveLength(1);
+
+      const res = await postWebhook(paidCheckout(sessionId, `cus_${ulid()}`, promotionCodeId));
+      expect(res.status).toBe(200);
+      expect(warn).toHaveBeenCalledWith(
+        collision,
+        expect.objectContaining({
+          externalEventId: sessionId,
+          type: 'invoice_paid',
+          value: 129,
+          heldBy: expect.objectContaining({ eventId: heldId, type: 'signup' }),
+        }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+    // Still lost: the warning makes it visible, it doesn't repair it.
+    expect(await db(TABLES.Event).where({ type: 'invoice_paid', externalEventId: sessionId })).toHaveLength(0);
   });
 });

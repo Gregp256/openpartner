@@ -11,8 +11,9 @@
  * UNDOCUMENTED_ROUTES with a reason.
  */
 
-import { z } from 'zod';
+import { utcDateTime, z } from '../zod.js';
 import * as partners from '../routes/partners.js';
+import * as signinLinks from '../routes/partner-signin-link.js';
 import * as programs from '../routes/programs.js';
 import * as assignments from '../routes/partner-campaigns.js';
 import * as links from '../routes/links.js';
@@ -30,6 +31,9 @@ import * as apiKeys from '../routes/api-keys.js';
 import * as exportRoutes from '../routes/export.js';
 import * as settings from '../routes/settings.js';
 import * as payouts from '../routes/payouts.js';
+import * as paypal from '../routes/paypal.js';
+import * as referrals from '../routes/referrals.js';
+import * as journey from '../routes/journey.js';
 import { EXPORTABLE_TABLES } from '../export.js';
 import { MAX_IP_ALLOWLIST } from '../conversion-postback.js';
 import type { OperationRegistry } from './registry.js';
@@ -40,6 +44,8 @@ import * as S from './schemas.js';
  *  so the generated scope table can't silently omit one. */
 export const SCOPED_ROUTES_OUTSIDE_SPEC: Record<string, string> = {
   'GET /brand-resources': 'partners:read: brand logo, colours and shareable assets, read by Network creator dashboards.',
+  'POST /network/notify-recipients':
+    'partners:read: which addresses are still active admins, asked by the Network before each conversation or booking email to the brand.',
 };
 
 /** Authenticated routes outside the spec that carry no admin, partner or
@@ -73,6 +79,7 @@ export const HANDLER_GUARDED_ROUTES_OUTSIDE_SPEC: Record<string, string> = {
   'GET /network/me/affiliations/:id/earnings': NETWORK_PROXY,
   'POST /network/me/uploads/avatar': NETWORK_PROXY,
   'POST /network/me/uploads/cover': NETWORK_PROXY,
+  'POST /network/me/cover/youtube': NETWORK_PROXY,
   'GET /network/me/consent': NETWORK_CONSENT,
   'POST /network/me/consent': NETWORK_CONSENT,
 };
@@ -85,7 +92,7 @@ export const UNDOCUMENTED_ROUTES: Record<string, string> = {
 };
 
 const sinceQuery = z.object({
-  since: z.string().datetime().optional().openapi({ description: 'ISO-8601 start of the window. Default: 30 days ago. Not validated by the route: send a valid timestamp.' }),
+  since: utcDateTime().optional().openapi({ description: 'ISO-8601 start of the window. Default: 30 days ago. Not validated by the route: send a valid timestamp.' }),
 });
 
 export function registerPaths(r: OperationRegistry): void {
@@ -104,22 +111,25 @@ Creates a partner and grants it programs.
 - \`programIds\` omitted grants **every current program**. Pass an explicit list (even \`[]\`) to control access.
 - A coupon is auto-minted per granted program.
 - Fires \`partner.created\`, then, for a \`sendInvite: false\` partner (active now), \`partner.activated\` with \`invited: false\`. An invited partner fires \`partner.activated\` when they accept.
+- \`recruitedByPartnerId\` names the partner who recruited this one (two-tier commissions). In programs with \`recruiterCommissionPercent\` that partner earns that share of this one's commissions from now on. The recruiter must be in this tenant and not revoked (\`400 recruiter_not_found\`, \`400 recruiter_revoked\`).
 
-**\`partners:create\`** is the scope for an in-app integration's runtime key: it can only create partners, and only without an invite or commission terms. A request with \`sendInvite\` omitted or \`true\`, a \`commissionSnapshot\` or \`programCommissions\` answers \`403 forbidden_scope\` with \`required: "partners:write"\`.
+**\`partners:create\`** is the scope for an in-app integration's runtime key: it can only create partners, and only without an invite or commission terms. A request with \`sendInvite\` omitted or \`true\`, a \`commissionSnapshot\`, \`programCommissions\` or \`recruitedByPartnerId\` answers \`403 forbidden_scope\` with \`required: "partners:write"\`.
 
 **\`country\`** (optional, ISO 3166-1 alpha-2) is where the partner is based. OpenPartner Cloud doesn't serve some countries: a blocked one answers \`422 country_not_supported\`, and \`"UA"\` needs \`outsideOccupiedRegions: true\` (\`422 occupied_region_confirmation_required\` otherwise). An accepted country is recorded, and if it is blocked later, the partner's Stripe payouts are held. Self-hosted installs ignore it.
 
+An email that's already a partner answers \`409 email_taken\`. The one exception is the OpenPartner Network's own registered key approving a creator who is already your partner: it grants them the new program instead, answering \`200\` with the existing partner and \`existing: true\` (\`409 partner_revoked\` for a partner you revoked).
+
 **OpenPartner Network:** this call shares nothing with the OpenPartner Network. A partner's name and email reach it only if the partner opts in themselves, while the tenant offers the Network (\`autoEnroll\` on, \`GET /config/network\`): they're asked on the join page, once on first portal sign-in, and in a portal setting. \`metadata\` is never sent. To keep customer-referral partners from being asked, turn offering off: \`POST /config/network {"autoEnroll": false}\`.
 
-On OpenPartner Cloud the brand needs an active plan (\`402 plan_required\`) and an approved account (\`403 brand_pending_review\`).`,
+On OpenPartner Cloud the brand needs an active plan (\`402 plan_required\`), an approved account (\`403 brand_pending_review\`) and, once the platform requires it, verified tracking: a test click that reached \`identify\`, or a partner click linked to a customer (\`403 tracking_not_verified\`).`,
     access: { kind: 'admin', scope: ['partners:write', 'partners:create'] },
     body: partners.createSchema.openapi('CreatePartnerRequest'),
     responses: { 201: { description: 'Created.', schema: S.PartnerCreated } },
     errors: {
-      400: ['unknown_campaign_ids', 'invite_requires_portal_access'],
+      400: ['unknown_campaign_ids', 'invite_requires_portal_access', 'recruiter_not_found', 'recruiter_revoked'],
       402: ['plan_required'],
-      403: ['brand_pending_review'],
-      409: ['email_taken'],
+      403: ['brand_pending_review', 'tracking_not_verified'],
+      409: ['email_taken', 'partner_revoked'],
       422: ['country_not_supported', 'occupied_region_confirmation_required'],
     },
   });
@@ -154,16 +164,40 @@ On OpenPartner Cloud the brand needs an active plan (\`402 plan_required\`) and 
     path: '/partners/:id',
     tag: 'Partners',
     operationId: 'updatePartner',
-    summary: "Change a partner's portal access",
+    summary: "Change a partner's portal access or recruiter",
     description: `
 \`portalAccess: false\` ends the partner's portal sessions and unused sign-in links at once. From then on \`POST /auth/signin\` sends them nothing, and no invite or portal email goes to them. Their partner API keys (\`POST /partners/{id}/api-keys\`) keep working; revoke those with \`DELETE /api-keys/{keyId}\`.
 
 \`portalAccess: true\` sends nothing. An active partner can then request a sign-in link on the portal; one who never accepted an invite needs \`POST /partners/{id}/invite\`.
 
+\`recruitedByPartnerId\` sets, changes or (\`null\`) clears who recruited this partner, for two-tier commissions. The recruitment starts at the change (\`recruitedAt\`), so a new recruiter earns only on commissions from then on, and commissions already accrued stay with whoever earned them. Refused: the partner themselves (\`recruiter_is_partner\`), a partner this one recruited (\`recruiter_cycle\`: two partners can't recruit each other), a revoked partner or one not in this tenant.
+
 Fields this operation doesn't accept answer \`400 invalid_body\`.`,
     access: { kind: 'admin', scope: 'partners:write' },
     body: partners.updateSchema.openapi('UpdatePartnerRequest'),
     responses: { 200: { description: 'The partner, as saved.', schema: S.Partner } },
+    errors: {
+      400: ['recruiter_not_found', 'recruiter_is_partner', 'recruiter_revoked', 'recruiter_cycle'],
+      404: ['not_found'],
+    },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/partners/:id/recruits',
+    tag: 'Partners',
+    operationId: 'getPartnerRecruits',
+    summary: "A partner's recruit link and recruits",
+    description: `
+Two-tier commissions: in a program with \`recruiterCommissionPercent\`, a partner earns that share of each commission earned by the partners they recruited. One level only: they earn nothing on partners their recruits bring in.
+
+- **\`recruitUrl\`** is the join page with the partner's \`ref\`. Someone who joins through it is recorded as their recruit (\`recruitedByPartnerId\`). The code is minted on the first read while a program pays a share; until then, and for a revoked partner, the link is null.
+- **\`programs\`**: the programs that pay a share. A partner calling sees the running programs they're granted; an admin or a \`partners:read\` key sees them all.
+- **\`recruits\`**: newest first (up to \`limit\`), with what each has earned the partner per currency: live recruiter commissions net of clawbacks. \`total\` counts all of them.
+
+A recruiter commission is a commission like any other, on the recruit's sale (\`sourceCommissionId\` names the recruit's commission). It is approved together with that commission, cut by the same share when the sale is refunded, and reversed when an admin reverses it.`,
+    access: { kind: 'partnerOrAdmin', scope: 'partners:read' },
+    responses: { 200: { description: "The partner's recruiting.", schema: S.PartnerRecruits } },
     errors: { 404: ['not_found'] },
   });
 
@@ -211,7 +245,11 @@ Rows whose email already exists are reported as \`skipped_email_taken\` with the
         }),
       },
     },
-    errors: { 400: ['empty_body', 'invalid_csv', 'no_rows'], 402: ['trial_expired'], 403: ['brand_pending_review'] },
+    errors: {
+      400: ['empty_body', 'invalid_csv', 'no_rows'],
+      402: ['trial_expired'],
+      403: ['brand_pending_review', 'tracking_not_verified'],
+    },
   });
 
   r.operation({
@@ -225,6 +263,58 @@ Rows whose email already exists are reported as \`skipped_email_taken\` with the
     access: { kind: 'admin', scope: 'partners:write' },
     responses: { 200: { description: 'Sent.', schema: z.object({ ok: z.literal(true), approved: z.boolean() }) } },
     errors: { 404: ['not_found'], 409: ['already_activated', 'portal_access_disabled'], 422: ['mail_send_failed'] },
+  });
+
+  const signinLinkDescription = `
+Mints a link that signs the partner in to the partner portal, so your users go from your app to their referral dashboard without a second login. Call it from your backend when the user clicks through (a "Refer & earn" button that hits your server), and redirect the browser to \`url\` at once: it works **once**, for **five minutes**, and signs in whoever opens it. Don't email it, log it, or render it into a page ahead of time.
+
+The link goes to your white-label domain when one is verified (\`refer.example.com/auth/magic?…\`), otherwise to the portal on OpenPartner's own domain. \`returnTo\` (a portal path such as \`/links\`) picks the page it lands on.
+
+The partner must be one \`POST /auth/signin\` would email: active, not revoked, with portal access. Otherwise \`409\`: \`partner_revoked\`, \`pending_review\` (an applicant not yet approved), \`portal_access_disabled\` (turn it on with \`PATCH /partners/{id}\`), or \`partner_not_activated\` (invited, but hasn't accepted; partners created with \`sendInvite: false\` are active at once). The checks run again when the link is opened, along with the served-country check on the partner's own connection.
+
+**\`partners:signin\`** is the scope for this, and nothing else grants it, \`partners:write\` included. The OpenPartner Network's federation key is refused even if it holds the scope. Portal sessions get \`403 api_key_required\`: this is a server-to-server call. Each key may mint 600 links a minute, and each partner 10 (\`429 rate_limited\`), and every link minted is recorded with the key that asked for it.
+
+On OpenPartner Cloud the brand needs an approved account (\`403 brand_pending_review\`).`;
+
+  r.operation({
+    method: 'post',
+    path: '/partners/:id/signin-link',
+    tag: 'Partners',
+    operationId: 'createPartnerSigninLink',
+    summary: 'Sign a partner in to the portal from your app',
+    description: signinLinkDescription,
+    access: { kind: 'admin', scope: 'partners:signin' },
+    body: signinLinks.signinLinkSchema.openapi('PartnerSigninLinkRequest'),
+    responses: { 201: { description: 'Minted. Redirect to `url` now.', schema: S.PartnerSigninLink } },
+    errors: {
+      403: ['api_key_required', 'brand_pending_review'],
+      404: ['partner_not_found'],
+      409: ['partner_revoked', 'pending_review', 'portal_access_disabled', 'partner_not_activated'],
+      429: ['rate_limited'],
+    },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/partners/signin-link',
+    tag: 'Partners',
+    operationId: 'lookupPartnerSigninLink',
+    summary: 'Sign a partner in, by email or your own user id',
+    description: `
+The same as \`POST /partners/{id}/signin-link\`, naming the partner by something your app already holds instead of the OpenPartner id: exactly one of \`email\` or \`metadata\`.
+
+- \`email\` is unique per brand. Send only addresses your app has verified.
+- \`metadata\` is one key and value you stored on the partner when you created it, e.g. \`{ "appUserId": "u_123" }\` for \`POST /partners\` with \`"metadata": { "appUserId": "u_123" }\`. Values match as stored, so a number only matches a number. Two partners carrying the same value: \`409 ambiguous_partner\`. Storing the partner id on your user and calling the \`{id}\` form is quicker still.
+${signinLinkDescription}`,
+    access: { kind: 'admin', scope: 'partners:signin' },
+    body: signinLinks.signinLinkLookupSchema.openapi('PartnerSigninLinkLookupRequest'),
+    responses: { 201: { description: 'Minted. Redirect to `url` now.', schema: S.PartnerSigninLink } },
+    errors: {
+      403: ['api_key_required', 'brand_pending_review'],
+      404: ['partner_not_found'],
+      409: ['ambiguous_partner', 'partner_revoked', 'pending_review', 'portal_access_disabled', 'partner_not_activated'],
+      429: ['rate_limited'],
+    },
   });
 
   r.operation({
@@ -359,6 +449,29 @@ The legacy \`commissionType\`/\`commissionValue\`/\`recurring\` columns are stil
 
   r.operation({
     method: 'get',
+    path: '/programs/stats',
+    tag: 'Programs',
+    operationId: 'getProgramStats',
+    summary: "Each program's results over a window",
+    description: `
+Clicks, partners, conversions, attributed revenue and commission by status for every program, over [\`since\`, \`until\`). The default window is the 30 days before \`until\`, which defaults to now.
+
+- A click, conversion or commission counts toward the program it was made in. A bonus's commission counts toward the bonus's program; a bonus with no program counts toward none.
+- \`partners\` counts the partners enrolled in the program now, plus any with clicks, conversions or commission in it during the window, such as a partner removed from the program after earning in it.
+- Amounts are per currency, never converted or added together. Commission is by accrual date, in its status today.
+
+\`since\` at or after \`until\` answers \`400 invalid_window\`.`,
+    access: { kind: 'admin' },
+    query: programs.programStatsQuerySchema.extend({
+      since: utcDateTime().optional().openapi({ description: 'ISO-8601 start of the window (UTC, `Z`), inclusive. Default: 30 days before `until`.' }),
+      until: utcDateTime().optional().openapi({ description: 'ISO-8601 end of the window (UTC, `Z`), exclusive. Default: now.' }),
+    }),
+    responses: { 200: { description: 'One row per program.', schema: S.ProgramStatsList } },
+    errors: { 400: ['invalid_window'] },
+  });
+
+  r.operation({
+    method: 'get',
     path: '/me/programs',
     tag: 'Programs',
     operationId: 'listMyPrograms',
@@ -375,11 +488,11 @@ The legacy \`commissionType\`/\`commissionValue\`/\`recurring\` columns are stil
     operationId: 'createProgram',
     summary: 'Create a program',
     description:
-      "A program is one set of terms: commission rule, attribution window and model, destination URL.\n\n`shareOnNetwork` defaults to **true** when the tenant is on the OpenPartner Network, which lists the program on the public marketplace and makes `marketplaceDescription` required. Pass `shareOnNetwork: false` for a private program such as customer referral.\n\n`holdbackDays` above 0 means commissions are **approved automatically** that many days after they accrue (by the scheduled jobs), and then paid by the next payout run. 0 or omitted means every commission waits for `POST /commissions/{id}/approve`.\n\n`attributionWindowDays` decides which click wins a customer's first conversion of each event type. With `renewalsStayWithPartner` (default true), repeats of that event type, such as monthly `invoice_paid` renewals, keep the same partners and weights for as long as the customer pays, even when another partner's link is clicked later. Past the window, only sub-rules with `recurring: true` pay on them, up to `recurringMonths`.\n\n**Destination and the click id.** The router appends `?cref=<click id>` to `destinationUrl`. To put the id in a parameter of your own instead, write the `{click_id}` macro where it goes, exactly like that (`%7Bclick_id%7D` works too). It may go in the path, query or fragment, not the host. Any other brace text, such as `{{click_id}}`, `{ click_id }`, `{CLICK_ID}` or `{subid}`, is refused with `400`, because the router would send it through as text. A Stripe Payment Link (`buy.stripe.com`) reads the referral only from `client_reference_id`: without `?client_reference_id={click_id}` the program still saves, with a `warnings` entry.",
+      "A program is one set of terms: commission rule, attribution window and model, destination URL.\n\n`shareOnNetwork` defaults to **true** when the tenant is on the OpenPartner Network, which lists the program on the public marketplace and makes `marketplaceDescription` required. Pass `shareOnNetwork: false` for a private program such as customer referral.\n\n`holdbackDays` above 0 means commissions are **approved automatically** that many days after they accrue (by the scheduled jobs), and then paid by the next payout run. 0 or omitted means every commission waits for `POST /commissions/{id}/approve`.\n\n`attributionWindowDays` decides which click wins a customer's first conversion of each event type. With `renewalsStayWithPartner` (default true), repeats of that event type, such as monthly `invoice_paid` renewals, keep the same partners and weights for as long as the customer pays, even when another partner's link is clicked later. Past the window, only sub-rules with `recurring: true` pay on them, up to `recurringMonths`.\n\n**Destination and the click id.** The router appends `?cref=<click id>` to `destinationUrl`. To put the id in a parameter of your own instead, write the `{click_id}` macro where it goes, exactly like that (`%7Bclick_id%7D` works too). It may go in the path, query or fragment, not the host. Any other brace text, such as `{{click_id}}`, `{ click_id }`, `{CLICK_ID}` or `{subid}`, is refused with `400`, because the router would send it through as text. A Stripe Payment Link (`buy.stripe.com`) reads the referral only from `client_reference_id`: without `?client_reference_id={click_id}` the program still saves, with a `warnings` entry.\n\n`grantToAllPartners: true` grants the new program to every current partner. On OpenPartner Cloud, once the platform requires it, that needs verified tracking (`403 tracking_not_verified`).",
     access: { kind: 'admin' },
     body: programs.createSchema.openapi('CreateProgramRequest'),
     responses: { 201: { description: 'Created. `warnings` flags a destination that will probably lose referrals.', schema: S.ProgramSaved } },
-    errors: { 402: ['trial_expired'] },
+    errors: { 402: ['trial_expired'], 403: ['tracking_not_verified'] },
   });
 
   r.operation({
@@ -418,7 +531,7 @@ The legacy \`commissionType\`/\`commissionValue\`/\`recurring\` columns are stil
     access: { kind: 'admin' },
     body: assignments.addSchema.openapi('GrantProgramsRequest'),
     responses: { 201: { description: 'The program ids granted.', schema: z.object({ added: z.array(z.string()) }) } },
-    errors: { 404: ['partner_not_found', 'no_valid_campaigns'] },
+    errors: { 403: ['brand_pending_review', 'tracking_not_verified'], 404: ['partner_not_found', 'no_valid_campaigns'] },
   });
 
   r.operation({
@@ -463,6 +576,20 @@ The legacy \`commissionType\`/\`commissionValue\`/\`recurring\` columns are stil
     },
   });
 
+  r.operation({
+    method: 'get',
+    path: '/partners/:id/links/:linkId/results',
+    tag: 'Links',
+    operationId: 'getLinkResults',
+    summary: "One link's clicks and the conversions credited to them",
+    description:
+      "Clicks on the link in the click window, and the events credited through them up to `conversionUntil` (default: `clickUntil` plus the program's attribution window). Leads and sales count distinct events; revenue is each sale's value times the link's share of its credit, per currency, with refunds reported separately. `linkId` may be the link's id or its `linkKey`. The OpenPartner Network reads it for booking reports.",
+    access: { kind: 'partnerOrAdmin', scope: 'partners:read' },
+    query: links.linkResultsQuerySchema,
+    responses: { 200: { description: 'Results.', schema: S.LinkResults } },
+    errors: { 400: ['invalid_query'], 404: ['partner_not_found', 'link_not_found'] },
+  });
+
   // ------------------------------------------------------------- Attribution
   r.operation({
     method: 'post',
@@ -480,6 +607,39 @@ Unauthenticated by design. It accepts any origin (CORS) and is limited to 120 re
     body: identify.schema.openapi('IdentifyRequest'),
     responses: { 200: { description: 'Stitched (or already stitched).', schema: S.IdentifyResult } },
     errors: { 404: ['click_not_found'], 429: ['rate_limited'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/attribution/landing',
+    tag: 'Attribution',
+    operationId: 'reportLanding',
+    summary: 'Report that a click arrived on your site',
+    description: `
+The browser SDK calls this once per click, when it first captures the click id from the landing URL. Admin → Tracking health compares landings with clicks, so clicks lost between the partner link and your page show up: a redirect that dropped \`?cref=\`, a page without the script, a consent banner holding it back.
+
+Only the first call for a click records anything (\`firstLanding\`). The page's hostname is taken from the browser's \`Origin\` header (or \`Referer\`), never its path or query. A click id this program doesn't have is a \`404\` and is counted on Tracking health, since it usually means the script's API URL names another program.
+
+Unauthenticated by design, like identify: any origin (CORS), 120 requests per minute per client IP. Turn it off in the SDK with \`reportLanding: false\` (script tag: \`data-landing="off"\`).`,
+    access: { kind: 'public' },
+    body: identify.landingSchema.openapi('LandingRequest'),
+    responses: { 200: { description: 'Recorded (or already recorded).', schema: S.LandingResult } },
+    errors: { 404: ['click_not_found'], 429: ['rate_limited'] },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/consent-region',
+    tag: 'Attribution',
+    operationId: 'getConsentRegion',
+    summary: 'The consent rule for this visitor',
+    description: `
+The browser SDK calls this on page load in \`consent: 'regional'\` mode (script tag: \`data-consent="pending" data-consent-region="on"\`), before it reads or writes anything. Where the answer is \`opt_in\`, or when the call fails or takes longer than 1.5 seconds, the SDK waits for \`setConsent('granted')\` as in \`'pending'\` mode. Where it's \`opt_out\`, the SDK starts tracking unless \`setConsent('denied')\` came first, or the browser sends a Global Privacy Control or Do Not Track signal (unless the SDK was told to ignore those: \`privacySignals: 'ignore'\`, script tag \`data-gpc="ignore"\`).
+
+The country comes from the client IP address. Nothing is stored, and the response isn't cacheable. Unauthenticated: any origin (CORS), no credentials, 300 requests per minute per client IP.`,
+    access: { kind: 'public' },
+    responses: { 200: { description: 'The rule.', schema: S.ConsentRegion } },
+    errors: { 429: ['rate_limited'] },
   });
 
   r.operation({
@@ -503,7 +663,7 @@ Server-to-server conversion ingest. The event is attributed to the partner whose
 
 **Refunds.** Report them to \`POST /attribution/refunds\`. A \`refund\` or \`chargeback\` event sent here is recorded but never attributed (\`attribution.status\` \`corrective\`) and reverses nothing.
 
-**Don't report a payment twice.** If your Stripe account also sends webhooks to this deployment (\`/webhooks/stripe\`, self-host), those payments are already recorded, keyed by the Stripe event id. Reporting the same payment here under your own invoice id records it a second time.
+**Don't report a payment twice.** If your Stripe account also sends webhooks to this deployment (\`/webhooks/stripe\`, single-tenant self-host), those payments are already recorded: invoices keyed by the Stripe event id, one-time Checkout payments by the Checkout Session id. Reporting the same payment here under your own invoice id records it a second time. Checkout Session ids are reserved for the webhook there: one (\`cs_live_…\`, \`cs_test_…\`) as the key returns \`409 recorded_from_stripe\`.
 
 **Stripe connected (OpenPartner Cloud).** Once your Stripe account is connected through the OpenPartner Stripe App, Stripe invoices and Checkout payments are recorded from Stripe itself, keyed by the invoice or Checkout Session id. An \`externalEventId\` that is one of those ids (\`in_…\`, \`cs_live_…\`, \`cs_test_…\`) returns \`409 recorded_from_stripe\`: Stripe's record of the payment wins.`,
     access: { kind: 'admin', scope: 'events:write' },
@@ -527,16 +687,20 @@ Send \`userId\` when you have your own id for the user: attribution then follows
 
 **Scope.** Conversions are scoped to the tenant, not to a program. The click id already says which program the click came through, so there's no \`programId\` to send, and a click from any program in this tenant is accepted. A click id this tenant doesn't have is \`404 click_not_found\`. Keys with \`events:write\` (and the postback token) work across every program in the tenant, so a sender holding one can report against any of its clicks.
 
-**Idempotency.** \`externalEventId\` is required. A retry with the same key returns \`200\` with \`replayed: true\` and the original result, even if the click has been flagged since. Keys are unique across the **whole tenant**: one namespace shared by \`POST /attribution/events\`, \`GET /postback\` (\`txn_id\`), \`POST /coupons/redeem\` and the Stripe webhook. Reusing a key for a different click, userId, type, value or currency returns \`409 external_event_id_conflict\`, and that conversion is not recorded. With your Stripe account connected, a Stripe invoice or Checkout Session id as the key returns \`409 recorded_from_stripe\`, as on \`POST /attribution/events\`. So:
+**Idempotency.** \`externalEventId\` is required. A retry with the same key returns \`200\` with \`replayed: true\` and the original result, even if the click has been flagged since. Keys are unique across the **whole tenant**: one namespace shared by \`POST /attribution/events\`, \`GET /postback\` (\`txn_id\`), \`POST /coupons/redeem\` and the Stripe webhook. Reusing a key for a different click, userId, type, value or currency returns \`409 external_event_id_conflict\`, and that conversion is not recorded. With your Stripe account connected, a Stripe invoice or Checkout Session id as the key returns \`409 recorded_from_stripe\`, as on \`POST /attribution/events\`, and so does a Checkout Session id on a single-tenant self-host whose Stripe webhook points at \`/webhooks/stripe\`. So:
 - **One key per stage.** A loan reported as \`approved\` and later \`loan_funded\` needs two keys, e.g. \`loan-881:approved\` and \`loan-881:funded\`.
 - **Prefix keys per sender.** Two suppliers' order ids can collide: \`acme:loan-881:funded\`, \`zenlend:loan-881:funded\`.
 
 **Outcome.** Every \`200\` carries \`outcome\` (and sometimes \`reason\`), which says what the conversion came to: \`attributed\`, \`no_matching_rule\` (credited, but no commission rule takes this \`type\`, which usually means a typo'd stage name) or \`not_attributed\` (e.g. \`outside_window\`). The conversion is recorded in every case, so don't retry on these. Fix the cause and send the next conversion.
 
-A click flagged by velocity limits or a revoked partner earns nothing: \`422 click_flagged\`.`,
+A click flagged by velocity limits or a revoked partner earns nothing: \`422 click_flagged\`.
+
+**Test clicks.** The click id of a test sent from Admin → Tracking health → Send a test click answers \`200\` \`{ "ok": true, "test": true }\`: the test is marked linked to a customer, and nothing is recorded.`,
     access: { kind: 'admin', scope: 'events:write' },
     body: conversions.conversionSchema.openapi('RecordConversionRequest'),
-    responses: { 200: { description: 'Recorded (or replayed).', schema: S.ConversionResult } },
+    responses: {
+      200: { description: 'Recorded (or replayed), or a test click linked.', schema: z.union([S.ConversionResult, S.ConversionTestResult]) },
+    },
     errors: { 404: ['click_not_found'], 409: ['external_event_id_conflict', 'recorded_from_stripe'], 422: ['click_flagged'] },
   });
 
@@ -589,10 +753,11 @@ The token is checked before anything else, so a caller without one learns nothin
     textErrors: true,
     responses: {
       200: {
-        description: 'Recorded (or replayed): `ok` and the outcome, or a 1×1 GIF with `pixel=1`.',
+        description:
+          'Recorded (or replayed): `ok` and the outcome, or a 1×1 GIF with `pixel=1`. A test click from Admin → Tracking health is linked and nothing is recorded: `ok test_click`.',
         content: {
           'text/plain': {
-            schema: z.enum(conversions.POSTBACK_BODIES).openapi({ example: 'ok attributed' }),
+            schema: z.enum([...conversions.POSTBACK_BODIES, conversions.TEST_POSTBACK_BODY]).openapi({ example: 'ok attributed' }),
           },
           'image/gif': { schema: z.string().openapi({ format: 'binary' }) },
         },
@@ -796,7 +961,7 @@ The refund is recorded as a corrective event (type \`refund\` or \`chargeback\`,
     operationId: 'redeemCoupon',
     summary: 'Record a coupon redemption',
     description:
-      "Call from your checkout when a customer uses a partner code. Records the conversion and stitches the user to the partner, so their later events attribute too. `externalEventId` is required and works as on `POST /attribution/events` (same namespace), as do `value` and `currency`: without a currency the redemption is stored in the brand's default currency. With your Stripe account connected, codes entered at Stripe Checkout are redeemed from Stripe, and a Stripe invoice or Checkout Session id as the key returns `409 recorded_from_stripe`.",
+      "Call from your checkout when a customer uses a partner code. Records the conversion and stitches the user to the partner, so their later events attribute too. `externalEventId` is required and works as on `POST /attribution/events` (same namespace), as do `value` and `currency`: without a currency the redemption is stored in the brand's default currency. With your Stripe account connected, codes entered at Stripe Checkout are redeemed from Stripe, and a Stripe invoice or Checkout Session id as the key returns `409 recorded_from_stripe`. The same goes for a Checkout Session id on a single-tenant self-host whose Stripe webhook points at `/webhooks/stripe`: the webhook records a one-time Checkout's payment under it, and redeems a code entered at Stripe Checkout itself. Redeem a code your own app took under your own order id, when the customer applies it and before they pay: a redemption made after the payment isn't credited with it.",
     access: { kind: 'admin', scope: 'events:write' },
     body: coupons.redeemSchema.openapi('RedeemCouponRequest'),
     responses: {
@@ -842,10 +1007,15 @@ The refund is recorded as a corrective event (type \`refund\` or \`chargeback\`,
     operationId: 'approveCommission',
     summary: 'Approve an accrued commission',
     description:
-      "Refused while the holdback is running. Fires `commission.approved`. With a holdback above 0 the scheduled jobs approve matured commissions on their own; with none, this is the only way they're approved.",
+      "Refused while the holdback is running. Fires `commission.approved`. With a holdback above 0 the scheduled jobs approve matured commissions on their own; with none, this is the only way they're approved.\n\nA recruiter's share of this commission (two-tier, `sourceCommissionId`) is approved with it and returned in `recruiterCommissions`. A recruiter commission itself can't be approved before the commission it is a share of (`409 source_not_approved`).",
     access: { kind: 'admin' },
-    responses: { 200: { description: 'Approved.', schema: z.object({ commission: S.Commission }) } },
-    errors: { 404: ['not_found'], 409: ['holdback_active', 'not_approvable'] },
+    responses: {
+      200: {
+        description: 'Approved.',
+        schema: z.object({ commission: S.Commission, recruiterCommissions: z.array(S.Commission).optional() }),
+      },
+    },
+    errors: { 404: ['not_found'], 409: ['holdback_active', 'not_approvable', 'source_not_approved'] },
   });
 
   r.operation({
@@ -854,9 +1024,24 @@ The refund is recorded as a corrective event (type \`refund\` or \`chargeback\`,
     tag: 'Commissions',
     operationId: 'reverseCommission',
     summary: 'Reverse an accrued or approved commission',
-    description: 'Fires `commission.reversed` with `reason: "manual"`.',
+    description:
+      "Fires `commission.reversed` with `reason: \"manual\"`.\n\nA recruiter's share of it (two-tier, `sourceCommissionId`) goes with it, in `recruiterCommissions`: an accrued or approved one is `reversed`; a paid one stays paid and gets a refund clawback for what the recruiter holds, netted off their next manual or direct payout (`clawbacks`); one a payout is moving right now is left as it is (`heldInTransfer`).\n\nTo finish a held share, call this again on the same (already reversed) commission once the payout settles: it answers `200` with what it did to the share (a clawback, if it was paid), and `409 not_reversible` once there is nothing left to do.",
     access: { kind: 'admin' },
-    responses: { 200: { description: 'Reversed.', schema: z.object({ commission: S.Commission }) } },
+    responses: {
+      200: {
+        description: 'Reversed.',
+        schema: z.object({
+          commission: S.Commission,
+          recruiterCommissions: z
+            .object({
+              reversed: z.array(S.Commission),
+              clawbacks: z.array(z.object({ commissionId: z.string(), partnerId: z.string(), amount: S.Decimal, currency: z.string() })),
+              heldInTransfer: z.array(z.string()),
+            })
+            .optional(),
+        }),
+      },
+    },
     errors: { 409: ['commission_in_transfer', 'not_reversible'] },
   });
 
@@ -961,9 +1146,12 @@ Called with the brand's OpenPartner Network federation key, the bonus is recorde
     tag: 'Payouts',
     operationId: 'confirmManualPayout',
     summary: 'Mark a manual payout as sent',
-    description:
-      'Only a `pending` manual payout. On OpenPartner Cloud a payout on a do-not-pay hold (the partner or their payout account in a country OpenPartner doesn’t serve, or a confirmed sanctions-list match) is refused with `409 not_confirmable` and a `reason`.',
+    description: `Only a \`pending\` manual payout. On OpenPartner Cloud a payout on a do-not-pay hold (the partner or their payout account in a country OpenPartner doesn’t serve, or a confirmed sanctions-list match) is refused with \`409 not_confirmable\` and a \`reason\`.
+
+The body is optional. For a payout you sent one at a time (a bank transfer, UPI, a cheque), \`reference\` records what identifies the payment: the bank's UTR, the UPI transaction ID, the cheque number. Up to 100 characters on one line, trimmed. It is kept on the payout as \`metadata.externalReference\` and printed on its statement as the \`Payment reference\` (\`GET /payouts/{id}/statement\`), unless the payout is in a PayPal or Wise file, whose own reference is printed instead. It can't be added or changed after the payout is confirmed.`,
     access: { kind: 'admin' },
+    body: payouts.confirmPayoutSchema.openapi('ConfirmManualPayoutRequest'),
+    optionalBody: true,
     responses: { 200: { description: 'Confirmed.', schema: z.object({ payout: S.Payout }) } },
     errors: { 404: ['payout_not_found'], 409: ['not_confirmable'] },
   });
@@ -974,9 +1162,40 @@ Called with the brand's OpenPartner Network federation key, the bonus is recorde
     tag: 'Payouts',
     operationId: 'listPartnerPayouts',
     summary: "List a partner's payouts",
-    description: 'The 200 most recent, newest first.',
+    description:
+      'The 200 most recent, newest first. A payout PayPal can’t send in its own currency (INR) that Pay with PayPal sent in USD carries `sent`: the USD amount and the ECB rate and date it was converted at. Its `amount` and `currency` stay its own.',
     access: { kind: 'partnerOrAdmin', scope: 'payouts:read' },
-    responses: { 200: { description: 'Payouts.', schema: z.object({ payouts: z.array(S.Payout) }) } },
+    responses: { 200: { description: 'Payouts.', schema: z.object({ payouts: z.array(S.PayoutWithSent) }) } },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/payouts/:id/statement',
+    tag: 'Payouts',
+    operationId: 'getPayoutStatement',
+    summary: "Get a payout's statement",
+    description: `Remittance advice for one payout: who paid whom, how, and for what. A printable HTML page by default (print it, or save it as a PDF from the browser's print dialog); \`?format=json\` returns the same data.
+
+It lists the payout's commissions (date, program, the event it was earned on, amount), its bonuses, and the refund clawbacks deducted from it, with totals per currency and the amount paid. It names your business (the legal name and address from \`POST /config/payout-statements\`, else the program name; on OpenPartner Cloud, the GSTIN on your billing profile), the partner, and where the payout went, **masked**: a full account number, email or UPI ID is never shown. A pending or failed payout says so.
+
+It is built from the payout's records each time, so it always agrees with them. It is not a tax invoice.`,
+    access: {
+      kind: 'handler',
+      rule: "an admin key, a key holding `payouts:read`, or a partner (session or key) for one of their own payouts. Another partner's payout answers `404 payout_not_found`, like one that doesn't exist.",
+      scopes: ['payouts:read'],
+      partner: true,
+    },
+    query: payouts.statementQuerySchema,
+    responses: {
+      200: {
+        description: 'The statement.',
+        content: {
+          'text/html': { schema: z.string() },
+          'application/json': { schema: z.object({ statement: S.PayoutStatement }) },
+        },
+      },
+    },
+    errors: { 400: ['invalid_query'], 404: ['payout_not_found'] },
   });
 
   r.operation({
@@ -986,7 +1205,7 @@ Called with the brand's OpenPartner Network federation key, the bonus is recorde
     operationId: 'confirmManualPayouts',
     summary: 'Mark many manual payouts as sent',
     description:
-      'Each id is confirmed as `POST /payouts/{id}/confirm` would, or reported in `notConfirmable` (with a `reason` for a do-not-pay hold); one that can’t be confirmed doesn’t stop the rest. Up to 5,000 ids. To confirm a PayPal or Wise file, use `POST /payouts/exports/{exportId}/confirm`, which confirms exactly the payouts in it. No webhooks: `payout.created` and `commission.paid` fired when the run made the payouts.',
+      'Each id is confirmed as `POST /payouts/{id}/confirm` would, or reported in `notConfirmable` (with a `reason` for a do-not-pay hold); one that can’t be confirmed doesn’t stop the rest. Up to 5,000 ids. To confirm a PayPal or Wise file, use `POST /payouts/exports/{exportId}/confirm`, which confirms exactly the payouts in it. This takes no payment references: to record one for a payout you sent one at a time, confirm it with `POST /payouts/{id}/confirm`. No webhooks: `payout.created` and `commission.paid` fired when the run made the payouts.',
     access: { kind: 'admin' },
     body: payouts.bulkConfirmSchema,
     responses: { 200: { description: 'What was confirmed, and what wasn’t.', schema: S.BulkConfirmResult } },
@@ -1092,6 +1311,280 @@ The file's payouts are fixed here: each is stamped with the \`exportId\`, held o
     errors: { 404: ['export_not_found'] },
   });
 
+  // ------------------------------------------------------- Pay with PayPal
+  const paypalEnvironment = { environment: paypal.paypalEnvironmentParam };
+  const connectionResponse = z.object({ connection: S.PaypalConnection });
+  const batchResponse = z.object({ batch: S.PaypalBatch });
+
+  r.operation({
+    method: 'get',
+    path: '/config/paypal',
+    tag: 'Payouts',
+    operationId: 'listPaypalConnections',
+    summary: 'Your connected PayPal apps',
+    description: 'The PayPal REST apps Pay with PayPal sends with, live and/or sandbox, and which one is active. The secret is never returned. See docs/paypal-payouts.md.',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'Connections.', schema: z.object({ connections: z.array(S.PaypalConnection) }) } },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/paypal',
+    tag: 'Payouts',
+    operationId: 'connectPaypal',
+    summary: 'Connect your PayPal app',
+    description: `Saves your PayPal REST app's client id and secret for one environment, after a token call proves them. The secret is sealed at rest, never returned, never logged and never exported. Pay with PayPal then calls PayPal's Payouts API as your app: money goes from your PayPal balance to your partners and never passes through OpenPartner.
+
+The first environment you connect becomes the one Pay with PayPal uses; switch with \`POST /config/paypal/{environment}/activate\`. Connecting again replaces that environment's credentials. A different app's are refused (\`409 open_batches\`) while batches sent with the current ones are in flight; a new secret for the same app takes them over.
+
+OpenPartner also registers a webhook on the app for the Payouts events, when the deployment has a public https address.`,
+    access: { kind: 'admin' },
+    body: paypal.connectPaypalSchema,
+    responses: { 201: { description: 'Connected.', schema: connectionResponse } },
+    errors: { 409: ['open_batches'], 422: ['credentials_refused'], 502: ['paypal_unreachable'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/paypal/:environment/verify',
+    tag: 'Payouts',
+    operationId: 'verifyPaypalConnection',
+    summary: 'Check your PayPal credentials again',
+    description: 'A fresh token call with the saved credentials. Also refreshes whether PayPal has enabled Payouts on the app (`payoutsEnabled`).',
+    access: { kind: 'admin' },
+    params: paypalEnvironment,
+    responses: { 200: { description: 'Verified.', schema: connectionResponse } },
+    errors: { 404: ['not_connected'], 422: ['credentials_refused', 'credentials_unreadable'], 502: ['paypal_unreachable'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/paypal/:environment/activate',
+    tag: 'Payouts',
+    operationId: 'activatePaypalEnvironment',
+    summary: 'Choose live or sandbox for Pay with PayPal',
+    description: 'Pay with PayPal sends with this environment from now on. Batches already sent keep the app they were sent with.',
+    access: { kind: 'admin' },
+    params: paypalEnvironment,
+    responses: { 200: { description: 'Active.', schema: connectionResponse } },
+    errors: { 404: ['not_connected'] },
+  });
+
+  r.operation({
+    method: 'delete',
+    path: '/config/paypal/:environment',
+    tag: 'Payouts',
+    operationId: 'disconnectPaypal',
+    summary: 'Disconnect a PayPal app',
+    description:
+      'Removes OpenPartner’s webhook from the app and wipes the saved secret and token. Refused while batches sent with it are in flight (`409 open_batches`): their status can only be read with it. Never makes the other environment active.',
+    access: { kind: 'admin' },
+    params: paypalEnvironment,
+    responses: { 204: { description: 'Disconnected.' } },
+    errors: { 404: ['not_connected'], 409: ['open_batches'] },
+  });
+
+  // ------------------------------------------ PayPal payments as conversions
+  const paymentAppResponse = z.object({ app: S.PaypalPaymentApp });
+
+  r.operation({
+    method: 'get',
+    path: '/config/paypal-payments',
+    tag: 'Attribution',
+    operationId: 'listPaypalPaymentApps',
+    summary: 'Your PayPal apps and which report payments',
+    description:
+      'Every connected PayPal app, Pay with PayPal’s and checkout apps, and whether each reports the payments it takes as conversions. See docs/paypal-payments.md.',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'Apps.', schema: z.object({ apps: z.array(S.PaypalPaymentApp) }) } },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/paypal/:environment/payments',
+    tag: 'Attribution',
+    operationId: 'setPaypalPaymentTracking',
+    summary: 'Record the payments Pay with PayPal’s app takes',
+    description: `With \`tracking: true\`, a payment your checkout takes through this app is recorded as a conversion when its order's \`purchase_units[].custom_id\` (or a subscription's \`custom_id\`) carries the visitor's partner click (\`openpartner.getReferral()\`): an \`invoice_paid\` Event for each capture and subscription payment, \`subscription_created\` when a subscription is approved, refunds through the same path as \`POST /attribution/refunds\`, a payment PayPal reverses (a card chargeback, for example) as a \`chargeback\`, and disputes recorded without reversing anything until one is resolved for the buyer with you debited: then the refunds PayPal lists on it are recorded, each once. OpenPartner adds the payment events to the app's webhook, and reads the app's recent payments every hour for any the webhook missed.
+
+Payments from before tracking was turned on are never recorded. A sandbox app's payments are recorded the same way (their Events say \`paypalEnvironment: sandbox\`) and never billed. A payment carrying a test click (\`POST /admin/tracking-health/test-click\`) links the test instead.`,
+    access: { kind: 'admin' },
+    params: paypalEnvironment,
+    body: paypal.paypalPaymentTrackingSchema,
+    responses: { 200: { description: 'The app.', schema: paymentAppResponse } },
+    errors: { 404: ['not_connected'], 409: ['already_tracked'], 422: ['credentials_refused', 'credentials_unreadable'], 502: ['paypal_unreachable'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/paypal-payments',
+    tag: 'Attribution',
+    operationId: 'connectPaypalCheckoutApp',
+    summary: 'Connect the PayPal app your checkout runs on',
+    description: `For a checkout that runs on another PayPal app than the one Pay with PayPal sends with: saves that app's client id and secret for one environment, after a token call proves them, sealed and never returned, logged or exported like Pay with PayPal's. The app only reports payments (as \`POST /config/paypal/{environment}/payments\` describes) and never sends any. PayPal sends a webhook only to the app a payment went through, which is why the checkout's own app is needed.
+
+Pay with PayPal's own app is refused (\`409 same_app_as_payouts\`): turn tracking on for it instead. Connecting again replaces that environment's checkout app.`,
+    access: { kind: 'admin' },
+    body: paypal.connectPaypalSchema,
+    responses: { 201: { description: 'Connected and tracking.', schema: paymentAppResponse } },
+    errors: { 409: ['same_app_as_payouts'], 422: ['credentials_refused'], 502: ['paypal_unreachable'] },
+  });
+
+  r.operation({
+    method: 'delete',
+    path: '/config/paypal-payments/:environment',
+    tag: 'Attribution',
+    operationId: 'disconnectPaypalCheckoutApp',
+    summary: 'Disconnect a checkout app',
+    description: 'Removes OpenPartner’s webhook from the app and wipes its saved secret and token. Conversions it recorded stay.',
+    access: { kind: 'admin' },
+    params: paypalEnvironment,
+    responses: { 204: { description: 'Disconnected.' } },
+    errors: { 404: ['not_connected'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/payouts/runs/:runId/paypal-batches',
+    tag: 'Payouts',
+    operationId: 'sendRunWithPaypal',
+    summary: 'Pay a run’s PayPal partners through your PayPal app',
+    description: `Sends the next PayPal Payouts batch of a run, in one currency, with your active PayPal app: the same payouts a PayPal file would take (partners whose payout details are a PayPal email, a currency PayPal sends, under PayPal's per-payment limit, nothing on a do-not-pay hold), up to 5,000. The money goes from your PayPal balance to the partners; it never passes through OpenPartner.
+
+The payouts are stamped with the batch id (\`exportId\`, \`via: "api"\`) before anything is sent, so they are in no other file or batch. The batch id is also PayPal's \`sender_batch_id\` and \`PayPal-Request-Id\`: a re-send after a timeout or crash reaches the same batch, and PayPal never pays one twice.
+
+PayPal pays asynchronously. Follow the batch with \`GET /payouts/paypal-batches/{batchId}\`: paid items confirm their payouts; failed, returned or refunded ones go back to pending (and your admins are emailed); unclaimed ones wait for the partner to claim them.
+
+**INR.** PayPal can't send INR (it isn't a PayPal API currency): an INR payout is \`currency_not_supported\` unless you turn on \`POST /config/paypal-payouts\` \`{"sendUnsupportedAs": "USD"}\`. Then quote first (\`POST /payouts/runs/{runId}/paypal-batches/quote\`) and send with \`{"currency": "INR", "sendAs": "USD", "quoteId": "…"}\` within 15 minutes: the batch sends exactly the quoted payouts at exactly the quoted ECB rate. A quote that expired is \`409 quote_expired\`; one whose payouts changed since (another batch took one, a partner changed their PayPal email, PayPal gave one back) or whose PayPal app is no longer the active one is \`409 quote_changed\`; quote again. The payouts stay in INR; each one's stamp records what was sent (\`conversion\`).
+
+With your **sandbox** app active, the batch is a rehearsal: PayPal's sandbox moves test money, so no payout is marked paid, and once PayPal settles every item the payouts go back to pending (\`rehearsal\` on the batch says what happened).`,
+    access: { kind: 'admin' },
+    body: paypal.sendWithPaypalSchema,
+    responses: { 201: { description: 'The batch, as it stands after the first send.', schema: batchResponse } },
+    errors: {
+      400: ['invalid_quote'],
+      404: ['nothing_to_send'],
+      409: ['paypal_not_connected', 'conversion_not_enabled', 'quote_expired', 'quote_changed'],
+      422: ['currency_not_supported', 'conversion_not_needed'],
+    },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/payouts/runs/:runId/paypal-batches/quote',
+    tag: 'Payouts',
+    operationId: 'quotePaypalConversion',
+    summary: 'Quote sending INR balances through PayPal in USD',
+    description: `For balances PayPal can't send in their own currency (INR), with \`POST /config/paypal-payouts\` \`{"sendUnsupportedAs": "USD"}\` on. Quotes the next batch the send would make: the European Central Bank reference rate (crossed through EUR, published once a business day), its date, each payout's USD amount (its INR amount × rate, rounded half up to the cent on its own), the INR and USD totals, and a signed \`quoteId\` valid for 15 minutes.
+
+Send with \`POST /payouts/runs/{runId}/paypal-batches\` \`{"currency": "INR", "sendAs": "USD", "quoteId": "…"}\`. Nothing is held: the send checks the payouts are still exactly these. A payout over PayPal's per-payment limit in USD, or under a cent, is listed in \`leftOut\` instead; when that's every payout, the \`404 nothing_to_send\` carries the \`leftOut\` list.
+
+The rate is the ECB mid-market reference rate; you send that USD amount from your PayPal balance. PayPal then converts it to INR for the partner's Indian bank at PayPal's own rate, which is between the partner and PayPal. If the ECB rates can't be read, nothing is quoted (\`503 fx_unavailable\`): no rate is ever guessed.`,
+    access: { kind: 'admin' },
+    body: paypal.quotePaypalConversionSchema,
+    responses: { 200: { description: 'The quote.', schema: z.object({ quote: S.PaypalConversionQuote }) } },
+    errors: {
+      404: ['nothing_to_send'],
+      409: ['paypal_not_connected', 'conversion_not_enabled'],
+      422: ['currency_not_supported', 'conversion_not_needed'],
+      503: ['fx_unavailable'],
+    },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/config/paypal-payouts',
+    tag: 'Payouts',
+    operationId: 'getPaypalPayoutSettings',
+    summary: 'Your Pay with PayPal settings',
+    description: 'Whether balances PayPal can’t send in their own currency (INR) are sent in USD instead. Off by default. Exported with your settings (the `paypal_payouts` Config key).',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'Settings.', schema: S.PaypalPayoutSettings } },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/paypal-payouts',
+    tag: 'Payouts',
+    operationId: 'updatePaypalPayoutSettings',
+    summary: 'Change your Pay with PayPal settings',
+    description:
+      '`{"sendUnsupportedAs": "USD"}`: INR payouts to partners with a PayPal email become ready for Pay with PayPal, sent in USD at an ECB rate you are quoted and see before each batch. `null` turns it off; batches already sent are unaffected. Omitted fields keep their value.',
+    access: { kind: 'admin' },
+    body: paypal.paypalPayoutSettingsSchema,
+    responses: { 200: { description: 'Saved.', schema: S.PaypalPayoutSettings } },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/payouts/runs/:runId/paypal-batches',
+    tag: 'Payouts',
+    operationId: 'listRunPaypalBatches',
+    summary: 'List a run’s PayPal Payouts batches',
+    description: 'Newest first, up to 50.',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'Batches.', schema: z.object({ batches: z.array(S.PaypalBatch) }) } },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/payouts/paypal-batches/:batchId',
+    tag: 'Payouts',
+    operationId: 'getPaypalBatch',
+    summary: 'Get a PayPal Payouts batch',
+    description: 'Where the batch stands, as of the last read from PayPal (`lastSyncedAt`).',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'The batch.', schema: batchResponse } },
+    errors: { 404: ['batch_not_found'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/payouts/paypal-batches/:batchId/sync',
+    tag: 'Payouts',
+    operationId: 'syncPaypalBatch',
+    summary: 'Check a PayPal Payouts batch now',
+    description: 'Reads the batch from PayPal now instead of at the next poll, and applies what it says. A batch whose send had no answer yet is re-sent (it reaches the same batch).',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'The batch.', schema: batchResponse } },
+    errors: { 404: ['batch_not_found'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/payouts/paypal-batches/:batchId/resolve',
+    tag: 'Payouts',
+    operationId: 'resolvePaypalBatch',
+    summary: 'Settle a PayPal batch OpenPartner can’t',
+    description: `For a batch in \`reconcile_required\` (OpenPartner can't tell whether it went out), after you've looked in your PayPal account:
+
+- \`{"action": "link", "payoutBatchId": "…"}\`: PayPal shows the batch. It is read back and adopted only if its sender_batch_id is this batch's id.
+- \`{"action": "retry"}\`: send the same request again. Only within 29 days of the first send, while PayPal still refuses a duplicate.
+- \`{"action": "release"}\`: no such batch went out. The payouts go back to pending. Also abandons a batch still in \`intent\`, and a **sandbox** batch in any open state (it moves test money only).`,
+    access: { kind: 'admin' },
+    body: paypal.resolvePaypalBatchSchema,
+    responses: { 200: { description: 'The batch.', schema: batchResponse } },
+    errors: { 404: ['batch_not_found'], 409: ['not_resolvable', 'not_retryable', 'not_connected'], 422: ['batch_not_ours'], 502: ['paypal_unreachable'] },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/payouts/:id/paypal-cancel',
+    tag: 'Payouts',
+    operationId: 'cancelUnclaimedPaypalPayout',
+    summary: 'Cancel an unclaimed PayPal payout',
+    description:
+      'PayPal returns an unclaimed payment after 30 days. This cancels it now: PayPal returns the money to your balance and the payout goes back to pending. If the partner has just claimed it, nothing is cancelled and the payout follows what PayPal says.',
+    access: { kind: 'admin' },
+    responses: {
+      200: {
+        description: 'What PayPal said.',
+        schema: z.object({ ok: z.literal(true), released: z.boolean(), status: z.string().openapi({ description: 'The item’s transaction_status now.' }) }),
+      },
+    },
+    errors: { 404: ['payout_not_found'], 409: ['not_unclaimed', 'not_connected'], 502: ['paypal_unreachable'] },
+  });
+
   r.operation({
     method: 'get',
     path: '/partners/:id/payout-profile',
@@ -1165,7 +1658,8 @@ The file's payouts are fixed here: each is stamped with the \`exportId\`, held o
     tag: 'Partner reporting',
     operationId: 'listPartnerEvents',
     summary: 'Attributed events for a partner',
-    description: 'Newest first, offset-paginated (default 50, max 200), with the click each event was credited through.',
+    description:
+      "Newest first, offset-paginated (default 50, max 200), with the click each event was credited through. A partner calling gets `userId: null` and the customer's `referralId` instead, and only events of the types the brand shows as referral stages (`GET /config/referrals`); admins and scoped keys get every type and the userId.",
     access: { kind: 'partnerOrAdmin', scope: 'partners:read' },
     query: dashboard.eventsQuerySchema,
     responses: { 200: { description: 'Events.', schema: S.PartnerEventList } },
@@ -1177,7 +1671,8 @@ The file's payouts are fixed here: each is stamped with the \`exportId\`, held o
     tag: 'Partner reporting',
     operationId: 'listPartnerCustomers',
     summary: 'Customers a partner brought in',
-    description: 'One row per attributed userId, by attributed revenue. Offset-paginated (default 50, max 200).',
+    description:
+      "One row per attributed userId, by attributed revenue. Offset-paginated (default 50, max 200). A partner calling gets `userId: null` and the customer's `referralId` instead, and counts, dates and revenue over only the event types the brand shows as referral stages. For each customer's stages, see `GET /partners/{id}/referrals`.",
     access: { kind: 'partnerOrAdmin', scope: 'partners:read' },
     query: dashboard.customersQuerySchema,
     responses: { 200: { description: 'Customers.', schema: S.PartnerCustomerList } },
@@ -1205,6 +1700,27 @@ The file's payouts are fixed here: each is stamped with the \`exportId\`, held o
     access: { kind: 'partnerOrAdmin' },
     query: sinceQuery,
     responses: { 200: { description: 'Funnel.', schema: S.PartnerFunnel } },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/partners/:id/referrals',
+    tag: 'Partner reporting',
+    operationId: 'listPartnerReferrals',
+    summary: "A partner's referrals and the stages each has reached",
+    description: `
+One row per customer the partner referred: a userId with at least one event credited to the partner, of any type, whether or not it earned anything. So a CRM stage that pays nothing (\`lead_created\`, \`demo_booked\`) still shows the partner their customer moving.
+
+- **Stages** are the event types the brand shows partners (\`GET /config/referrals\`), with its labels, in its order. Every other type is hidden: it still makes the customer a referral and still counts toward \`commission\`, but its type and dates never appear.
+- **No userId for partners.** A partner sees \`referralId\` (pseudonymous) and \`label\`: "Referral #12" (its \`number\`), or the \`metadata.customerLabel\` you send on events if you turn \`showCustomerLabels\` on. Admins and scoped keys also get \`userId\`, so a headless brand can show its own customer names.
+- **Reversals:** \`commission\` counts live commissions net of refund clawbacks; a stage whose commissions were all reversed or clawed back says \`reversed: true\` and is skipped by \`latestStage\`.
+- A revoked partner's referrals stay readable to the brand as history. The partner's own sessions and keys stop working when they're revoked, including keys minted for them afterwards.
+
+Newest referral first: the customer who most recently became the partner's referral leads, and \`number\` counts up in the same order. \`referredAt\` is when they first clicked the partner's link. Keyset-paginated: pass \`nextCursor\` back as \`cursor\`. The cursor is encrypted and carries no readable data.`,
+    access: { kind: 'partnerOrAdmin', scope: 'partners:read' },
+    query: referrals.listQuerySchema,
+    responses: { 200: { description: 'One page.', schema: S.PartnerReferralPage } },
+    errors: { 400: ['invalid_cursor'], 404: ['not_found'] },
   });
 
   // ---------------------------------------------------------------- Webhooks
@@ -1369,7 +1885,7 @@ The file's payouts are fixed here: each is stamped with the \`exportId\`, held o
     tag: 'API keys',
     operationId: 'createPartnerKey',
     summary: 'Mint a partner key',
-    description: "A key that acts as this one partner: it reads and writes only that partner's own resources. Revoking the partner revokes its keys.",
+    description: "A key that acts as this one partner: it reads and writes only that partner's own resources. Revoking the partner revokes its keys, and a key minted for a revoked partner doesn't authenticate (`401`) until they're reinstated.",
     access: { kind: 'partnerOrAdmin' },
     body: apiKeys.createSchema,
     responses: { 201: { description: 'Minted.', schema: S.CreatedKey } },
@@ -1437,7 +1953,7 @@ The file's payouts are fixed here: each is stamped with the \`exportId\`, held o
       200: {
         description: 'The table.',
         content: {
-          'application/json': { schema: z.array(z.record(z.unknown())) },
+          'application/json': { schema: z.array(z.record(z.string(), z.unknown())) },
           'text/csv': { schema: z.string() },
           'application/sql': { schema: z.string() },
         },
@@ -1545,5 +2061,82 @@ The file's payouts are fixed here: each is stamped with the \`exportId\`, held o
     access: { kind: 'admin' },
     body: settings.partnerAccessSchema.openapi('UpdatePartnerAccessSettingsRequest'),
     responses: { 200: { description: 'The saved setting.', schema: S.PartnerAccessSettings } },
+  });
+
+  // ------------------------------------------------ Payout statements
+  r.operation({
+    method: 'get',
+    path: '/config/payout-statements',
+    tag: 'Payouts',
+    operationId: 'getPayoutStatementSettings',
+    summary: 'Get what payout statements print',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'The settings.', schema: S.PayoutStatementSettings } },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/payout-statements',
+    tag: 'Payouts',
+    operationId: 'updatePayoutStatementSettings',
+    summary: 'Set what payout statements print',
+    description:
+      'Your legal name and address, a footer, and a prefix for statement numbers (`GET /payouts/{id}/statement`). Omitted fields keep their value; `""` or `null` clears one. `taxLines` is a placeholder, off by default: OpenPartner records no tax amounts yet, so ask your accountant which lines (GST, TDS) you need before turning it on. Also on Admin → Settings.',
+    access: { kind: 'admin' },
+    body: settings.payoutStatementSettingsSchema.openapi('UpdatePayoutStatementSettingsRequest'),
+    responses: { 200: { description: 'The saved settings.', schema: S.PayoutStatementSettings } },
+  });
+
+  // ------------------------------------------------------- Referral stages
+  r.operation({
+    method: 'get',
+    path: '/config/referrals',
+    tag: 'Partner reporting',
+    operationId: 'getReferralSettings',
+    summary: 'Get which stages partners see on their referrals',
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'The setting.', schema: S.ReferralSettings } },
+  });
+
+  r.operation({
+    method: 'post',
+    path: '/config/referrals',
+    tag: 'Partner reporting',
+    operationId: 'updateReferralSettings',
+    summary: 'Set which stages partners see on their referrals',
+    description:
+      'Sets the stages partners see on `GET /partners/{id}/referrals` and the partner portal\'s Referrals page: `{"stages": [{"eventType": "lead_created", "label": "Lead"}, {"eventType": "demo_booked", "label": "Demo booked"}, {"eventType": "deal_won", "label": "Deal won"}, {"eventType": "invoice_paid", "label": "Paid"}]}`. `stages` replaces the whole list, in the order given (at most 20; a label at most 60 characters). `refund`, `chargeback`, `dispute_created` and `invoice_payment_failed` are never attributed, so they can\'t be stages (`400 corrective_stage`); a type listed twice is `400 duplicate_stage`. `showCustomerLabels: true` shows partners the `metadata.customerLabel` you send on events. That is your decision as the data\'s controller, so it is off by default. Omitted fields keep their value. Also on Admin → Settings.',
+    access: { kind: 'admin' },
+    body: referrals.settingsSchema.openapi('UpdateReferralSettingsRequest'),
+    responses: { 200: { description: 'The saved setting.', schema: S.ReferralSettings } },
+    errors: { 400: ['duplicate_stage', 'corrective_stage'] },
+  });
+
+  // ------------------------------------------------------- Customer journey
+  r.operation({
+    method: 'get',
+    path: '/events/:id/journey',
+    tag: 'Attribution',
+    operationId: 'getEventJourney',
+    summary: 'Who got credit for a conversion, and why',
+    description:
+      "The journey of the event's customer: every partner touch linked to them (link clicks and codes), oldest first, and their events. `selected` explains this event: what became of each touch (credited, outside its window, a code that gave way to a link…), how the credit was decided, and who each attribution model would credit over the same touches. `recorded` is what was actually written and earned. Only partner touches are recorded, so paid search, organic and direct visits are gaps in the path, not steps.",
+    access: { kind: 'admin' },
+    responses: { 200: { description: 'The journey.', schema: S.Journey } },
+    errors: { 404: ['event_not_found'] },
+  });
+
+  r.operation({
+    method: 'get',
+    path: '/customers/:userId/journey',
+    tag: 'Attribution',
+    operationId: 'getCustomerJourney',
+    summary: "A customer's partner journey",
+    description:
+      'The same journey, looked up by your customer id. `selected` explains `?eventId=`, or without it the customer\'s latest conversion.',
+    access: { kind: 'admin' },
+    query: journey.customerJourneyQuerySchema,
+    responses: { 200: { description: 'The journey.', schema: S.Journey } },
+    errors: { 400: ['invalid_user_id'], 404: ['customer_not_found', 'event_not_found'] },
   });
 }

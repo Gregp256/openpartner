@@ -30,7 +30,7 @@
  */
 
 import { Router } from 'express';
-import { z } from 'zod';
+import { utcDateTime, z } from '../zod.js';
 import { ulid } from 'ulid';
 import { randomBytes } from 'node:crypto';
 import {
@@ -44,13 +44,14 @@ import {
   type PartnerRow,
 } from '@openpartner/db';
 import { grantScope, requireAdmin, requireAuth, requirePartnerOrAdmin } from '../auth.js';
-import { getTenancyMode, tenantOf } from '../tenancy.js';
+import { afterCommit, getTenancyMode, tenantOf } from '../tenancy.js';
 import { getMode } from '../stripe.js';
 import { attributeEvent } from '../attribution.js';
 import { sameConversion } from '../conversion-ingest.js';
 import { currencyInputSchema, ingestCurrency } from '../currency.js';
 import { codeExistsInStripe, deactivateCustomerReward, provisionCustomerReward } from '../customer-rewards.js';
-import { RECORDED_FROM_STRIPE_DETAIL, recordedFromStripe } from '../stripe-app.js';
+import { recordedFromStripe, recordedFromStripeDetail } from '../stripe-app.js';
+import { noteTrackingIssue } from '../tracking-issues.js';
 
 export const couponsRouter = Router();
 
@@ -304,6 +305,9 @@ couponsRouter.post('/partners/:id/coupons', requireAuth, async (req, res) => {
       code,
       stripeCouponId: provisioned?.stripeCouponId ?? null,
       stripePromotionCodeId: provisioned?.stripePromotionCodeId ?? null,
+      // Recorded so the Stripe webhook keeps crediting a brand promo this
+      // code was chosen to map (stripe-webhook.ts discountMadeForCoupon).
+      brandChosen: adminChosen,
     });
     const row = await db<CouponRow>(TABLES.Coupon).where({ id, tenantId }).first();
     return res.status(201).json({ ...row, canEdit: program.partnersMayCustomizeCode });
@@ -362,19 +366,25 @@ couponsRouter.delete('/partners/:id/coupons/:couponId', requireAuth, async (req,
     return res.json({ ...coupon, canEdit: program.partnersMayCustomizeCode });
   }
 
-  // Disable the Stripe PromotionCode (best-effort). If Stripe is down
-  // or the code was never provisioned, we still flip our own flag —
-  // the OpenPartner attribution path is the source of truth for "is
-  // this code redeemable in OpenPartner," and a stale active Stripe
-  // code without a matching active OpenPartner Coupon would just
-  // discount the customer without attributing.
-  if (coupon.stripePromotionCodeId) {
-    await deactivateCustomerReward(coupon.tenantId, coupon.stripePromotionCodeId);
-  }
-
-  await db<CouponRow>(TABLES.Coupon)
+  // Flip our own flag, then disable the Stripe PromotionCode
+  // (best-effort). If Stripe is down or the code was never provisioned,
+  // the flag still stands — the OpenPartner attribution path is the
+  // source of truth for "is this code redeemable in OpenPartner," and a
+  // stale active Stripe code without a matching active OpenPartner Coupon
+  // would just discount the customer without attributing. The promo id
+  // comes back from the flip itself: a reward backfill may have recorded
+  // one since `coupon` was read, and none can after (it only writes
+  // active codes). Stripe is called once the flip has committed, so the
+  // row lock isn't held across the call.
+  const [retired] = (await db<CouponRow>(TABLES.Coupon)
     .where({ id: coupon.id, tenantId })
-    .update({ deactivatedAt: new Date() });
+    .whereNull('deactivatedAt')
+    .update({ deactivatedAt: new Date() })
+    .returning(['stripePromotionCodeId'])) as Array<Pick<CouponRow, 'stripePromotionCodeId'>>;
+  const retiredPromo = retired?.stripePromotionCodeId;
+  if (retiredPromo) {
+    afterCommit(req, 'deactivate customer reward', () => deactivateCustomerReward(tenantId, retiredPromo));
+  }
 
   const updated = await db<CouponRow>(TABLES.Coupon).where({ id: coupon.id, tenantId }).first();
   return res.json({ ...updated, canEdit: program.partnersMayCustomizeCode });
@@ -405,14 +415,15 @@ export const redeemSchema = z.object({
   value: z.number().nonnegative().optional(),
   /** Any case; stored upper case. Omitted → the tenant's default currency. */
   currency: currencyInputSchema.optional(),
-  /** Required so we can dedup retries. Use the brand's checkout-session
-   *  ID, order ID, or whatever's stable. */
+  /** Required so we can dedup retries. Use the brand's order ID, or
+   *  whatever's stable. Not a Stripe Checkout Session id where Stripe
+   *  reports that checkout itself (recordedFromStripe). */
   externalEventId: z.string().min(1).max(120),
   /** The brand's internal user ID. Identity row links userId ↔
    *  synthetic clickId so subsequent events from the same user
    *  attribute via the standard path. */
   userId: z.string().min(1).max(120),
-  ts: z.string().datetime().optional(),
+  ts: utcDateTime().optional(),
 });
 
 // Server-to-server coupon redemption → synthesizes Click+Identity+Event and
@@ -427,15 +438,20 @@ couponsRouter.post('/coupons/redeem', requireAuth, grantScope('events:write'), r
   if (!body.success) return res.status(400).json({ error: 'invalid_body', detail: body.error.flatten() });
 
   const coupon = await findCouponByCode(db, tenantId, body.data.code);
-  if (!coupon) return res.status(404).json({ error: 'coupon_not_found' });
+  if (!coupon) {
+    await noteTrackingIssue(db, tenantId, 'coupon_unknown_code', body.data.code);
+    return res.status(404).json({ error: 'coupon_not_found' });
+  }
 
   const { userId, eventType, value, currency, externalEventId } = body.data;
-  // Keyed on a Checkout Session or invoice while the brand's Stripe account
-  // is connected: the app records that checkout, and redeems a partner code
-  // entered at Stripe Checkout itself. A redemption under the same key would
-  // take it first and the checkout's revenue would be dropped as a replay.
+  // Keyed on a Checkout Session (or, connected, an invoice) whose payment
+  // Stripe reports to us itself: the brand's connected account on hosted, or
+  // a single-tenant self-host's own /webhooks/stripe. That records the
+  // checkout under the session id and redeems a partner code entered at
+  // Stripe Checkout. A redemption under the same key would take it first and
+  // the checkout's revenue would be dropped as a replay.
   if (await recordedFromStripe(db, tenantId, externalEventId)) {
-    return res.status(409).json({ error: 'recorded_from_stripe', detail: RECORDED_FROM_STRIPE_DETAIL });
+    return res.status(409).json({ error: 'recorded_from_stripe', detail: recordedFromStripeDetail() });
   }
   const ts = body.data.ts ? new Date(body.data.ts) : new Date();
   const row = {
