@@ -43,6 +43,7 @@ RUN apk add --no-cache tini \
  && touch /var/run/nginx.pid \
  && chown nginx:nginx /var/run/nginx.pid
 ENV API_UPSTREAM=api:4601
+ENV ROUTER_UPSTREAM=127.0.0.1:4701
 COPY --chown=nginx:nginx apps/portal/nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=builder --chown=nginx:nginx /repo/apps/portal/dist /usr/share/nginx/html
 

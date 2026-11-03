@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { useLocation, useNavigate, useSearchParams } from 'react-router';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { KeyRound, Mail } from 'lucide-react';
 import { api, clearApiKey, setApiKey, ApiError, type Principal } from '../../api.js';
@@ -17,12 +17,48 @@ import {
 
 type Tab = 'email' | 'key';
 
+/** Where a successful sign-in lands. Partners go to the page that shows
+ *  their share link. A return path wins when it is still inside this brand
+ *  and is not the sign-in page itself. */
+export function pathAfterSignIn(
+  role: Principal['role'],
+  tenantBase: string,
+  from?: { pathname?: string; search?: string },
+): string {
+  const loginPath = `${tenantBase}/login`;
+  const fromPath = from?.pathname;
+  if (fromPath && fromPath.startsWith(`${tenantBase}/`) && !fromPath.startsWith(loginPath)) {
+    return `${fromPath}${from?.search ?? ''}`;
+  }
+  if (role === 'partner') return `${tenantBase}/links`;
+  return tenantBase || '/';
+}
+
 export function LoginPage() {
   const [tab, setTab] = useState<Tab>('email');
   const [params] = useSearchParams();
+  const tenantBase = useTenantBase();
   const state = (useLocation().state ?? {}) as AuthLocationState;
   return (
-    <AuthFrame title="Sign in" subtitle="Choose how you want to sign in.">
+    <AuthFrame title="Sign in" subtitle="Your share link is on the links page. Sign in here when that page asks you to.">
+      <Link
+        to={`${tenantBase}/links`}
+        style={{
+          display: 'block',
+          width: '100%',
+          marginBottom: 16,
+          padding: '10px 14px',
+          background: theme.accent,
+          color: theme.accentInk,
+          borderRadius: theme.radiusSm,
+          fontSize: 14,
+          fontWeight: 600,
+          textAlign: 'center',
+          textDecoration: 'none',
+        }}
+      >
+        Open your links
+      </Link>
       <AuthNotice error={params.get('error')} reset={state.reset} />
       <div style={{ display: 'flex', gap: 4, background: theme.bg, padding: 4, borderRadius: theme.radiusSm, marginBottom: 20 }}>
         <TabButton active={tab === 'email'} onClick={() => setTab('email')} icon={<Mail size={14} />}>
@@ -96,7 +132,8 @@ function EmailTab() {
         // Same as the magic-link landing: the install probe was cached
         // before this admin existed.
         qc.invalidateQueries({ queryKey: ['install-status'] });
-        nav(tenantBase || '/', { replace: true });
+        const me = await api<Principal>('/auth/whoami');
+        nav(pathAfterSignIn(me.role, tenantBase, state.from), { replace: true });
       }}
       onLink={(email) => api('/auth/signin', { method: 'POST', body: { email } }).then(() => undefined)}
       onForgot={(email) => api('/auth/password/forgot', { method: 'POST', body: { email } }).then(() => undefined)}
@@ -109,6 +146,7 @@ function EmailTab() {
 function KeyTab() {
   const nav = useNavigate();
   const tenantBase = useTenantBase();
+  const state = (useLocation().state ?? {}) as AuthLocationState;
   const [token, setToken] = useState('');
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -119,12 +157,11 @@ function KeyTab() {
     setErr(null);
     setApiKey(token.trim());
     try {
-      await api<Principal>('/auth/whoami');
-      // Land on the tenant root (admin dashboard for admin keys,
-      // partner dashboard for partner keys) rather than '/' which
-      // strips the tenant prefix and falls through to the marketing
-      // landing page on multi-tenant deployments.
-      nav(tenantBase || '/');
+      const me = await api<Principal>('/auth/whoami');
+      // Partners land on the page that shows their share link. Admins
+      // land on the tenant root. A bare '/' would drop the tenant prefix
+      // and fall through to the marketing landing on multi-tenant hosts.
+      nav(pathAfterSignIn(me.role, tenantBase, state.from));
     } catch (e) {
       clearApiKey();
       if (e instanceof ApiError) {

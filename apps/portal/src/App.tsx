@@ -37,6 +37,7 @@ import { useTenantBase } from './tenant-base.js';
 import { alpha, theme } from './theme.js';
 import { useIsMobile } from './lib/useMediaQuery.js';
 import { useBrand, useConnectPayouts, usePublicBrand } from './lib/useBrand.js';
+import { AffiliateLinkGate, isAffiliateLinkEntry } from './pages/auth/AffiliateLinkGate.js';
 import { Dashboard } from './pages/Dashboard.js';
 import { LinksPage } from './pages/Links.js';
 import { CommissionsPage } from './pages/Commissions.js';
@@ -255,7 +256,13 @@ function Shell() {
   const brandLocationMissing = useBrandLocationMissing(auth.principal?.role === 'admin');
 
   if (auth.loading || brandLoading || partnerNetwork.loading) return <CenteredMessage>Loading…</CenteredMessage>;
-  if (!auth.principal) return <Navigate to={`${tenantBase}/login`} state={{ from: location }} replace />;
+  // The affiliate address opens on the page where a partner gets their
+  // share link. Sign-in is a link on that page. Other pages still require
+  // a session and send the visitor to sign in.
+  if (!auth.principal) {
+    if (isAffiliateLinkEntry(location.pathname, tenantBase)) return <AffiliateLinkGate />;
+    return <Navigate to={`${tenantBase}/login`} state={{ from: location }} replace />;
+  }
 
   const showNetwork = !whiteLabel && (auth.principal.role === 'admin' ? true : partnerNetwork.show);
   // The one-time "join the Network?" prompt: partners the brand offers it
@@ -290,7 +297,16 @@ function Shell() {
         {showNetworkConsentPrompt && <NetworkConsentPrompt isMobile={isMobile} />}
         {showNetworkProfileBanner && <NetworkProfileBanner isMobile={isMobile} />}
         <Routes>
-          <Route index element={<Dashboard principal={auth.principal} />} />
+          <Route
+            index
+            element={
+              auth.principal.role === 'partner' ? (
+                <Navigate to={`${tenantBase}/links`} replace />
+              ) : (
+                <Dashboard principal={auth.principal} />
+              )
+            }
+          />
 
           <Route path="links" element={<LinksPage principal={auth.principal} />} />
           <Route path="commissions" element={<CommissionsPage principal={auth.principal} />} />

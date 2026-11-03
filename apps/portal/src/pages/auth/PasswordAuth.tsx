@@ -105,6 +105,8 @@ export function AuthNotice({ error, reset }: { error: string | null; reset?: boo
 export interface AuthLocationState {
   email?: string;
   reset?: boolean;
+  /** Page the visitor was trying to open before sign-in. */
+  from?: { pathname?: string; search?: string };
 }
 
 export function Notice({ tone, children }: { tone: 'success' | 'danger' | 'info'; children: ReactNode }) {
