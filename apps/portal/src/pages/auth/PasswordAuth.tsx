@@ -2,6 +2,7 @@ import { useState, type CSSProperties, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Eye, EyeOff } from 'lucide-react';
 import { theme } from '../../theme.js';
+import { useTenantBase } from '../../tenant-base.js';
 import { countryErrorMessage } from '../../lib/CountryField.js';
 
 /**
@@ -321,7 +322,7 @@ export function useNewPassword(): {
         <div style={{ fontSize: 12, color: theme.textMuted, marginBottom: 4 }}>New password</div>
         <PasswordInput value={password} onChange={setPassword} autoComplete="new-password" autoFocus />
         <div style={{ fontSize: 11, color: theme.textDim, marginTop: 4 }}>
-          At least {MIN_PASSWORD_LENGTH} characters. A few unrelated words works well.
+          At least {MIN_PASSWORD_LENGTH} characters. A few unrelated words work well.
         </div>
       </div>
       <div style={{ marginBottom: 12 }}>
@@ -357,6 +358,7 @@ export function EmailPasswordForm({
   forgotHint,
   emailPlaceholder = 'you@example.com',
   footer,
+  initialMode = 'password',
 }: {
   initialEmail?: string;
   googleHref?: string | null;
@@ -370,8 +372,10 @@ export function EmailPasswordForm({
   forgotHint?: ReactNode;
   emailPlaceholder?: string;
   footer?: ReactNode;
+  initialMode?: FormMode;
 }) {
-  const [mode, setMode] = useState<FormMode>('password');
+  const tenantBase = useTenantBase();
+  const [mode, setMode] = useState<FormMode>(initialMode);
   const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
@@ -459,14 +463,14 @@ export function EmailPasswordForm({
           <div style={{ marginBottom: 12 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
               <div style={{ fontSize: 12, color: theme.textMuted }}>Password</div>
-              <TextButton onClick={() => switchTo('forgot')}>Forgot password?</TextButton>
+              <a href={`${tenantBase}/forgot-password`} style={{ fontSize: 12, color: theme.accentText }}>Forgot password?</a>
             </div>
             <PasswordInput value={password} onChange={setPassword} autoComplete="current-password" autoFocus={!!initialEmail} />
           </div>
         )}
         {mode === 'forgot' && (
           <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 12, lineHeight: 1.5 }}>
-            We&rsquo;ll email you a link to choose a new password. Never had one? This sets your first.
+            We&rsquo;ll email you a link to choose a password. Use it for a new password, including the first one.
             {forgotHint && <div style={{ marginTop: 6 }}>{forgotHint}</div>}
           </div>
         )}

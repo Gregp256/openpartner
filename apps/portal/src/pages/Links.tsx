@@ -178,7 +178,7 @@ function PartnerLinks({ partnerId, readOnly }: { partnerId: string; readOnly: bo
       subtitle={
         readOnly
           ? "Links this partner has created. Partners manage their own; admins view only."
-          : "Copy your share link and publish it. Visitors are redirected to the destination and their clicks are attributed to you."
+          : "Copy your share link and publish it. Add ?sub_id= to tell your own tracker which click it was. Visitors are redirected to the destination and their clicks are attributed to you."
       }
       actions={
         readOnly ? undefined : (

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { KeyRound, Mail } from 'lucide-react';
@@ -34,41 +34,40 @@ export function pathAfterSignIn(
   return tenantBase || '/';
 }
 
-export function LoginPage() {
+export function LoginPage({ allowAdminKey = false, start = 'email' }: { allowAdminKey?: boolean; start?: 'email' | 'forgot' }) {
   const [tab, setTab] = useState<Tab>('email');
   const [params] = useSearchParams();
+  const nav = useNavigate();
   const tenantBase = useTenantBase();
   const state = (useLocation().state ?? {}) as AuthLocationState;
+  useEffect(() => {
+    let cancel = false;
+    api<Principal>('/auth/whoami')
+      .then((me) => {
+        if (!cancel) nav(pathAfterSignIn(me.role, tenantBase, state.from), { replace: true });
+      })
+      .catch(() => {});
+    return () => {
+      cancel = true;
+    };
+  }, [nav, tenantBase, state.from]);
   return (
-    <AuthFrame title="Sign in" subtitle="Your share link is on the links page. Sign in here when that page asks you to.">
-      <Link
-        to={`${tenantBase}/links`}
-        style={{
-          display: 'block',
-          width: '100%',
-          marginBottom: 16,
-          padding: '10px 14px',
-          background: theme.accent,
-          color: theme.accentInk,
-          borderRadius: theme.radiusSm,
-          fontSize: 14,
-          fontWeight: 600,
-          textAlign: 'center',
-          textDecoration: 'none',
-        }}
-      >
-        Open your links
-      </Link>
+    <AuthFrame title={start === 'forgot' ? 'Choose a password' : 'Sign in'} subtitle="Sign in to your affiliate account.">
       <AuthNotice error={params.get('error')} reset={state.reset} />
-      <div style={{ display: 'flex', gap: 4, background: theme.bg, padding: 4, borderRadius: theme.radiusSm, marginBottom: 20 }}>
-        <TabButton active={tab === 'email'} onClick={() => setTab('email')} icon={<Mail size={14} />}>
-          Email
-        </TabButton>
-        <TabButton active={tab === 'key'} onClick={() => setTab('key')} icon={<KeyRound size={14} />}>
-          Admin / partner key
-        </TabButton>
+      {allowAdminKey && (
+        <div style={{ display: 'flex', gap: 4, background: theme.bg, padding: 4, borderRadius: theme.radiusSm, marginBottom: 20 }}>
+          <TabButton active={tab === 'email'} onClick={() => setTab('email')} icon={<Mail size={14} />}>
+            Email
+          </TabButton>
+          <TabButton active={tab === 'key'} onClick={() => setTab('key')} icon={<KeyRound size={14} />}>
+            Admin key
+          </TabButton>
+        </div>
+      )}
+      {!allowAdminKey || tab === 'email' ? <EmailTab start={start} /> : <KeyTab />}
+      <div style={{ marginTop: 16, fontSize: 13, textAlign: 'center' }}>
+        <Link to={`${tenantBase}/join`} style={{ color: theme.accentText }}>Become an affiliate</Link>
       </div>
-      {tab === 'email' ? <EmailTab /> : <KeyTab />}
     </AuthFrame>
   );
 }
@@ -106,7 +105,7 @@ function TabButton({ active, onClick, icon, children }: { active: boolean; onCli
  * carried; redeeming it here is the same POST /auth/magic/verify the
  * emailed link's landing page makes.
  */
-function EmailTab() {
+function EmailTab({ start = 'email' }: { start?: 'email' | 'forgot' }) {
   const nav = useNavigate();
   const qc = useQueryClient();
   const tenantBase = useTenantBase();
@@ -136,6 +135,7 @@ function EmailTab() {
         nav(pathAfterSignIn(me.role, tenantBase, state.from), { replace: true });
       }}
       onLink={(email) => api('/auth/signin', { method: 'POST', body: { email } }).then(() => undefined)}
+      initialMode={start === 'forgot' ? 'forgot' : 'link'}
       onForgot={(email) => api('/auth/password/forgot', { method: 'POST', body: { email } }).then(() => undefined)}
       linkSentText={(email) => `If an account exists for ${email}, we sent a sign-in link. It’s good for 15 minutes.`}
       forgotSentText={(email) => `If an account exists for ${email}, we sent a link to choose a password. It’s good for 15 minutes.`}

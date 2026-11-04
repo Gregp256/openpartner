@@ -29,12 +29,21 @@
         document.documentElement.setAttribute('data-theme', t);
       })();
     </script>
-    <title>OpenPartner</title>
+    <title>Truest Affiliate</title>
+    <script>
+      (function () {
+        var host = location.hostname.toLowerCase();
+        var title = host.indexOf('aifluxx') >= 0 ? 'AIfluxx Affiliate' : host.indexOf('truest') >= 0 ? 'Truest Affiliate' : 'Affiliate';
+        document.title = title;
+        var og = document.querySelector('meta[property="og:title"]');
+        if (og) og.setAttribute('content', title);
+      })();
+    </script>
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta property="og:title" content="OpenPartner" />
+    <meta property="og:title" content="Truest Affiliate" />
     <meta property="og:image" content="/og-default.png" />
   </head>
   <body>

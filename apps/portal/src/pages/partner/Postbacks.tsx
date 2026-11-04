@@ -435,12 +435,10 @@ function MacroReference() {
     <div style={{ marginTop: 28 }}>
       <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>Available macros</div>
       <Card>
-        <div style={{ fontSize: 12, color: theme.textMuted, marginBottom: 10 }}>
-          Macro values are URL-encoded at fire time. Unknown macros stay literal so you notice
-          typos. Postbacks are unsigned by design — if you want verification, add a shared
-          secret as a query param yourself: <code style={{ color: theme.text }}>?secret=…</code>
+        <div style={{ fontSize: 14, color: theme.textMuted, marginBottom: 10 }}>
+          Put these in the URL. They are filled in when the postback fires.
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: '6px 14px', fontSize: 12 }}>
+        <div className="op-grid-collapse" style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: '8px 14px', fontSize: 15 }}>
           {macros.map(([macro, desc]) => (
             <FragmentRow key={macro} macro={macro} desc={desc} />
           ))}

@@ -1206,34 +1206,74 @@ function escapeHtml(s: string): string {
 /** {@link wrap} plus a small muted footer line (raw HTML — callers escape). */
 function wrapWithFooter(text: string, cta: string, ctaLabel: string, footerHtml: string): string {
   const html = wrap(text, cta, ctaLabel);
-  const row = `<tr><td style="padding:0 32px 22px; color:#6b7280; font-size:12px; line-height:1.5;">${footerHtml}</td></tr>`;
-  const anchor = '</td></tr>\n        </table>';
-  // Inside the card when the layout is the familiar one; otherwise still
-  // present — an unsubscribe link must never silently disappear.
-  return html.includes(anchor)
-    ? html.replace(anchor, `</td></tr>\n          ${row}\n        </table>`)
+  const row = `<tr><td style="padding:0 32px 8px; color:#8B949E; font-size:12px; line-height:1.5;">${footerHtml}</td></tr>`;
+  const marker = '<!-- op-email-footer -->';
+  return html.includes(marker)
+    ? html.replace(marker, row)
     : html.replace('</body>', `<table role="presentation" align="center">${row}</table>\n  </body>`);
+}
+
+const FONT = "Poppins,'Segoe UI',Roboto,Arial,sans-serif";
+
+function mailBrand(): { name: string; home: string; logo: string; footer: string } {
+  const host = (process.env.PORTAL_URL ?? '').toLowerCase();
+  if (host.includes('aifluxx')) {
+    return {
+      name: 'AIfluxx Affiliate',
+      home: 'https://affiliate.aifluxx.co.za',
+      logo: 'https://affiliate.aifluxx.co.za/brand/aifluxx-email-logo.png',
+      footer: 'AIfluxx Affiliate · South Africa · POPIA. This is an automated message.',
+    };
+  }
+  if (host.includes('truest')) {
+    return {
+      name: 'Truest Affiliate',
+      home: 'https://affiliate.truest.ae',
+      logo: 'https://affiliate.truest.ae/brand/truest-email-logo.png',
+      footer: 'Truest Affiliate · United Arab Emirates. This is an automated message.',
+    };
+  }
+  return {
+    name: 'Affiliate',
+    home: (process.env.PORTAL_URL ?? '').replace(/\/$/, ''),
+    logo: '',
+    footer: 'Updates are sent through OpenPartner. This is an automated message.',
+  };
+}
+
+function emailShell(inner: string): string {
+  const brand = mailBrand();
+  const logo = brand.logo
+    ? `<a href="${escapeHtml(brand.home)}/"><img src="${escapeHtml(brand.logo)}" width="140" alt="${escapeHtml(brand.name)}" style="display:block;border:0;width:140px;height:auto;"/></a>`
+    : `<div style="color:#ffffff;font-family:${FONT};font-size:20px;font-weight:700;">${escapeHtml(brand.name)}</div>`;
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${escapeHtml(brand.name)}</title></head>
+<body style="margin:0;padding:0;background:#0a0a0a;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" bgcolor="#0a0a0a" style="background:#0a0a0a;">
+<tr><td align="center" style="padding:32px 12px;">
+<table role="presentation" width="600" cellspacing="0" cellpadding="0" data-op-email="card" style="width:100%;max-width:600px;background:#161b22;border:1px solid #30363d;border-radius:16px;">
+<tr><td align="center" style="padding:28px 32px 20px;border-bottom:1px solid #30363d;">${logo}</td></tr>
+<tr><td style="padding:28px 32px 12px;color:#d4d4d4;font-family:${FONT};font-size:15px;line-height:1.6;">
+${inner}
+</td></tr>
+<!-- op-email-footer -->
+<tr><td style="padding:18px 32px 24px;border-top:1px solid #30363d;">
+<p style="margin:0 0 8px;color:#8B949E;font-family:${FONT};font-size:12px;line-height:1.6;">
+<a href="${escapeHtml(brand.home)}/terms" style="color:#8B949E;text-decoration:underline;">Terms</a>
+ &middot; <a href="${escapeHtml(brand.home)}/privacy" style="color:#8B949E;text-decoration:underline;">Privacy</a>
+ &middot; <a href="${escapeHtml(brand.home)}/login" style="color:#8B949E;text-decoration:underline;">Sign in</a>
+</p>
+<p style="margin:0;color:#8B949E;font-family:${FONT};font-size:12px;line-height:1.6;">${escapeHtml(brand.footer)}</p>
+</td></tr>
+</table></td></tr></table></body></html>`;
 }
 
 /** Plain-text-in-HTML wrapper for templates with no call-to-action button. */
 export function plainHtml(text: string): string {
-  return `<!DOCTYPE html>
-<html>
-  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f4f4f5; padding:24px 0; margin:0;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-      <tr><td align="center">
-        <table role="presentation" width="520" cellspacing="0" cellpadding="0" border="0" data-op-email="card" style="background:#ffffff; border-radius:8px; overflow:hidden;">
-          <tr><td style="padding:28px 32px; color:#1f2937; font-size:14px; line-height:1.6;">
-            ${text
-              .split('\n')
-              .map((l) => l.replace(/</g, '&lt;').replace(/>/g, '&gt;'))
-              .join('<br>')}
-          </td></tr>
-        </table>
-      </td></tr>
-    </table>
-  </body>
-</html>`;
+  const body = text.split('\n').map((line) => escapeHtml(line)).join('<br>');
+  return emailShell(body);
 }
 
 /** {@link plainHtml} for a mail offering several destinations, so no one
@@ -1241,27 +1281,15 @@ export function plainHtml(text: string): string {
  *  — a line of free text (a brand name) that looks like a URL stays text. */
 function linkedHtml(text: string, urls: string[]): string {
   const links = new Set(urls);
-  return `<!DOCTYPE html>
-<html>
-  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f4f4f5; padding:24px 0; margin:0;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-      <tr><td align="center">
-        <table role="presentation" width="520" cellspacing="0" cellpadding="0" border="0" data-op-email="card" style="background:#ffffff; border-radius:8px; overflow:hidden;">
-          <tr><td style="padding:28px 32px; color:#1f2937; font-size:14px; line-height:1.6;">
-            ${text
-              .split('\n')
-              .map((line) =>
-                links.has(line)
-                  ? `<a href="${escapeHtml(line)}" data-op-email="link" style="color:#2dd4bf">${escapeHtml(line)}</a>`
-                  : escapeHtml(line),
-              )
-              .join('<br>')}
-          </td></tr>
-        </table>
-      </td></tr>
-    </table>
-  </body>
-</html>`;
+  const body = text
+    .split('\n')
+    .map((line) =>
+      links.has(line)
+        ? `<a href="${escapeHtml(line)}" data-op-email="link" style="color:#2dd4bf">${escapeHtml(line)}</a>`
+        : escapeHtml(line),
+    )
+    .join('<br>');
+  return emailShell(body);
 }
 
 function wrap(text: string, cta: string, ctaLabel: string): string {
@@ -1273,23 +1301,9 @@ function wrap(text: string, cta: string, ctaLabel: string): string {
     .map((line) =>
       line.startsWith('http')
         ? `<a href="${href}" data-op-email="link" style="color:#2dd4bf">${href}</a>`
-        : line.replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+        : escapeHtml(line),
     )
     .join('<br>');
-  return `<!DOCTYPE html>
-<html>
-  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f4f4f5; padding:24px 0; margin:0;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-      <tr><td align="center">
-        <table role="presentation" width="520" cellspacing="0" cellpadding="0" border="0" data-op-email="card" style="background:#ffffff; border-radius:8px; overflow:hidden;">
-          <tr><td style="padding:28px 32px; color:#1f2937; font-size:14px; line-height:1.6;">
-            ${escaped}
-            <br><br>
-            <a href="${href}" data-op-email="button" style="display:inline-block; background:#2dd4bf; color:#041115; padding:10px 18px; border-radius:6px; text-decoration:none; font-weight:600;">${ctaLabel}</a>
-          </td></tr>
-        </table>
-      </td></tr>
-    </table>
-  </body>
-</html>`;
+  const button = `<br><br><a href="${href}" data-op-email="button" style="display:inline-block; background:#2dd4bf; color:#041115; padding:13px 28px; border-radius:8px; text-decoration:none; font-weight:600;">${escapeHtml(ctaLabel)}</a>`;
+  return emailShell(`${escaped}${button}`);
 }

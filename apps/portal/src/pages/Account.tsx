@@ -226,7 +226,43 @@ export function TenantAccountPage() {
 
   return (
     <Page title="Sign-in & password" subtitle="How you sign in to this portal.">
-      <div style={{ maxWidth: 560 }}>{body}</div>
+      <div style={{ maxWidth: 720, width: '100%' }}>
+        <NameSection />
+        {body}
+      </div>
     </Page>
+  );
+}
+
+function NameSection() {
+  const qc = useQueryClient();
+  const me = useQuery({ queryKey: ['whoami'], queryFn: () => api<{ role: string; partner?: { name: string } }>('/auth/whoami') });
+  const [name, setName] = useState(me.data?.partner?.name ?? '');
+  const [saved, setSaved] = useState(false);
+  useEffect(() => {
+    if (me.data?.partner?.name) setName(me.data.partner.name);
+  }, [me.data?.partner?.name]);
+  if (me.data?.role !== 'partner') return null;
+  return (
+    <Card>
+      <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>Your name</div>
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        style={{ width: '100%', boxSizing: 'border-box', padding: '10px 12px', marginBottom: 12, background: theme.surface2, color: theme.text, border: `1px solid ${theme.border}`, borderRadius: theme.radiusSm }}
+      />
+      <button
+        type="button"
+        onClick={async () => {
+          await api('/partners/me', { method: 'PATCH', body: { name } });
+          setSaved(true);
+          await qc.invalidateQueries({ queryKey: ['whoami'] });
+        }}
+        style={{ padding: '9px 18px', background: theme.accent, color: theme.accentInk, border: 'none', borderRadius: theme.radiusSm, fontWeight: 600 }}
+      >
+        Save name
+      </button>
+      {saved && <div style={{ marginTop: 8, color: theme.textMuted, fontSize: 13 }}>Name saved.</div>}
+    </Card>
   );
 }

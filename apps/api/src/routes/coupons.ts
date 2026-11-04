@@ -622,13 +622,9 @@ export async function ensureCouponClickAndIdentity(
 
 // ---------- Helpers ----------
 
-function defaultCode(email: string): string {
-  // <local-part-stripped-of-symbols-uppercased> + 4 random chars.
-  // Example: ada.lovelace+test@example.com → ADALOVELACE + 4F2A
-  const local = email.split('@')[0] ?? 'partner';
-  const slug = local.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 12) || 'PARTNER';
-  const rand = randomBytes(2).toString('hex').toUpperCase();
-  return `${slug}${rand}`;
+function defaultCode(_email: string): string {
+  // A short code that does not include the partner's name or email.
+  return `AFF${randomBytes(4).toString('hex').toUpperCase()}`;
 }
 
 /** Auto-mint's use of codeExistsInStripe. A generated code is a random

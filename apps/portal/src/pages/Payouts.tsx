@@ -10,6 +10,7 @@ import { ManualPayoutFiles } from './ManualPayoutFiles.js';
 import { PayoutRunSummary, payoutMethodLabel, type PayoutRunResult } from './PayoutRunSummary.js';
 import { SentAs, withdrawalNote, type PayoutSent } from './payout-sent.js';
 import { isViewOnly } from '../lib/viewOnly.js';
+import { ProgramTermsCard } from './PublicPages.js';
 
 interface Payout {
   id: string;
@@ -116,6 +117,7 @@ export function PayoutsPage({ principal }: { principal: Principal }) {
 
   return (
     <Page title="Payouts" subtitle={subtitle} actions={actions}>
+      <ProgramTermsCard />
       <ErrorBanner error={runPayouts.error ?? payouts.error} />
 
       {shownHolds.length > 0 && (
@@ -167,7 +169,7 @@ export function PayoutsPage({ principal }: { principal: Principal }) {
       ) : (payouts.data?.payouts ?? []).length === 0 ? (
         <EmptyState
           title="No payouts yet"
-          hint="Approved commissions become payouts on the next run."
+          hint="Approved commission is paid on the next payout run. A run is the regular payout. Anything under the minimum waits for a later run."
           icon={<Banknote size={28} strokeWidth={1.25} />}
         />
       ) : (
@@ -240,7 +242,7 @@ function RecentPayouts() {
       ) : rows.length === 0 ? (
         <EmptyState
           title="No payouts yet"
-          hint="Approved commissions become payouts on the next run."
+          hint="Approved commission is paid on the next payout run. A run is the regular payout. Anything under the minimum waits for a later run."
           icon={<Banknote size={28} strokeWidth={1.25} />}
         />
       ) : (

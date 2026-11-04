@@ -4,6 +4,8 @@ import { theme } from '../../theme.js';
 import { usePublicBrand } from '../../lib/useBrand.js';
 import { ThemeToggle } from '../../lib/ThemeToggle.js';
 import { CookieSettingsButton } from '../../lib/ConsentBanner.js';
+import { affiliateMark, affiliateTitle } from '../../lib/affiliateHost.js';
+import { useTenantBase } from '../../tenant-base.js';
 
 export function AuthFrame({
   title,
@@ -21,7 +23,10 @@ export function AuthFrame({
   // white-label tenant's sign-in page never shows platform branding. On
   // platform pages it returns nulls and we keep the OpenPartner default.
   const publicBrand = usePublicBrand();
-  const name = brand ?? (publicBrand.isLoading ? '' : publicBrand.programName);
+  const tenantBase = useTenantBase();
+  const product = affiliateTitle();
+  const name = brand ?? product ?? (publicBrand.isLoading ? '' : publicBrand.programName);
+  const mark = publicBrand.logoUrl ?? affiliateMark();
   return (
     <div
       style={{
@@ -49,10 +54,10 @@ export function AuthFrame({
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
           <AuthBrandMark
-            logoUrl={publicBrand.logoUrl}
+            logoUrl={mark}
             programName={name || '?'}
-            whiteLabel={publicBrand.whiteLabel}
-            pending={publicBrand.isLoading}
+            whiteLabel={publicBrand.whiteLabel || !!product}
+            pending={publicBrand.isLoading && !product}
           />
           <div style={{ fontSize: 18, fontWeight: 600 }}>{name}</div>
         </div>
@@ -62,6 +67,13 @@ export function AuthFrame({
       </div>
       {/* Footer-style, below the card: reachable on every public page
           without competing with the form. */}
+      <div style={{ marginTop: 16, fontSize: 12, color: theme.textMuted }}>
+        <Link to={`${tenantBase}/terms`} style={{ color: theme.textMuted }}>Terms</Link>
+        {' · '}
+        <Link to={`${tenantBase}/privacy`} style={{ color: theme.textMuted }}>Privacy</Link>
+        {' · '}
+        <Link to={`${tenantBase}/faq`} style={{ color: theme.textMuted }}>FAQ</Link>
+      </div>
       <ThemeToggle style={{ marginTop: 16 }} />
       <CookieSettingsButton style={{ marginTop: 8 }} />
     </div>

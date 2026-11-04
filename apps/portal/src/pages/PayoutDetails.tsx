@@ -91,10 +91,10 @@ interface Form {
 const EMPTY: Form = {
   method: 'paypal',
   email: '',
-  country: '',
+  country: 'AE',
   accountHolderName: '',
   accountHolderType: 'person',
-  currency: 'USD',
+  currency: 'AED',
   byIban: true,
   iban: '',
   bic: '',
@@ -325,7 +325,7 @@ export function PayoutDetailsPage({ principal }: { principal: Principal }) {
               e.preventDefault();
               save.mutate();
             }}
-            style={{ display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 620 }}
+            style={{ display: 'flex', flexDirection: 'column', gap: 14, width: '100%' }}
           >
             <Field label={isAdmin ? 'Payout method' : 'How should we pay you?'}>
               <Select value={form.method} onChange={(e) => set('method')(e.target.value as Method)}>

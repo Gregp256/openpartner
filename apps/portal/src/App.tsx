@@ -44,6 +44,8 @@ import { alpha, theme } from './theme.js';
 import { useIsMobile } from './lib/useMediaQuery.js';
 import { useBrand, useConnectPayouts, usePublicBrand } from './lib/useBrand.js';
 import { AffiliateLinkGate, isAffiliateLinkEntry } from './pages/auth/AffiliateLinkGate.js';
+import { FaqPage, NotFoundPage, PrivacyPage, TermsPage } from './pages/PublicPages.js';
+import { affiliateTitle, isPortalSection } from './lib/affiliateHost.js';
 import { Dashboard } from './pages/Dashboard.js';
 import { LinksPage } from './pages/Links.js';
 import { CommissionsPage } from './pages/Commissions.js';
@@ -153,6 +155,18 @@ function RethrowRouteError(): never {
   throw useRouteError();
 }
 
+function BootScreen() {
+  const title = affiliateTitle() ?? 'Affiliate';
+  useEffect(() => {
+    document.title = title;
+  }, [title]);
+  return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: theme.bg, color: theme.textMuted, fontSize: 14 }}>
+      Loading {title}…
+    </div>
+  );
+}
+
 function AppRoutes() {
   // First-run gate. Three modes the probe can return:
   //   { needsSetup: true }                     — single-tenant, no admin yet
@@ -189,8 +203,8 @@ function AppRoutes() {
     staleTime: Infinity,
   });
 
-  if (install.isLoading) return null;
-  if (isMultiTenant && hostBrand.isPending) return null;
+  if (install.isLoading) return <BootScreen />;
+  if (isMultiTenant && hostBrand.isPending) return <BootScreen />;
   const needsSetup = install.data?.needsSetup ?? false;
   const hostTenantSlug = isMultiTenant ? (hostBrand.data?.tenantSlug ?? null) : null;
 
@@ -203,7 +217,13 @@ function AppRoutes() {
           <>
             {/* Custom-domain origin — the whole host is one tenant. */}
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/admin-login" element={<LoginPage allowAdminKey />} />
+            <Route path="/forgot-password" element={<LoginPage start="forgot" />} />
+            <Route path="/signup" element={<PartnerJoinPage />} />
             <Route path="/join" element={<PartnerJoinPage />} />
+            <Route path="/terms" element={<TermsPage />} />
+            <Route path="/faq" element={<FaqPage />} />
+            <Route path="/privacy" element={<PrivacyPage />} />
             <Route path="/auth/magic" element={<MagicLandingPage />} />
             <Route path="/reset-password" element={<ResetPasswordPage loginPath="/login" />} />
             <Route path="/go/creators/:handle" element={<GoCreatorPage multiTenant={false} />} />
@@ -261,7 +281,13 @@ function AppRoutes() {
           <>
             <Route path="/install" element={<Navigate to="/" replace />} />
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/admin-login" element={<LoginPage allowAdminKey />} />
+            <Route path="/forgot-password" element={<LoginPage start="forgot" />} />
+            <Route path="/signup" element={<PartnerJoinPage />} />
             <Route path="/join" element={<PartnerJoinPage />} />
+            <Route path="/terms" element={<TermsPage />} />
+            <Route path="/faq" element={<FaqPage />} />
+            <Route path="/privacy" element={<PrivacyPage />} />
             <Route path="/auth/magic" element={<MagicLandingPage />} />
             <Route path="/reset-password" element={<ResetPasswordPage loginPath="/login" />} />
             <Route path="/go/creators/:handle" element={<GoCreatorPage multiTenant={false} />} />
@@ -315,6 +341,7 @@ function Shell() {
   // a session and send the visitor to sign in.
   if (!auth.principal) {
     if (isAffiliateLinkEntry(location.pathname, tenantBase)) return <AffiliateLinkGate />;
+    if (!isPortalSection(location.pathname, tenantBase)) return <NotFoundPage />;
     return <Navigate to={`${tenantBase}/login`} state={{ from: location }} replace />;
   }
 
@@ -548,6 +575,12 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
   const tenantBase = useTenantBase();
   const { programName, supportEmail, logoUrl, whiteLabel } = useBrand();
   const connectPayouts = useConnectPayouts();
+  const partnerPrograms = useQuery({
+    queryKey: ['me-campaigns'],
+    queryFn: () => api<{ programs: Array<{ customerReward?: unknown }> }>('/me/programs'),
+    enabled: principal.role === 'partner',
+  });
+  const showCoupons = principal.role === 'partner' && (partnerPrograms.data?.programs ?? []).some((program) => program.customerReward);
   const partnerNetwork = usePartnerNetworkAccess(principal.role === 'partner');
   // Only once a program pays for recruiting (or there are recruits to see).
   const showRecruiting = useShowRecruiting(principal);
@@ -591,7 +624,7 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
           <NavItem to="/" icon={<LayoutDashboard size={16} />}>Dashboard</NavItem>
           <NavItem to="/links" icon={<Link2 size={16} />} locked={locked}>Links</NavItem>
           {principal.role === 'partner' && <NavItem to="/referrals" icon={<UserCheck size={16} />}>Referrals</NavItem>}
-          {principal.role === 'partner' && <NavItem to="/coupons" icon={<Tag size={16} />}>Coupons</NavItem>}
+          {showCoupons && <NavItem to="/coupons" icon={<Tag size={16} />}>Coupons</NavItem>}
           {principal.role === 'partner' && <NavItem to="/bounties" icon={<Trophy size={16} />}>Bounties</NavItem>}
           {principal.role === 'partner' && showRecruiting && (
             <NavItem to="/recruit" icon={<UserPlus size={16} />}>Recruit partners</NavItem>

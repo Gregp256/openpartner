@@ -10,6 +10,7 @@ import {
 import { TenantLink } from '../tenant-link.js';
 import { theme } from '../theme.js';
 import { Avatar, Button, Card, EmptyState, ErrorBanner, Page, StatusPill, Table, formatDate, money, shortId } from '../ui.js';
+import { ProgramTermsCard } from './PublicPages.js';
 
 export { StatusPill };
 
@@ -96,6 +97,7 @@ export function CommissionsPage({ principal }: { principal: Principal }) {
 
   return (
     <Page title="Commissions" subtitle={partnerId ? 'Earnings on attributed sales, and bonuses.' : 'Every partner, every commission.'}>
+      <ProgramTermsCard />
       <ErrorBanner error={error} />
       {isLoading ? (
         <Card>Loading…</Card>

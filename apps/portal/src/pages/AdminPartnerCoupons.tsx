@@ -96,6 +96,14 @@ export function AdminPartnerCoupons({ ownPartnerId }: { ownPartnerId?: string } 
   });
   const campaignNameById = new Map((campaigns.data?.programs ?? []).map((c) => [c.id, c.name]));
   const partnerName = partner.data?.name ?? '…';
+  const offersDiscount = (campaigns.data?.programs ?? []).some((program) => program.customerReward);
+  if (selfService && campaigns.data && !offersDiscount) {
+    return (
+      <Page title="Coupons" subtitle="Coupons stay hidden until a program offers a customer discount.">
+        <Card>There is no customer discount on your programs yet.</Card>
+      </Page>
+    );
+  }
 
   return (
     <Page
@@ -123,7 +131,7 @@ export function AdminPartnerCoupons({ ownPartnerId }: { ownPartnerId?: string } 
       )}
       <Card>
         {selfService && (
-          <p style={{ color: theme.textMuted, fontSize: 13 }}>Your brand controls discount terms. Existing codes may retain earlier terms when a program changes. Discount duration does not indicate a code's expiry or redemption limit.</p>
+          <p style={{ color: theme.textMuted, fontSize: 13 }}>Your brand sets the discount. A code does not expire on its own.</p>
         )}
         {coupons.isLoading ? (
           <p style={{ color: theme.textMuted, fontSize: 13 }}>Loading…</p>
@@ -162,7 +170,7 @@ export function AdminPartnerCoupons({ ownPartnerId }: { ownPartnerId?: string } 
                           <div>Discount applies automatically at checkout</div>
                         ) : null}
                       </div>
-                      <span style={{ color: theme.textMuted, fontSize: 11, whiteSpace: 'nowrap' }}>
+                      <span style={{ color: theme.text, fontSize: 14, fontWeight: 600, whiteSpace: 'nowrap' }}>
                         {(c.redemptions90d ?? 0) > 0
                           ? `${c.redemptions90d} redemption${c.redemptions90d === 1 ? '' : 's'} (90d)`
                           : 'unused (90d)'}

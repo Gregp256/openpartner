@@ -217,7 +217,7 @@ export function SignupPage() {
             style={inputStyle}
           />
         </Field>
-        <Field label="Password" hint={`At least ${MIN_PASSWORD_LENGTH} characters. A few unrelated words works well.`}>
+        <Field label="Password" hint={`At least ${MIN_PASSWORD_LENGTH} characters. A few unrelated words work well.`}>
           <PasswordInput value={password} onChange={setPassword} autoComplete="new-password" style={inputStyle} />
         </Field>
         {err && <div style={{ color: theme.danger, fontSize: 13, marginTop: 4, marginBottom: 8 }}>{err}</div>}

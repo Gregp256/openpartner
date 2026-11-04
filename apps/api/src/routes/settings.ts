@@ -230,6 +230,41 @@ settingsRouter.get('/branding', async (req, res) => {
   });
 });
 
+/** Read-only terms for the public pages and the affiliate dashboard.
+ *  Does not change the program. */
+settingsRouter.get('/program-terms', async (req, res) => {
+  if (!req.db || !req.tenantId) {
+    return res.json({ currency: 'USD', minimumPayout: 0, payoutSchedule: 'weekly', nextRun: '', programs: [] });
+  }
+  const tenant = await req.db<TenantRow>(TABLES.Tenant).where({ id: req.tenantId }).first();
+  const programs = await req.db(TABLES.Program)
+    .where({ tenantId: req.tenantId })
+    .select('name', 'commissionRule', 'attributionWindowDays', 'holdbackDays');
+  const cadence = tenant?.payoutCadence ?? 'weekly';
+  const schedule = cadence === 'monthly' ? 'once a month' : cadence === 'manual' ? 'when an admin runs them' : 'once a week';
+  res.json({
+    currency: tenant?.defaultCurrency ?? 'USD',
+    minimumPayout: (tenant?.payoutThresholdCents ?? 0) / 100,
+    payoutSchedule: schedule,
+    nextRun: 'The next run is the next time that schedule pays approved commission. An amount under the minimum waits for a later run.',
+    programs: programs.map((program: { name: string; commissionRule: unknown; attributionWindowDays: number; holdbackDays: number | null }) => ({
+      name: program.name,
+      commission: summarizeCommission(program.commissionRule),
+      attributionWindowDays: program.attributionWindowDays,
+      holdDays: program.holdbackDays ?? 0,
+    })),
+  });
+});
+
+function summarizeCommission(rule: unknown): string {
+  const list = Array.isArray(rule) ? rule : rule && typeof rule === 'object' ? [rule] : [];
+  const percent = list.find((row) => row && typeof row === 'object' && (row as { type?: string }).type === 'percent') as { value?: number } | undefined;
+  if (percent && typeof percent.value === 'number') return `${percent.value}% of the amount paid`;
+  const fixed = list.find((row) => row && typeof row === 'object' && (row as { type?: string }).type === 'fixed') as { value?: number } | undefined;
+  if (fixed && typeof fixed.value === 'number') return `a fixed ${fixed.value}`;
+  return 'the rate set on the program';
+}
+
 /** Only admins write. Empty strings clear fields. */
 settingsRouter.post('/config/program', requireAuth, requireAdmin, async (req, res) => {
   const { db, tenantId } = tenantOf(req);

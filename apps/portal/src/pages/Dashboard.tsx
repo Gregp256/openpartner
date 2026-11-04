@@ -22,6 +22,7 @@ import { TenantLink } from '../tenant-link.js';
 import { alpha, theme } from '../theme.js';
 import { useBrand, useConnectPayouts, useDefaultCurrency } from '../lib/useBrand.js';
 import { EditOnly } from '../lib/viewOnly.js';
+import { ProgramTermsCard } from './PublicPages.js';
 import {
   Avatar,
   Button,
@@ -159,6 +160,7 @@ function PartnerDashboard({ partnerId, name }: { partnerId: string; name: string
       subtitle="Last 30 days"
     >
       <ErrorBanner error={error} />
+      <ProgramTermsCard />
       {showGettingStarted && (
         <GettingStarted hasLink={hasLink} payoutStep={paysManually ? 'details' : 'stripe'} payoutReady={payoutReady} />
       )}
@@ -230,7 +232,7 @@ function GettingStarted({
     <Card>
       <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>Getting started</div>
       <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 16 }}>
-        Two quick steps and you're earning. This card goes away once both are done.
+        Create the link you share, then say where commission should be sent. This card goes away once both are done.
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
         <ChecklistRow
@@ -352,7 +354,7 @@ function FunnelChart({ funnel }: { funnel: Funnel }) {
       <SectionHeading>Funnel</SectionHeading>
       <Card>
         <div style={{ fontSize: 13, color: theme.textMuted, marginBottom: 14 }}>
-          Your clicks in the last 30 days, and what those visitors went on to do.
+          Your clicks in the last 30 days, and what those visitors went on to do. Identified means a visitor we could match to a person, usually after they sign up.
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {stages.map((s, i) => {

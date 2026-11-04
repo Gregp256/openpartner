@@ -808,6 +808,18 @@ export const updateSchema = z
   })
   .strict();
 
+partnersRouter.patch('/partners/me', requireAuth, async (req, res) => {
+  const principal = req.principal;
+  if (!principal || principal.role !== 'partner' || !principal.partnerId) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (!name || name.length > 120) return res.status(400).json({ error: 'invalid_body' });
+  const { db, tenantId } = tenantOf(req);
+  await db(TABLES.Partner).where({ id: principal.partnerId, tenantId }).update({ name, updatedAt: new Date() });
+  res.json({ ok: true, name });
+});
+
 partnersRouter.patch('/partners/:id', requireAuth, grantScope('partners:write'), requireAdmin, async (req, res) => {
   const { db, tenantId } = tenantOf(req);
   const body = updateSchema.safeParse(req.body ?? {});

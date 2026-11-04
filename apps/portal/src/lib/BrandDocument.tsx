@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useLocation } from 'react-router';
 import { usePublicBrand, DEFAULT_BRAND } from './useBrand.js';
+import { affiliateMark, affiliateTitle } from './affiliateHost.js';
 
 /**
  * Keeps the HTML document itself on-brand: tab title, favicon, og:title,
@@ -31,17 +32,21 @@ export function BrandDocument() {
   const { programName, logoUrl, faviconUrl, whiteLabel, brandColor, isLoading } = usePublicBrand();
 
   useEffect(() => {
-    if (isLoading) return;
+    const product = affiliateTitle();
+    if (isLoading) {
+      if (product) document.title = product;
+      return;
+    }
     applyAccent(brandColor);
 
     const branded = programName && programName !== DEFAULT_BRAND;
-    if (!branded && !whiteLabel) return; // platform surface — leave defaults
+    if (!branded && !whiteLabel && !product) return; // platform surface — leave defaults
 
-    const title = whiteLabel ? programName : `${programName} · ${DEFAULT_BRAND}`;
+    const title = product ?? (whiteLabel ? programName : `${programName} · ${DEFAULT_BRAND}`);
     document.title = title;
     document.querySelector('meta[property="og:title"]')?.setAttribute('content', title);
 
-    const icon = faviconUrl ?? logoUrl ?? (whiteLabel ? monogramIcon(programName, brandColor) : null);
+    const icon = faviconUrl ?? logoUrl ?? affiliateMark() ?? (whiteLabel ? monogramIcon(programName, brandColor) : null);
     if (icon) {
       for (const el of Array.from(document.querySelectorAll('link[rel="icon"], link[rel="apple-touch-icon"]'))) {
         el.remove();
