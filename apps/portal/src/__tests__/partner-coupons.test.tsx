@@ -13,9 +13,10 @@ function show(canEdit: boolean, customerReward?: CustomerReward | null, stripePr
   client.setQueryData(['me-campaigns'], { programs: [{ id: 'pr1', name: 'Brand', partnersMayCustomizeCode: canEdit, customerReward }] });
   return render(<MemoryRouter><QueryClientProvider client={client}><AdminPartnerCoupons ownPartnerId="p1" /></QueryClientProvider></MemoryRouter>);
 }
+const REWARD: CustomerReward = { type: 'percent_off', value: 10, duration: 'once' };
 describe('local partner coupon page', () => {
   it('offers another code for an editable assigned program while preserving existing codes', () => {
-    const page = show(true);
+    const page = show(true, REWARD);
     expect(page.getByText('MYCODE')).toBeTruthy();
     expect(page.getByText('Deactivate')).toBeTruthy();
     const program = page.getByRole('combobox') as HTMLSelectElement;
@@ -23,7 +24,7 @@ describe('local partner coupon page', () => {
     expect((page.getByText('Mint coupon') as HTMLButtonElement).disabled).toBe(false);
   });
   it('keeps brand-managed codes visible without edit controls', () => {
-    const page = show(false);
+    const page = show(false, REWARD);
     expect(page.getByText('MYCODE')).toBeTruthy();
     expect(page.getByText('Managed by brand')).toBeTruthy();
     expect(page.queryByText('Deactivate')).toBeNull();
@@ -37,21 +38,24 @@ describe('partner-visible discount terms', () => {
     [{ type: 'percent_off', value: 20, duration: 'repeating', durationInMonths: 3 }, '20% off, for 3 months'],
     [{ type: 'amount_off', value: 5, currency: 'eur', duration: 'forever' }, '€5.00 off, every eligible payment'],
     [{ type: 'free_months', value: 2, duration: 'forever' }, '2 months free'],
-    [null, 'No customer discount configured'],
   ] as Array<[CustomerReward | null, string]>)('previews %j when choosing a program', (reward, summary) => {
     const page = show(true, reward, 'promo_test');
     fireEvent.change(page.getByRole('combobox'), { target: { value: 'pr1' } });
     expect(page.getByText(`Customer discount: ${summary}`)).toBeTruthy();
     expect(page.getByText(`Current program discount: ${summary}`)).toBeTruthy();
     expect(page.getByText('Discount applies automatically at checkout')).toBeTruthy();
-    expect(page.getByText(/Existing codes may retain earlier terms/)).toBeTruthy();
-    expect(page.getByText(/Discount duration does not indicate a code's expiry or redemption limit/)).toBeTruthy();
+    expect(page.getByText(/A code does not expire on its own/)).toBeTruthy();
   });
-  it('does not promise missing Stripe provisioning or unknown discount terms', () => {
-    const page = show(true);
+  it('does not promise missing Stripe provisioning', () => {
+    const page = show(true, REWARD);
     // No Stripe promotion recorded (always the case on hosted): say nothing
     // rather than an alarming "not recorded".
     expect(page.queryByText(/Stripe|applies automatically/)).toBeNull();
-    expect(page.getByText('Current program discount: Discount details unavailable')).toBeTruthy();
+  });
+  it.each([[null], [undefined]])('hides coupons when no program offers a customer discount (%s), without deleting codes', (reward) => {
+    const page = show(true, reward as CustomerReward | null | undefined);
+    expect(page.getByText('There is no customer discount on your programs yet.')).toBeTruthy();
+    expect(page.queryByText('Mint coupon')).toBeNull();
+    expect(page.queryByText('Deactivate')).toBeNull();
   });
 });

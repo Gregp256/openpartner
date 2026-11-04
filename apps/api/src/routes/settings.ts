@@ -59,6 +59,7 @@ import { getMode } from '../stripe.js';
 import { connectPayoutsAvailable } from '../payout-method.js';
 import { isWhiteLabelEntitled, getWhiteLabelState } from '../white-label.js';
 import { currencyInputSchema } from '../currency.js';
+import { renderCommissionSummary, type CommissionSubRuleLike } from '@openpartner/db';
 
 export const settingsRouter = Router();
 
@@ -231,38 +232,42 @@ settingsRouter.get('/branding', async (req, res) => {
 });
 
 /** Read-only terms for the public pages and the affiliate dashboard.
- *  Does not change the program. */
+ *  Does not change the program. A value the brand has not configured is
+ *  returned as null so the portal shows a "not set yet" placeholder
+ *  instead of an invented default. */
 settingsRouter.get('/program-terms', async (req, res) => {
   if (!req.db || !req.tenantId) {
-    return res.json({ currency: 'USD', minimumPayout: 0, payoutSchedule: 'weekly', nextRun: '', programs: [] });
+    return res.json({ currency: null, minimumPayout: null, payoutSchedule: null, nextRun: null, programs: [] });
   }
   const tenant = await req.db<TenantRow>(TABLES.Tenant).where({ id: req.tenantId }).first();
   const programs = await req.db(TABLES.Program)
     .where({ tenantId: req.tenantId })
     .select('name', 'commissionRule', 'attributionWindowDays', 'holdbackDays');
-  const cadence = tenant?.payoutCadence ?? 'weekly';
-  const schedule = cadence === 'monthly' ? 'once a month' : cadence === 'manual' ? 'when an admin runs them' : 'once a week';
+  const currency = tenant?.defaultCurrency ?? null;
+  const cadence = tenant?.payoutCadence ?? null;
+  const schedule = cadence === 'monthly' ? 'once a month' : cadence === 'weekly' ? 'once a week' : cadence === 'manual' ? 'when an admin runs them' : null;
   res.json({
-    currency: tenant?.defaultCurrency ?? 'USD',
-    minimumPayout: (tenant?.payoutThresholdCents ?? 0) / 100,
+    currency,
+    minimumPayout: tenant?.payoutThresholdCents == null ? null : tenant.payoutThresholdCents / 100,
     payoutSchedule: schedule,
-    nextRun: 'The next run is the next time that schedule pays approved commission. An amount under the minimum waits for a later run.',
-    programs: programs.map((program: { name: string; commissionRule: unknown; attributionWindowDays: number; holdbackDays: number | null }) => ({
+    nextRun: schedule
+      ? 'The next run is the next scheduled payout of approved commission. An amount under the minimum waits for a later run.'
+      : null,
+    programs: programs.map((program: { name: string; commissionRule: unknown; attributionWindowDays: number | null; holdbackDays: number | null }) => ({
       name: program.name,
-      commission: summarizeCommission(program.commissionRule),
-      attributionWindowDays: program.attributionWindowDays,
-      holdDays: program.holdbackDays ?? 0,
+      commission: summarizeCommission(program.commissionRule, currency ?? undefined),
+      attributionWindowDays: program.attributionWindowDays ?? null,
+      holdDays: program.holdbackDays ?? null,
     })),
   });
 });
 
-function summarizeCommission(rule: unknown): string {
+/** The program's own rule in plain words, or null when none is set. */
+function summarizeCommission(rule: unknown, currency?: string): string | null {
   const list = Array.isArray(rule) ? rule : rule && typeof rule === 'object' ? [rule] : [];
-  const percent = list.find((row) => row && typeof row === 'object' && (row as { type?: string }).type === 'percent') as { value?: number } | undefined;
-  if (percent && typeof percent.value === 'number') return `${percent.value}% of the amount paid`;
-  const fixed = list.find((row) => row && typeof row === 'object' && (row as { type?: string }).type === 'fixed') as { value?: number } | undefined;
-  if (fixed && typeof fixed.value === 'number') return `a fixed ${fixed.value}`;
-  return 'the rate set on the program';
+  if (list.length === 0) return null;
+  const summary = renderCommissionSummary(list as CommissionSubRuleLike[], null, currency);
+  return summary === '—' ? null : summary;
 }
 
 /** Only admins write. Empty strings clear fields. */

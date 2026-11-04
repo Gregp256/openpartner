@@ -13,6 +13,7 @@ import { ApiError, api, currentTenantSlug } from '../api.js';
 import { alpha, theme } from '../theme.js';
 import { CountryField, countryErrorMessage } from '../lib/CountryField.js';
 import { AuthFrame } from './auth/Shared.js';
+import { affiliateTitle } from '../lib/affiliateHost.js';
 import { usePublicBrand } from '../lib/useBrand.js';
 
 /**
@@ -249,7 +250,8 @@ export function PartnerJoinPage() {
     );
   }
 
-  const title = `Become a ${program ? `${program} ` : ''}partner`;
+  const product = affiliateTitle(undefined, program || null);
+  const title = product ? `Request access to ${product}` : `Become a ${program ? `${program} ` : ''}partner`;
   if (status.isLoading) {
     // Don't show a form that might be closed.
     return (

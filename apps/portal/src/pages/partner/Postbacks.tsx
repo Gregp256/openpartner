@@ -88,7 +88,7 @@ export function PartnerPostbacksPage({ principal }: { principal: Principal }) {
   return (
     <Page
       title="Postback URLs"
-      subtitle="Forward conversion events to your tracker (Voluum, RedTrack, Bemob, or your own)."
+      subtitle="Optional. If you use your own tracking tool, we can send it a message each time you earn a commission. Most affiliates can skip this page."
       actions={
         <Button icon={<Plus size={14} />} onClick={() => setShowCreate(true)}>
           Add postback
@@ -407,7 +407,7 @@ function MacroReference() {
   const macros: Array<[string, string]> = [
     [
       '{click_id}',
-      "Originating click — present on every commission event except a recruiter commission (your share of what a partner you recruited earned). That one carries nothing of their sale: {click_id}, {sub_id}, {event_id}, {transaction_id} and {sale_amount} stay literal",
+      "The click that led to the sale. Not filled in on a recruiter commission (your share of what someone you recruited earned)",
     ],
     [
       '{sub_id}',
@@ -415,7 +415,7 @@ function MacroReference() {
     ],
     [
       '{status}',
-      'pending / approved / reversed / paid — which change fired it (accrued = pending). bonus.awarded: approved, or pending during a holdback',
+      'pending, approved, reversed or paid: what just happened to the commission',
     ],
     ['{partner_id}', 'Your partner ID'],
     ['{commission_id}', 'The Commission row id'],
@@ -425,7 +425,7 @@ function MacroReference() {
     ['{event_id}', 'The Event row that drove the commission'],
     ['{transaction_id}', 'Alias for {event_id} — many trackers use this name'],
     ['{event_type}', 'invoice_paid / signup / your custom event'],
-    ['{program_id}', ' Program id'],
+    ['{program_id}', 'Program id'],
     ['{payout_id}', 'Only present on commission.paid and bonus.paid'],
     ['{bonus_id}', 'bonus.* only: the bonus. A bonus has no click or event, so those macros stay literal'],
     ['{bonus_amount}', 'bonus.* only: the bonus amount in major units'],
