@@ -71,7 +71,7 @@ describe('email branding', () => {
     // e.g. a partner named `data-op-email="card" style="x"`, HTML-escaped into the body.
     const html = templates.partnerInviteEmail('data-op-email="card" style="x"', url).html;
     const branded = brandEmailHtml(html, '#123456');
-    expect(branded).toContain('data-op-email="card" style="x"');
+    expect(branded).toContain('data-op-email=&quot;card&quot; style=&quot;x&quot;');
     expect(branded).toContain('border-top:4px solid #123456');
   });
 

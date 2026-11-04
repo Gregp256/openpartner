@@ -45,7 +45,7 @@ import { useIsMobile } from './lib/useMediaQuery.js';
 import { useBrand, useConnectPayouts, usePublicBrand } from './lib/useBrand.js';
 import { AffiliateLinkGate, isAffiliateLinkEntry } from './pages/auth/AffiliateLinkGate.js';
 import { FaqPage, NotFoundPage, PrivacyPage, TermsPage } from './pages/PublicPages.js';
-import { affiliateTitle, isPortalSection } from './lib/affiliateHost.js';
+import { affiliateMark, affiliateTitle, isPortalSection } from './lib/affiliateHost.js';
 import { Dashboard } from './pages/Dashboard.js';
 import { LinksPage } from './pages/Links.js';
 import { CommissionsPage } from './pages/Commissions.js';
@@ -524,7 +524,7 @@ function MobileTopBar({ onMenu }: { onMenu: () => void }) {
         <Menu size={22} />
       </button>
       <BrandMark logoUrl={logoUrl} programName={programName} whiteLabel={whiteLabel} size={24} />
-      <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em' }}>{programName}</div>
+      <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em' }}>{affiliateTitle(undefined, programName) ?? programName}</div>
     </header>
   );
 }
@@ -609,7 +609,7 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 8px', marginBottom: 20 }}>
         <BrandMark logoUrl={logoUrl} programName={programName} whiteLabel={whiteLabel} size={26} />
-        <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em' }}>{programName}</div>
+        <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em' }}>{affiliateTitle(undefined, programName) ?? programName}</div>
       </div>
 
       {principal.role === 'admin' ? (
@@ -1612,11 +1612,13 @@ function BrandMark({
   whiteLabel: boolean;
   size?: number;
 }) {
-  if (logoUrl) {
+  const productMark = affiliateMark(undefined, programName);
+  const label = affiliateTitle(undefined, programName) ?? programName;
+  if (logoUrl || productMark) {
     return (
       <img
-        src={logoUrl}
-        alt={programName}
+        src={logoUrl ?? productMark!}
+        alt={label}
         style={{ width: size, height: size, borderRadius: 6, objectFit: 'contain', background: theme.surface2 }}
       />
     );

@@ -24,9 +24,9 @@ export function AuthFrame({
   // platform pages it returns nulls and we keep the OpenPartner default.
   const publicBrand = usePublicBrand();
   const tenantBase = useTenantBase();
-  const product = affiliateTitle();
+  const product = affiliateTitle(undefined, publicBrand.isLoading ? null : publicBrand.programName);
   const name = brand ?? product ?? (publicBrand.isLoading ? '' : publicBrand.programName);
-  const mark = publicBrand.logoUrl ?? affiliateMark();
+  const mark = publicBrand.logoUrl ?? affiliateMark(undefined, publicBrand.isLoading ? null : publicBrand.programName);
   return (
     <div
       style={{

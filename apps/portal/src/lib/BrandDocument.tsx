@@ -32,7 +32,7 @@ export function BrandDocument() {
   const { programName, logoUrl, faviconUrl, whiteLabel, brandColor, isLoading } = usePublicBrand();
 
   useEffect(() => {
-    const product = affiliateTitle();
+    const product = affiliateTitle(undefined, isLoading ? null : programName);
     if (isLoading) {
       if (product) document.title = product;
       return;
@@ -46,7 +46,7 @@ export function BrandDocument() {
     document.title = title;
     document.querySelector('meta[property="og:title"]')?.setAttribute('content', title);
 
-    const icon = faviconUrl ?? logoUrl ?? affiliateMark() ?? (whiteLabel ? monogramIcon(programName, brandColor) : null);
+    const icon = faviconUrl ?? logoUrl ?? affiliateMark(undefined, programName) ?? (whiteLabel ? monogramIcon(programName, brandColor) : null);
     if (icon) {
       for (const el of Array.from(document.querySelectorAll('link[rel="icon"], link[rel="apple-touch-icon"]'))) {
         el.remove();

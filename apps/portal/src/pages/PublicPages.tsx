@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import { theme } from '../theme.js';
 import { AuthFrame } from './auth/Shared.js';
 import { affiliateTitle } from '../lib/affiliateHost.js';
+import { usePublicBrand } from '../lib/useBrand.js';
 import { useTenantBase } from '../tenant-base.js';
 
 export interface ProgramTerms {
@@ -52,7 +53,8 @@ export function ProgramTermsCard() {
 
 function PublicShell({ title, children }: { title: string; children: ReactNode }) {
   const tenantBase = useTenantBase();
-  const product = affiliateTitle() ?? 'Affiliate';
+  const brand = usePublicBrand();
+  const product = affiliateTitle(undefined, brand.isLoading ? null : brand.programName) ?? 'Affiliate';
   return (
     <div style={{ minHeight: '100vh', background: theme.bg, color: theme.text }}>
       <div style={{ maxWidth: 720, margin: '0 auto', padding: '28px 20px 64px' }}>
@@ -96,7 +98,8 @@ export function FaqPage() {
 }
 
 export function PrivacyPage() {
-  const product = affiliateTitle() ?? 'This affiliate program';
+  const brand = usePublicBrand();
+  const product = affiliateTitle(undefined, brand.isLoading ? null : brand.programName) ?? 'This affiliate program';
   return (
     <PublicShell title="Privacy">
       <p style={{ color: theme.textMuted, lineHeight: 1.6 }}>

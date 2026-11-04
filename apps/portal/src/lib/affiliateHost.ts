@@ -1,15 +1,26 @@
-/** Product name for the Truest and AIfluxx affiliate hosts. Other hosts stay on the platform name. */
-export function affiliateTitle(hostname?: string): string | null {
+/** Truest or AIfluxx, from the host first, then a white-label program name. */
+function affiliateProduct(hostname?: string, programName?: string | null): 'truest' | 'aifluxx' | null {
   const host = (hostname ?? (typeof window !== 'undefined' ? window.location.hostname : '')).toLowerCase();
-  if (host.includes('truest')) return 'Truest Affiliate';
-  if (host.includes('aifluxx')) return 'AIfluxx Affiliate';
+  if (host.includes('truest')) return 'truest';
+  if (host.includes('aifluxx')) return 'aifluxx';
+  const program = (programName ?? '').trim().toLowerCase();
+  if (program === 'truest') return 'truest';
+  if (program === 'aifluxx') return 'aifluxx';
   return null;
 }
 
-export function affiliateMark(hostname?: string): string | null {
-  const host = (hostname ?? (typeof window !== 'undefined' ? window.location.hostname : '')).toLowerCase();
-  if (host.includes('truest')) return '/brand/truest-icon-dark.svg';
-  if (host.includes('aifluxx')) return '/brand/aifluxx-icon-dark.svg';
+/** Product name for the Truest and AIfluxx affiliate hosts. Other hosts stay on the platform name. */
+export function affiliateTitle(hostname?: string, programName?: string | null): string | null {
+  const product = affiliateProduct(hostname, programName);
+  if (product === 'truest') return 'Truest Affiliate';
+  if (product === 'aifluxx') return 'AIfluxx Affiliate';
+  return null;
+}
+
+export function affiliateMark(hostname?: string, programName?: string | null): string | null {
+  const product = affiliateProduct(hostname, programName);
+  if (product === 'truest') return '/brand/truest-icon-dark.svg';
+  if (product === 'aifluxx') return '/brand/aifluxx-icon-dark.svg';
   return null;
 }
 
