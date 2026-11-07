@@ -24,6 +24,12 @@ export function affiliateMark(hostname?: string, programName?: string | null): s
   return null;
 }
 
+/** Truest app action blue (`--action-primary`). Used when the tenant has no brand color of its own. */
+export function affiliateAccent(hostname?: string, programName?: string | null): string | null {
+  if (affiliateProduct(hostname, programName) === 'truest') return '#3b82f6';
+  return null;
+}
+
 /** First path segment under the tenant prefix. Empty string is the dashboard. */
 export function portalSection(pathname: string, tenantBase: string): string {
   const rest = (pathname.slice(tenantBase.length) || '/').replace(/\/$/, '') || '/';

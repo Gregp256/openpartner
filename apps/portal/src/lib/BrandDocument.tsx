@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { useLocation } from 'react-router';
 import { usePublicBrand, DEFAULT_BRAND } from './useBrand.js';
-import { affiliateMark, affiliateTitle } from './affiliateHost.js';
+import { affiliateAccent, affiliateMark, affiliateTitle } from './affiliateHost.js';
 
 /**
  * Keeps the HTML document itself on-brand: tab title, favicon, og:title,
@@ -32,12 +32,14 @@ export function BrandDocument() {
   const { programName, logoUrl, faviconUrl, whiteLabel, brandColor, isLoading } = usePublicBrand();
 
   useEffect(() => {
-    const product = affiliateTitle(undefined, isLoading ? null : programName);
+    const knownName = isLoading ? null : programName;
+    const product = affiliateTitle(undefined, knownName);
+    const accent = brandColor || affiliateAccent(undefined, knownName);
+    if (accent || !isLoading) applyAccent(accent);
     if (isLoading) {
       if (product) document.title = product;
       return;
     }
-    applyAccent(brandColor);
 
     const branded = programName && programName !== DEFAULT_BRAND;
     if (!branded && !whiteLabel && !product) return; // platform surface — leave defaults
