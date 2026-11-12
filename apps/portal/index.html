@@ -37,6 +37,20 @@
         document.title = title;
         var og = document.querySelector('meta[property="og:title"]');
         if (og) og.setAttribute('content', title);
+        // Brand favicon before the app boots, so the tab never shows the
+        // platform mark on the affiliate hosts.
+        var mark = host.indexOf('aifluxx') >= 0 ? '/brand/aifluxx-icon-dark.svg' : host.indexOf('truest') >= 0 ? '/brand/truest-icon-dark.svg' : null;
+        if (mark) {
+          document.addEventListener('DOMContentLoaded', function () {
+            var links = document.querySelectorAll('link[rel="icon"], link[rel="apple-touch-icon"]');
+            for (var i = 0; i < links.length; i++) links[i].parentNode.removeChild(links[i]);
+            var l = document.createElement('link');
+            l.rel = 'icon';
+            l.type = 'image/svg+xml';
+            l.href = mark;
+            document.head.appendChild(l);
+          });
+        }
       })();
     </script>
     <link rel="icon" href="/favicon.ico" sizes="any" />
@@ -47,7 +61,8 @@
     <meta property="og:image" content="/og-default.png" />
   </head>
   <body>
-    <div id="root"></div>
+    <!-- Shown until React mounts, so a slow first load is never a blank page. -->
+    <div id="root"><div style="min-height:100vh;display:flex;align-items:center;justify-content:center;font:14px system-ui,sans-serif;color:#808994">Loading…</div></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

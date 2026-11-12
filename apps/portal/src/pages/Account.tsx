@@ -225,7 +225,7 @@ export function TenantAccountPage() {
   }
 
   return (
-    <Page title="Sign-in & password" subtitle="How you sign in to this portal.">
+    <Page title="Profile & sign-in" subtitle="Your name, and how you sign in to this portal.">
       <div style={{ maxWidth: 720, width: '100%' }}>
         <NameSection />
         {body}

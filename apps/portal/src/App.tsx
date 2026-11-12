@@ -216,9 +216,9 @@ function AppRoutes() {
         {isMultiTenant && hostTenantSlug ? (
           <>
             {/* Custom-domain origin — the whole host is one tenant. */}
-            <Route path="/login" element={<LoginPage />} />
-            <Route path="/admin-login" element={<LoginPage allowAdminKey />} />
-            <Route path="/forgot-password" element={<LoginPage start="forgot" />} />
+            <Route path="/login" element={<LoginPage key="login" />} />
+            <Route path="/admin-login" element={<LoginPage key="admin" allowAdminKey />} />
+            <Route path="/forgot-password" element={<LoginPage key="forgot" start="forgot" />} />
             <Route path="/signup" element={<PartnerJoinPage />} />
             <Route path="/join" element={<PartnerJoinPage />} />
             <Route path="/terms" element={<TermsPage />} />
@@ -280,9 +280,9 @@ function AppRoutes() {
         ) : (
           <>
             <Route path="/install" element={<Navigate to="/" replace />} />
-            <Route path="/login" element={<LoginPage />} />
-            <Route path="/admin-login" element={<LoginPage allowAdminKey />} />
-            <Route path="/forgot-password" element={<LoginPage start="forgot" />} />
+            <Route path="/login" element={<LoginPage key="login" />} />
+            <Route path="/admin-login" element={<LoginPage key="admin" allowAdminKey />} />
+            <Route path="/forgot-password" element={<LoginPage key="forgot" start="forgot" />} />
             <Route path="/signup" element={<PartnerJoinPage />} />
             <Route path="/join" element={<PartnerJoinPage />} />
             <Route path="/terms" element={<TermsPage />} />
@@ -480,7 +480,9 @@ function Shell() {
             </>
           )}
 
-          <Route path="*" element={<Navigate to="/" replace />} />
+          {/* Unknown signed-in paths get the same "not found" page as
+              signed-out ones, not a silent bounce to the dashboard. */}
+          <Route path="*" element={<NotFoundPage signedIn />} />
         </Routes>
       </main>
     </div>
@@ -638,7 +640,7 @@ export function Sidebar({ principal, variant = 'sidebar' }: { principal: Princip
             <NavItem to="/connect" icon={<CreditCard size={16} />}>Stripe Connect</NavItem>
           )}
           {principal.role === 'partner' && <NavItem to="/postbacks" icon={<Webhook size={16} />}>Postbacks</NavItem>}
-          {principal.role === 'partner' && <NavItem to="/account" icon={<KeyRound size={16} />}>Sign-in &amp; password</NavItem>}
+          {principal.role === 'partner' && <NavItem to="/account" icon={<KeyRound size={16} />}>Profile &amp; sign-in</NavItem>}
         </div>
 
         {principal.role === 'partner' && partnerNetwork.show && (

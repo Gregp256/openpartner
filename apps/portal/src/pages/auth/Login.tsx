@@ -52,7 +52,16 @@ export function LoginPage({ allowAdminKey = false, start = 'email' }: { allowAdm
     };
   }, [nav, tenantBase, state.from]);
   return (
-    <AuthFrame title={start === 'forgot' ? 'Choose a password' : 'Sign in'} subtitle="Sign in to your affiliate account.">
+    <AuthFrame
+      title={allowAdminKey ? 'Admin sign-in' : start === 'forgot' ? 'Choose a password' : 'Sign in'}
+      subtitle={
+        allowAdminKey
+          ? 'For program staff. Affiliates sign in on the main sign-in page.'
+          : start === 'forgot'
+            ? 'First time here, or forgot your password? Enter your email and we’ll send a link to set one.'
+            : 'Sign in to your affiliate account.'
+      }
+    >
       <AuthNotice error={params.get('error')} reset={state.reset} />
       {allowAdminKey && (
         <div style={{ display: 'flex', gap: 4, background: theme.bg, padding: 4, borderRadius: theme.radiusSm, marginBottom: 20 }}>
@@ -66,7 +75,15 @@ export function LoginPage({ allowAdminKey = false, start = 'email' }: { allowAdm
       )}
       {!allowAdminKey || tab === 'email' ? <EmailTab start={start} /> : <KeyTab />}
       <div style={{ marginTop: 16, fontSize: 13, textAlign: 'center' }}>
-        <Link to={`${tenantBase}/join`} style={{ color: theme.accentText }}>Become an affiliate</Link>
+        {allowAdminKey ? (
+          <Link to={`${tenantBase}/login`} style={{ color: theme.accentText }}>Affiliate sign-in</Link>
+        ) : (
+          <>
+            New here? <Link to={`${tenantBase}/signup`} style={{ color: theme.accentText }}>Request access</Link>
+            {' · '}
+            <Link to={`${tenantBase}/terms`} style={{ color: theme.accentText }}>Program terms</Link>
+          </>
+        )}
       </div>
     </AuthFrame>
   );
@@ -136,6 +153,7 @@ function EmailTab({ start = 'email' }: { start?: 'email' | 'forgot' }) {
       }}
       onLink={(email) => api('/auth/signin', { method: 'POST', body: { email } }).then(() => undefined)}
       initialMode={start === 'forgot' ? 'forgot' : 'link'}
+      forgotHref={`${tenantBase}/forgot-password`}
       onForgot={(email) => api('/auth/password/forgot', { method: 'POST', body: { email } }).then(() => undefined)}
       linkSentText={(email) => `If an account exists for ${email}, we sent a sign-in link. It’s good for 15 minutes.`}
       forgotSentText={(email) => `If an account exists for ${email}, we sent a link to choose a password. It’s good for 15 minutes.`}
@@ -172,7 +190,7 @@ function KeyTab() {
           // (CRM / Zapier / federation) into the portal sign-in.
           // Tell them what kind of key actually works here.
           setErr(
-            "That's a scoped integration key — they can't sign into the portal. Sign in on the Email tab, or use an admin API key.",
+            "That's an integration key, which can't sign into the portal. Sign in with email, or use an admin key.",
           );
         } else {
           setErr(e.message || 'Could not reach the API.');
@@ -204,12 +222,10 @@ function KeyTab() {
         {busy ? 'Checking…' : 'Sign in'}
       </button>
       <div style={{ marginTop: 12, fontSize: 12, color: theme.textDim, lineHeight: 1.6 }}>
-        Admin keys come from <code style={{ color: theme.textMuted }}>ADMIN_API_KEY</code>.
-        Partner keys are issued from the Partners admin view.
+        Use the admin key issued for this program.
         <br />
-        <strong style={{ color: theme.textMuted }}>Not for integration keys</strong> — scoped
-        keys minted under Admin → Integrations are server-to-server credentials and can&rsquo;t
-        sign into the portal.
+        <strong style={{ color: theme.textMuted }}>Not for integration keys</strong> — server-to-server
+        keys can&rsquo;t sign into the portal.
       </div>
     </form>
   );

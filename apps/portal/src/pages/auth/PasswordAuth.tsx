@@ -2,7 +2,7 @@ import { useState, type CSSProperties, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Eye, EyeOff } from 'lucide-react';
 import { theme } from '../../theme.js';
-import { useTenantBase } from '../../tenant-base.js';
+import { Link } from 'react-router';
 import { countryErrorMessage } from '../../lib/CountryField.js';
 
 /**
@@ -359,6 +359,7 @@ export function EmailPasswordForm({
   emailPlaceholder = 'you@example.com',
   footer,
   initialMode = 'password',
+  forgotHref,
 }: {
   initialEmail?: string;
   googleHref?: string | null;
@@ -373,8 +374,10 @@ export function EmailPasswordForm({
   emailPlaceholder?: string;
   footer?: ReactNode;
   initialMode?: FormMode;
+  /** When set, "Forgot password?" is a link to its own page (its own URL)
+   *  instead of an in-place toggle. */
+  forgotHref?: string;
 }) {
-  const tenantBase = useTenantBase();
   const [mode, setMode] = useState<FormMode>(initialMode);
   const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState('');
@@ -463,14 +466,18 @@ export function EmailPasswordForm({
           <div style={{ marginBottom: 12 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
               <div style={{ fontSize: 12, color: theme.textMuted }}>Password</div>
-              <a href={`${tenantBase}/forgot-password`} style={{ fontSize: 12, color: theme.accentText }}>Forgot password?</a>
+              {forgotHref ? (
+                <Link to={forgotHref} style={{ fontSize: 12, color: theme.accentText }}>Forgot password?</Link>
+              ) : (
+                <TextButton onClick={() => switchTo('forgot')}>Forgot password?</TextButton>
+              )}
             </div>
             <PasswordInput value={password} onChange={setPassword} autoComplete="current-password" autoFocus={!!initialEmail} />
           </div>
         )}
         {mode === 'forgot' && (
           <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 12, lineHeight: 1.5 }}>
-            We&rsquo;ll email you a link to choose a password. Use it for a new password, including the first one.
+            We&rsquo;ll email you a link to choose a password. First time signing in? This is also how you set your first password.
             {forgotHint && <div style={{ marginTop: 6 }}>{forgotHint}</div>}
           </div>
         )}

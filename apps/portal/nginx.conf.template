@@ -56,7 +56,7 @@ server {
     # /api/ declares none and stays that way, so the API's helmet headers
     # pass through without a second, conflicting copy from nginx.
     location = /index.html {
-        add_header Cache-Control "no-cache";
+        add_header Cache-Control "no-cache" always;
         add_header Content-Security-Policy "frame-ancestors 'none'" always;
         add_header X-Frame-Options "DENY" always;
     }
@@ -82,11 +82,22 @@ server {
         proxy_set_header X-Forwarded-Proto $api_forwarded_proto;
     }
 
-    # SPA fallback — every non-asset, non-/api URL serves index.html so
-    # react-router owns client-side routing.
-    location / {
+    # SPA routes the portal knows: index.html with 200 so react-router
+    # owns client-side routing. Keep this list in step with the top-level
+    # <Route> paths in src/App.tsx and APP_SECTIONS in lib/affiliateHost.ts.
+    location ~ ^/(?:(?:login|admin-login|forgot-password|signup|join|terms|faq|privacy|auth|reset-password|go|signin|workspaces|brands|account|platform|creator|creators|reports|booking|install|t|links|commissions|payouts|payout-details|payout-sent|connect|coupons|bounties|postbacks|admin|network|referrals|recruit|claim)(?:/.*)?)?$ {
         add_header Content-Security-Policy "frame-ancestors 'none'" always;
         add_header X-Frame-Options "DENY" always;
         try_files $uri /index.html;
+    }
+
+    # Anything else is a real 404. The body is still index.html, so the
+    # SPA renders its own "Page not found" page, but crawlers and link
+    # checkers get the right status instead of a 200 that looks like login.
+    location / {
+        add_header Content-Security-Policy "frame-ancestors 'none'" always;
+        add_header X-Frame-Options "DENY" always;
+        error_page 404 /index.html;
+        try_files $uri =404;
     }
 }

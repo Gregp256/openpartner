@@ -108,7 +108,7 @@ describe('partner dashboard payout step', () => {
 describe('partner funnel', () => {
   it('reads as one cohort of this month’s clicks', async () => {
     const page = renderPartner();
-    expect(await page.findByText('Your clicks in the last 30 days, and what those visitors went on to do.')).toBeTruthy();
+    expect(await page.findByText(/Your clicks in the last 30 days, and what those visitors went on to do\. Identified means/)).toBeTruthy();
     for (const label of ['Identified', 'Signed up']) expect(page.getByText(label)).toBeTruthy();
     expect(page.getByText('67%')).toBeTruthy(); // 6 of 9 identified signed up
     expect(page.getByText('33%')).toBeTruthy(); // 2 of 6 paid
